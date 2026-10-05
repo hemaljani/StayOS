@@ -1,0 +1,119 @@
+# StayOS
+
+> The operating system for hotel General Managers and associates — a
+> mobile-first platform turning fragmented hotel operational data into
+> proactive, AI-generated intelligence.
+
+- Prototype/demo monorepo (not production).
+- Each feature is a self-contained top-level directory with its own backend,
+  frontend, infrastructure, docs, `README.md`, and `AGENTS.md`. This single
+  repo-root `llms.txt` is the one index for the whole repo — features do not
+  carry their own.
+- Features share one PWA origin, one Cognito user pool, one AWS WAF web ACL, and
+  one DynamoDB operational data layer. Three static-export Next.js apps are
+  served from ONE shared CloudFront distribution: the StayOS shell at `/`
+  (unified login + feature launcher), LUMI at `/lumi`, PULSE at `/pulse`. A GM
+  signs in once at the shell and both features trust the shared browser session
+  (single sign-on). Serverless-first, CloudFormation nested stacks, Python 3.12
+  + Next.js, `us-east-1`.
+
+## Apps
+
+- [StayOS shell](stayos-shell/README.md): unified login + feature launcher at
+  `/`. Login when unauthenticated, feature grid (LUMI, PULSE) when authenticated.
+  Static-export Next.js; consumes the shared `@stayos/auth` module. Agent guide:
+  [stayos-shell/AGENTS.md](stayos-shell/AGENTS.md).
+- [LUMI](lumi/README.md): Feature 1, built and deployed. Served at `/lumi`. Daily
+  AI-generated GM brief (KPIs, VIP arrivals, overbooking risk, OOO rooms) as a
+  dashboard + audio brief, plus voice/chat Q&A agents. Agent guide:
+  [lumi/AGENTS.md](lumi/AGENTS.md).
+- [PULSE](pulse/README.md): Feature 2, built and tested. Served at `/pulse`.
+  Real-time tiered (CRITICAL/WARNING/INFO) AI-triaged alerts with closed-loop
+  resolution: a DynamoDB Streams rule engine, agentic triage on Amazon Bedrock
+  AgentCore Runtime via the shared StayOS Gateway, and dual-channel delivery
+  (AppSync Events realtime + Web Push). A second, additive **Forecasting Agent**
+  runs ahead of the rule engine on a per-property daily schedule to predict room
+  oversell (advisory `FORECAST_OVERSELL` alerts; human-in-the-loop, never
+  auto-executed). Deploys with the whole platform via `make deploy-all`.
+
+## Shared
+
+- [shared/README.md](shared/README.md): the cross-feature shared layer.
+- [shared/auth/src/index.ts](shared/auth/src/index.ts): `@stayos/auth` — the
+  single client-side auth module shared by the shell, LUMI, and PULSE (Cognito
+  sign-in/refresh, JWT decode, and the `localStorage` `stayos.*` session that
+  powers SSO). Consumed via a build-time TypeScript path alias.
+- [shared/data-orchestrator/infrastructure/data-orchestrator.yaml](shared/data-orchestrator/infrastructure/data-orchestrator.yaml):
+  the Unified Data Orchestrator nested stack (`StackPrefix` `stayos-data`) — the
+  `stayos-data-orchestrator` Step Functions state machine
+  (Quiesce -> Generate -> Reconcile -> UnQuiesce -> RegenerateBrief -> PrimeBaseline)
+  plus one per-property EventBridge Scheduler rule that rolls the demo dataset
+  forward at each property's local midnight.
+- [shared/data-orchestrator/handlers/generate_handler.py](shared/data-orchestrator/handlers/generate_handler.py):
+  the Generate step Lambda — re-anchors the deterministic 30-day window to a new
+  `Reference_Date` and idempotently upserts it (reuses the LUMI generators; never
+  bulk-deletes on the scheduled path).
+- [shared/data-orchestrator/handlers/prime_baseline_handler.py](shared/data-orchestrator/handlers/prime_baseline_handler.py):
+  the PrimeBaseline step Lambda — invokes the PULSE baseline builder after
+  un-quiesce to seed the ambient curated PULSE feed.
+
+## Shared data seams (PULSE-owned, orchestrator-consumed)
+
+- [pulse/backend/src/pulse/baseline/builder.py](pulse/backend/src/pulse/baseline/builder.py):
+  the curated PULSE baseline builder — deterministic, bounded reset-then-prime of
+  `pulse-alerts` items (`baselineManaged = True`, `baseline#` dedupe prefix) so a
+  presenter opens PULSE to a predictable ambient feed.
+- [pulse/backend/src/pulse/rule_engine/quiesce.py](pulse/backend/src/pulse/rule_engine/quiesce.py):
+  the PULSE quiesce seam — bounded, reversible suppression of rule-engine stream
+  consumption during the bulk roll-forward, called by the orchestrator's
+  Quiesce/UnQuiesce steps.
+- [pulse/backend/src/pulse/demo_simulator/simulator.py](pulse/backend/src/pulse/demo_simulator/simulator.py):
+  the demo scenario simulator behind the presenter live-fire routes
+  (`POST /demo/scenarios/{scenarioId}` + `/reset`, gated by `EnableDemoSimulator`)
+  — deterministic scenario catalog, variant-scoped runs, and reset.
+
+## PULSE Forecasting Agent (predictive, advisory)
+
+- [pulse/backend/services/forecast-agent/app.py](pulse/backend/services/forecast-agent/app.py):
+  the thin Strands entrypoint — binds one `propertyId`, orchestrates
+  read_signals -> run_forecast -> author_remediation_plan -> reconcile_alerts,
+  and performs no write-back of its own.
+- [pulse/backend/services/forecast-agent/forecast/engine.py](pulse/backend/services/forecast-agent/forecast/engine.py):
+  the PURE, deterministic Forecast Engine (no I/O, no clients, no model) — owns
+  the horizon, oversell classification, rooms-oversold, and integer 0-100
+  confidence. The determinism boundary: every number comes from here.
+- [pulse/backend/services/forecast-agent/forecast/narrative.py](pulse/backend/services/forecast-agent/forecast/narrative.py):
+  the Remediation Plan Author — Claude Sonnet authors only the narrative/steps
+  around the engine's fixed numbers (Bedrock Converse), with a deterministic
+  template fallback when no model is configured or it errors.
+- [pulse/backend/services/forecast-agent/forecast/alerts.py](pulse/backend/services/forecast-agent/forecast/alerts.py):
+  the Alert Writer — `dedupeKey` (`forecast#{propertyId}#OVERSELL#{day}`),
+  threshold gate, severity mapping, create-vs-update-in-place, resolve-when-no-
+  longer-forecast, and best-effort realtime/Web Push delivery.
+- [pulse/backend/functions/forecast-invoker/lambda_function.py](pulse/backend/functions/forecast-invoker/lambda_function.py):
+  the thin EventBridge Scheduler target that starts a `pulse-forecaster`
+  AgentCore Runtime session for a given `propertyId`.
+
+## Docs
+
+- [docs/data-model.md](docs/data-model.md): canonical platform-wide DynamoDB
+  data-model reference (LUMI + PULSE tables, keys/GSIs, volumes) plus the
+  Unified Data Orchestrator note — how the demo data is seeded, rolled forward,
+  quiesced, baselined, and fired live on stage.
+- [openapi.yaml](openapi.yaml): StayOS REST API spec — currently the PULSE
+  real-time alerts API (LUMI's REST spec is in [lumi/openapi.yaml](lumi/openapi.yaml)).
+- [AGENTS.md](AGENTS.md): root contributor/agent guide — repo-wide safety,
+  conventions, and per-feature workflow.
+- [stayos-shell/AGENTS.md](stayos-shell/AGENTS.md): StayOS shell agent guide.
+- [lumi/AGENTS.md](lumi/AGENTS.md): LUMI-specific agent guide.
+- [pulse/AGENTS.md](pulse/AGENTS.md): PULSE-specific agent guide.
+
+## Optional
+
+- [shared/README.md](shared/README.md): the cross-feature shared layer — the
+  populated `shared/auth/` module and why the infrastructure carve-out is still
+  deferred.
+- [CONTRIBUTING.md](CONTRIBUTING.md): how to scope a PR to one feature.
+- [CHANGELOG.md](CHANGELOG.md): notable changes per release; the latest entry is
+  `1.1.0` (the shared Data Orchestrator, the shell marketing landing page, plus
+  reliability and security fixes).

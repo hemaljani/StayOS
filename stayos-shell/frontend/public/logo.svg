@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="StayOS">
+  <!--
+    StayOS platform mark.
+
+    An "OS window" tile (rounded square, StayOS background) holding a rising
+    spectrum arc. The arc is shared DNA with LUMI's sun-arc, but rendered in the
+    StayOS platform gradient (accent blue #6b8fff -> accent-secondary violet
+    #9c7cff) so the platform owns its own identity rather than copying LUMI's
+    amber or PULSE's tri-tone. The arc + aperture dot read as a focal point
+    rising over a horizon: the platform that surfaces every feature.
+  -->
+  <defs>
+    <linearGradient id="stayosArc" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#6b8fff"/>
+      <stop offset="100%" stop-color="#9c7cff"/>
+    </linearGradient>
+  </defs>
+
+  <!-- OS window tile: matches the LUMI/PULSE favicon tile treatment for family consistency -->
+  <rect x="1" y="1" width="62" height="62" rx="15" fill="#080c18" stroke="#1e2740" stroke-width="1.5"/>
+
+  <!-- Rising arc (shared DNA with LUMI's sun) in the StayOS platform gradient -->
+  <path d="M 16 42 A 16 16 0 0 1 48 42" fill="none" stroke="url(#stayosArc)" stroke-width="4.5" stroke-linecap="round"/>
+
+  <!-- Horizon line beneath the arc -->
+  <line x1="15" y1="46" x2="49" y2="46" stroke="#334155" stroke-width="2.5" stroke-linecap="round"/>
+
+  <!-- Aperture / focal dot lifted above the arc crown as a distinct rising focal point -->
+  <circle cx="32" cy="18" r="3.5" fill="#c4b5ff"/>
+</svg>

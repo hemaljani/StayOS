@@ -1,0 +1,1323 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PULSE API stack: the REST API (API Gateway, pulse-api Lambda, Cognito JWT
+  auth, WAF) and the AppSync Events API for realtime alert delivery.
+
+# -------------------------------------------------------------------
+# Parameters
+# -------------------------------------------------------------------
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: pulse
+    Description: Prefix for all resource names (StackPrefix = pulse)
+
+  SharedAgentEcrRepo:
+    Type: String
+    Default: "stayos-chat-agent"
+    Description: >
+      Shared StayOS ECR repository (owned by LUMI) that the Triage Agent
+      container image is pushed to and pulled from. StayOS reuses the existing
+      shared agent repo (no per-feature repo); the triage image uses a distinct
+      tag (triage-latest). The triage AgentCore execution role is granted pull
+      on this repo.
+
+  EnableDemoSimulator:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: When true, expose the demo scenario API routes
+
+  # --- CORS ---
+  FrontendOrigin:
+    Type: String
+    Default: "*"
+    Description: >
+      Allowed CORS origin for the browser PWA. The PULSE frontend is served from
+      the shared StayOS CloudFront domain and sends the Cognito JWT in the
+      Authorization header (not cookies), so credentials are NOT required and a
+      permissive "*" is safe. Set to the exact CloudFront origin (e.g.
+      https://d2i4dji7rk5nxk.cloudfront.net) to lock it down.
+
+  # --- Lambda packaging (aws cloudformation package uploads here) ---
+  DeployBucket:
+    Type: String
+    Default: "pulse-deploy-artifacts"
+    Description: S3 bucket holding the shared PULSE Lambda deployment package
+  LambdaCodeS3Key:
+    Type: String
+    Default: "functions/pulse-backend.zip"
+    Description: S3 key of the shared PULSE Lambda deployment package
+
+  # --- Shared LUMI platform ARNs ---
+  UserPoolId:
+    Type: String
+    Description: LUMI Cognito user pool ID (REST authorizer + AppSync Events auth)
+  UserPoolClientId:
+    Type: String
+    Default: ""
+    Description: >
+      LUMI Cognito app client ID used as the JWT authorizer audience. Must be set
+      for the HTTP API JWT authorizer to validate tokens (thread from the LUMI
+      stack at deploy time).
+  WafWebAclArn:
+    Type: String
+    Default: ""
+    Description: >
+      LUMI WAF web ACL ARN. Associated with the AppSync Events API (which
+      supports WAFv2). HTTP APIs cannot be directly WAF-associated, so the REST
+      edge WAF is applied at the shared CloudFront distribution (LUMI).
+
+  # --- Web Push / realtime client config served via /config routes ---
+  VapidPublicKey:
+    Type: String
+    Default: ""
+    Description: VAPID public key served to the PWA for Web Push subscription
+
+  # --- Triage Agent (AgentCore Runtime) config ---
+  TriageModelId:
+    Type: String
+    Default: "us.anthropic.claude-sonnet-4-6"
+    Description: >
+      Bedrock model ID for the Triage Agent runtime (env-configurable, not
+      hardcoded; matches the LUMI chat model). Published to SSM so the
+      out-of-band CodeBuild/CLI deploy (Task 25) can set it on the runtime.
+
+  # --- Forecasting Agent (AgentCore Runtime) config ---
+  ForecastModelId:
+    Type: String
+    Default: "us.anthropic.claude-sonnet-4-6"
+    Description: >
+      Bedrock model ID the Forecasting Agent runtime uses to author the
+      Remediation_Plan narrative (env-configurable, not hardcoded; matches the
+      Triage Agent's TriageModelId and the LUMI chat model). Consumed as
+      FORECAST_MODEL_ID by the pulse-forecaster container, set on the runtime by
+      the out-of-band CodeBuild/CLI deploy the same way TriageModelId is.
+
+  # --- Shared StayOS AgentCore Gateway (C3b VIPs/Ops facade) ---
+  GatewayEndpointUrl:
+    Type: String
+    Default: ""
+    Description: >
+      Shared StayOS AgentCore Gateway MCP endpoint URL (SSM parameter
+      /<StackPrefix>/gateway/endpoint-url, owned by the LUMI shared-gateway
+      deploy), threaded to the pulse-ops-read facade as GATEWAY_ENDPOINT_URL.
+      Never hardcoded (PYQUALITY-06).
+
+  # --- PULSE table names / ARNs (from pulse-data) ---
+  AlertsTableName:
+    Type: String
+  AlertsTableArn:
+    Type: String
+  RulesTableName:
+    Type: String
+  RulesTableArn:
+    Type: String
+  AlertHistoryTableName:
+    Type: String
+  AlertHistoryTableArn:
+    Type: String
+  PushSubscriptionsTableName:
+    Type: String
+  PushSubscriptionsTableArn:
+    Type: String
+  KitchenTableName:
+    Type: String
+    Description: pulse-kitchen table name (Kitchen tab snapshot read)
+  KitchenTableArn:
+    Type: String
+    Description: pulse-kitchen table ARN (for the read-only IAM grant)
+
+  # --- LUMI operational-table ARNs / names (the Action Executor runs in-process
+  #     inside pulse-api on approval, so it needs operational write IAM + names) ---
+  ReservationsTableArn:
+    Type: String
+    Default: ""
+  RoomsTableArn:
+    Type: String
+    Default: ""
+  GuestsTableArn:
+    Type: String
+    Default: ""
+  ReservationsTableName:
+    Type: String
+    Default: ""
+    Description: stayos-reservations table name (in-process Action Executor env)
+  RoomsTableName:
+    Type: String
+    Default: ""
+    Description: stayos-rooms table name (in-process Action Executor env)
+  GuestsTableName:
+    Type: String
+    Default: ""
+    Description: stayos-guests table name (in-process Action Executor env)
+
+# -------------------------------------------------------------------
+# Conditions
+# -------------------------------------------------------------------
+Conditions:
+  # Gate the demo scenario routes so they can be excluded from a real deployment.
+  ShouldEnableDemoSimulator: !Equals [!Ref EnableDemoSimulator, "true"]
+  # Only associate a WAF web ACL when one was supplied.
+  HasWaf: !Not [!Equals [!Ref WafWebAclArn, ""]]
+
+# -------------------------------------------------------------------
+# Resources
+# -------------------------------------------------------------------
+Resources:
+
+  # =================================================================
+  # OBSERVABILITY - log group for the pulse-api Lambda
+  # =================================================================
+  PulseApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${StackPrefix}-api"
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: api
+
+  # =================================================================
+  # IAM ROLE - pulse-api Lambda (least privilege; region-suffixed name)
+  # Reads alerts/rules/history, writes alert lifecycle transitions,
+  # upserts rules, registers push subscriptions, and publishes the
+  # acknowledge ALERT_UPDATED realtime event.
+  # =================================================================
+  PulseApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-api-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: AlertsReadWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Feed/detail reads plus acknowledge/resolve/approve updates. The
+              # in-process Action Executor resolves an approved alert inside the
+              # same write-back transaction, so TransactWriteItems is required.
+              - Effect: Allow
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:Query"
+                  - "dynamodb:UpdateItem"
+                  - "dynamodb:TransactWriteItems"
+                Resource:
+                  - !Ref AlertsTableArn
+                  - !Sub "${AlertsTableArn}/index/*"
+        - PolicyName: OperationalWriteBack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The Action Executor runs in-process here on approval; it writes
+              # back the condition-clearing operational mutation as part of the
+              # RESOLVED transaction. UpdateItem + TransactWriteItems only (no
+              # DeleteItem, no table-level wildcard).
+              - Effect: Allow
+                Action:
+                  - "dynamodb:UpdateItem"
+                  - "dynamodb:TransactWriteItems"
+                Resource:
+                  - !Ref ReservationsTableArn
+                  - !Ref RoomsTableArn
+                  - !Ref GuestsTableArn
+        - PolicyName: DemoScenarioWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The demo scenario simulator runs in-process here (POST
+              # /demo/scenarios/{id}) and mutates the operational tables to raise
+              # or clear a condition: run does PutItem, reset does PutItem or
+              # DeleteItem. Scoped to the three operational tables only. This is a
+              # demo/presenter surface (gated by the demo routes); no wildcard.
+              - Effect: Allow
+                Action:
+                  - "dynamodb:PutItem"
+                  - "dynamodb:DeleteItem"
+                Resource:
+                  - !Ref ReservationsTableArn
+                  - !Ref RoomsTableArn
+                  - !Ref GuestsTableArn
+        - PolicyName: RulesReadWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:Query"
+                  - "dynamodb:PutItem"
+                Resource: !Ref RulesTableArn
+        - PolicyName: HistoryRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:Query"
+                Resource:
+                  - !Ref AlertHistoryTableArn
+                  - !Sub "${AlertHistoryTableArn}/index/*"
+        - PolicyName: SubscriptionsWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:PutItem"
+                  - "dynamodb:Query"
+                Resource: !Ref PushSubscriptionsTableArn
+        - PolicyName: KitchenRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # GET /kitchen: single-item read of the per-property snapshot.
+              - Effect: Allow
+                Action:
+                  - "dynamodb:GetItem"
+                Resource: !Ref KitchenTableArn
+        - PolicyName: RealtimePublish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Publish the acknowledge ALERT_UPDATED event to the realtime API.
+              - Effect: Allow
+                Action: "appsync:EventPublish"
+                Resource:
+                  - !GetAtt PulseRealtimeEventApi.ApiArn
+                  - !Sub "${PulseRealtimeEventApi.ApiArn}/*"
+        - PolicyName: Observability
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackPrefix}-*"
+              - Effect: Allow
+                Action:
+                  - "xray:PutTraceSegments"
+                  - "xray:PutTelemetryRecords"
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: api
+
+  # =================================================================
+  # LAMBDA - pulse-api (thin router; shared deployment package)
+  # =================================================================
+  PulseApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${StackPrefix}-api"
+      Description: PULSE REST API router (alerts, rules, approvals, push subs, config)
+      Runtime: python3.12
+      Handler: pulse.api.handler.lambda_handler
+      MemorySize: 512
+      Timeout: 30
+      Role: !GetAtt PulseApiRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref PulseApiLogGroup
+        LogFormat: JSON
+      Code:
+        S3Bucket: !Ref DeployBucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          ALERTS_TABLE_NAME: !Ref AlertsTableName
+          RULES_TABLE_NAME: !Ref RulesTableName
+          ALERT_HISTORY_TABLE_NAME: !Ref AlertHistoryTableName
+          PUSH_SUBSCRIPTIONS_TABLE_NAME: !Ref PushSubscriptionsTableName
+          KITCHEN_TABLE_NAME: !Ref KitchenTableName
+          # Operational write-back targets for the in-process Action Executor
+          # (names for the client; ARNs scope the IAM policy above).
+          RESERVATIONS_TABLE_NAME: !Ref ReservationsTableName
+          ROOMS_TABLE_NAME: !Ref RoomsTableName
+          GUESTS_TABLE_NAME: !Ref GuestsTableName
+          # Gate the in-process demo scenario routes. Mirrors EnableDemoSimulator
+          # so a real deployment (false) makes /demo/* return 404.
+          ENABLE_DEMO_SIMULATOR: !Ref EnableDemoSimulator
+          # Realtime + Web Push client config served via /config and used to
+          # publish the acknowledge ALERT_UPDATED event.
+          REALTIME_HTTP_ENDPOINT: !Sub "https://${PulseRealtimeEventApi.Dns.Http}"
+          REALTIME_WSS_ENDPOINT: !Sub "wss://${PulseRealtimeEventApi.Dns.Realtime}/event/realtime"
+          VAPID_PUBLIC_KEY: !Ref VapidPublicKey
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: api
+
+  # =================================================================
+  # HTTP API (API Gateway v2) + Cognito JWT authorizer
+  # A single catch-all proxy route delegates path routing to the thin
+  # pulse-api Lambda router. Every route requires a valid Cognito JWT.
+  # =================================================================
+  PulseHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${StackPrefix}-api"
+      ProtocolType: HTTP
+      Description: PULSE REST API (HTTP API proxying the pulse-api router)
+      # CORS for the browser PWA. With CORS configured, the HTTP API answers
+      # OPTIONS preflight itself WITHOUT invoking the JWT authorizer (otherwise
+      # the browser preflight - which carries no Authorization header - gets a
+      # 401 with no CORS headers and the real request fails as "Failed to fetch").
+      # The PWA sends the Cognito JWT in the Authorization header (not cookies),
+      # so AllowCredentials is intentionally omitted and AllowOrigins may be "*".
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref FrontendOrigin
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - PATCH
+          - DELETE
+          - OPTIONS
+        AllowHeaders:
+          - authorization
+          - content-type
+        MaxAge: 3600
+      Tags:
+        Project: StayOS
+        resilience-tier: business-critical
+        Component: api
+
+  PulseApiJwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref PulseHttpApi
+      AuthorizerType: JWT
+      Name: !Sub "${StackPrefix}-cognito-jwt"
+      IdentitySource:
+        - "$request.header.Authorization"
+      JwtConfiguration:
+        # LUMI Cognito user pool issuer; the app client ID is the audience.
+        Issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}"
+        Audience:
+          - !Ref UserPoolClientId
+
+  PulseApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PulseHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt PulseApiFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  # Catch-all authenticated route: the Lambda router matches the concrete path.
+  PulseApiProxyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PulseHttpApi
+      RouteKey: "ANY /{proxy+}"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref PulseApiJwtAuthorizer
+      Target: !Sub "integrations/${PulseApiIntegration}"
+
+  # Dedicated unauthenticated preflight route. The browser sends CORS preflight
+  # OPTIONS requests WITHOUT an Authorization header; because the "ANY /{proxy+}"
+  # route above also matches OPTIONS and requires JWT, the preflight would
+  # otherwise be routed to the authorizer and rejected with 401 (no valid CORS
+  # response), so the real request fails as "Failed to fetch". This explicit
+  # OPTIONS route with AuthorizationType NONE lets API Gateway answer preflight
+  # with the API's CorsConfiguration headers and no auth. It is preflight-only;
+  # actual data methods (GET/POST/...) still match the JWT route above.
+  PulseApiPreflightRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PulseHttpApi
+      RouteKey: "OPTIONS /{proxy+}"
+      AuthorizationType: NONE
+      Target: !Sub "integrations/${PulseApiIntegration}"
+
+  # Demo scenario routes (gated). Kept pointed at the pulse-api integration:
+  # the demo simulator lives in the same shared deployment package, so on Task
+  # 20 the choice is to invoke it in-process from the pulse-api router (like the
+  # Action Executor) rather than cross-invoking the standalone simulator Lambda.
+  # Consequently no lambda:InvokeFunction grant is needed here. The standalone
+  # pulse-demo-simulator Lambda (pipeline stack) remains for the ambient
+  # schedule and direct/async invocation.
+  PulseDemoScenarioRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: ShouldEnableDemoSimulator
+    Properties:
+      ApiId: !Ref PulseHttpApi
+      RouteKey: "ANY /demo/{proxy+}"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref PulseApiJwtAuthorizer
+      Target: !Sub "integrations/${PulseApiIntegration}"
+
+  # Unauthenticated CORS preflight for the demo routes. The "ANY /demo/{proxy+}"
+  # route above is more specific than the generic "OPTIONS /{proxy+}" preflight
+  # route, so it would otherwise capture the browser's OPTIONS preflight for a
+  # demo POST and reject it with 401 (no auth header on a preflight) -> the
+  # browser reports "Failed to fetch". This explicit OPTIONS route with
+  # AuthorizationType NONE lets API Gateway answer the demo preflight with the
+  # CorsConfiguration headers (the Lambda also short-circuits OPTIONS to 204).
+  PulseDemoPreflightRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: ShouldEnableDemoSimulator
+    Properties:
+      ApiId: !Ref PulseHttpApi
+      RouteKey: "OPTIONS /demo/{proxy+}"
+      AuthorizationType: NONE
+      Target: !Sub "integrations/${PulseApiIntegration}"
+
+  PulseApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref PulseHttpApi
+      # Lowercase version identifier per NAMING-05; the router tolerates the
+      # stage segment in the path.
+      StageName: "v1"
+      AutoDeploy: true
+      Tags:
+        Project: StayOS
+        resilience-tier: business-critical
+        Component: api
+
+  # Allow API Gateway to invoke the pulse-api Lambda.
+  PulseApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PulseApiFunction
+      Action: "lambda:InvokeFunction"
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PulseHttpApi}/*"
+
+  # =================================================================
+  # C3b VIPs/Ops READ FACADE (pulse-ops-read)
+  # A dedicated read-only facade Lambda that is an MCP client to the shared
+  # StayOS AgentCore Gateway (IAM auth). It serves GET /vips and GET /ops by
+  # calling the shared read-only tools (get_vip_guests, get_occupancy,
+  # get_room_status, get_work_orders) and shaping the results for the PWA VIPs
+  # and Ops tabs, so the PWA stays single-origin against the PULSE API
+  # (Component 5, Decision 9). Every request is property-scoped server-side from
+  # the caller's Cognito claims by the facade code.
+  # =================================================================
+
+  # Log group for the pulse-ops-read Lambda.
+  PulseOpsReadLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${StackPrefix}-ops-read"
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: api
+
+  # IAM role for the facade (least privilege; region-suffixed name). It only
+  # needs to invoke the shared Gateway over MCP, read the shared gateway SSM
+  # config, and write logs / X-Ray. No DynamoDB access: all data is read through
+  # the Gateway's read-only tools.
+  PulseOpsReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-ops-read-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        # Shared StayOS Gateway invocation for MCP tool discovery + tool calls
+        # (scoped like the Triage role: any gateway in this account/region).
+        - PolicyName: AgentCoreGateway
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "bedrock-agentcore:InvokeGateway"
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
+        # Read the shared gateway endpoint config from SSM (the facade resolves
+        # GATEWAY_ENDPOINT_URL from the env, threaded from this same SSM value).
+        - PolicyName: SsmGatewayConfigRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ssm:GetParameter"
+                  - "ssm:GetParameters"
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${StackPrefix}/gateway/*"
+        - PolicyName: Observability
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackPrefix}-*"
+              - Effect: Allow
+                Action:
+                  - "xray:PutTraceSegments"
+                  - "xray:PutTelemetryRecords"
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: api
+
+  # The facade Lambda (thin router; shared deployment package). The MCP client
+  # dependencies (mcp-proxy-for-aws, mcp/strands) must be present in the shared
+  # deployment package for this function to open the Gateway connection at
+  # runtime (they are imported lazily, so unit tests do not require them).
+  PulseOpsReadFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${StackPrefix}-ops-read"
+      Description: PULSE C3b VIPs/Ops read facade (MCP client to the shared Gateway)
+      Runtime: python3.12
+      Handler: pulse.ops_read.handler.lambda_handler
+      MemorySize: 512
+      Timeout: 30
+      Role: !GetAtt PulseOpsReadRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref PulseOpsReadLogGroup
+        LogFormat: JSON
+      Code:
+        S3Bucket: !Ref DeployBucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          # Shared Gateway MCP endpoint (threaded from SSM at deploy). The AWS
+          # region comes from the runtime-provided AWS_REGION (reserved; cannot
+          # be set here), which the facade resolves via _resolve_region().
+          GATEWAY_ENDPOINT_URL: !Ref GatewayEndpointUrl
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: api
+
+  # AWS_PROXY integration from the HTTP API to the facade Lambda.
+  PulseOpsReadIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PulseHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt PulseOpsReadFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  # JWT-authorized read routes for the VIPs and Ops tabs.
+  PulseVipsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PulseHttpApi
+      RouteKey: "GET /vips"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref PulseApiJwtAuthorizer
+      Target: !Sub "integrations/${PulseOpsReadIntegration}"
+
+  PulseOpsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PulseHttpApi
+      RouteKey: "GET /ops"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref PulseApiJwtAuthorizer
+      Target: !Sub "integrations/${PulseOpsReadIntegration}"
+
+  # Allow API Gateway to invoke the pulse-ops-read Lambda.
+  PulseOpsReadInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PulseOpsReadFunction
+      Action: "lambda:InvokeFunction"
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PulseHttpApi}/*"
+
+  # =================================================================
+  # APPSYNC EVENTS API (foreground realtime) + pulse channel namespace
+  # =================================================================
+
+  # Role AppSync assumes to push realtime access logs to CloudWatch.
+  PulseRealtimeLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-realtime-logs-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: PushToCloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/appsync/*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: api
+
+  PulseRealtimeEventApi:
+    Type: AWS::AppSync::Api
+    Properties:
+      Name: !Sub "${StackPrefix}-realtime"
+      EventConfig:
+        # Cognito (LUMI user pool) authorizes connect / subscribe / publish so
+        # realtime clients reuse the same JWT they already hold.
+        AuthProviders:
+          - AuthType: AMAZON_COGNITO_USER_POOLS
+            CognitoConfig:
+              UserPoolId: !Ref UserPoolId
+              AwsRegion: !Ref "AWS::Region"
+        ConnectionAuthModes:
+          - AuthType: AMAZON_COGNITO_USER_POOLS
+        DefaultPublishAuthModes:
+          - AuthType: AMAZON_COGNITO_USER_POOLS
+        DefaultSubscribeAuthModes:
+          - AuthType: AMAZON_COGNITO_USER_POOLS
+        LogConfig:
+          CloudWatchLogsRoleArn: !GetAtt PulseRealtimeLogRole.Arn
+          LogLevel: INFO
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: api
+
+  # The pulse channel namespace. The OnSubscribe/OnPublish authorization logic
+  # is realized as the namespace APPSYNC_JS CodeHandlers (this is the runtime
+  # counterpart of pulse.delivery.onsubscribe_handler; PulseOnSubscribeHandler
+  # is the onSubscribe function within this handler code, not a separate Lambda).
+  PulseRealtimeNamespace:
+    Type: AWS::AppSync::ChannelNamespace
+    Properties:
+      ApiId: !GetAtt PulseRealtimeEventApi.ApiId
+      Name: pulse
+      SubscribeAuthModes:
+        - AuthType: AMAZON_COGNITO_USER_POOLS
+      PublishAuthModes:
+        - AuthType: AMAZON_COGNITO_USER_POOLS
+      CodeHandlers: |
+        import { util } from '@aws-appsync/utils';
+
+        // Coerce to string via template literal. APPSYNC_JS does NOT support the
+        // String() global function (only String.prototype methods + template
+        // literals), so `${value}` is used instead of String(value).
+        function toStr(value) {
+          return `${value}`;
+        }
+
+        // Detect an array without Array.isArray (not supported in APPSYNC_JS):
+        // use a shape check instead.
+        function isArrayLike(value) {
+          return typeof value === 'object' && value !== null
+            && typeof value.length === 'number';
+        }
+
+        // Resolve the caller's associated properties from the Cognito claims.
+        // APPSYNC_JS also disallows passing a named function as an argument
+        // (so no callback .map/.filter) and try/catch; iterate with for-of.
+        // StayOS/LUMI GMs carry the SINGULAR custom:propertyId; multi-property
+        // operators may carry a plural custom:properties list. Both honored
+        // (see BUG-013).
+        function callerProperties(ctx) {
+          const claims = (ctx.identity && ctx.identity.claims) || {};
+          const raw = claims['custom:properties'] || claims['properties'] || '';
+          if (isArrayLike(raw)) {
+            const out = [];
+            for (const p of raw) { out.push(toStr(p)); }
+            if (out.length > 0) { return out; }
+          } else {
+            const text = toStr(raw).trim();
+            if (text) {
+              // JSON.parse returns "" (not a throw) on invalid JSON in
+              // APPSYNC_JS, so guard the result shape rather than catching.
+              if (text.charAt(0) === '[') {
+                const parsed = JSON.parse(text);
+                if (isArrayLike(parsed)) {
+                  const out = [];
+                  for (const p of parsed) { out.push(toStr(p)); }
+                  if (out.length > 0) { return out; }
+                }
+              } else {
+                const sep = text.indexOf(',') >= 0 ? ',' : ' ';
+                const parts = text.split(sep);
+                const result = [];
+                for (const part of parts) {
+                  const trimmed = part.trim();
+                  if (trimmed.length > 0) { result.push(trimmed); }
+                }
+                if (result.length > 0) { return result; }
+              }
+            }
+          }
+          // Fall back to the singular single-property claim (LUMI users carry
+          // custom:propertyId). Contributes exactly one property id.
+          const single = claims['custom:propertyId'] || claims['propertyId'] || '';
+          const singleText = toStr(single).trim();
+          if (singleText.length > 0) { return [singleText]; }
+          return [];
+        }
+
+        // Resolve the caller identity (their gmAlias) from the Cognito claims.
+        function callerAlias(ctx) {
+          const claims = (ctx.identity && ctx.identity.claims) || {};
+          return claims['cognito:username'] || claims['username'] || claims['email']
+            || (ctx.identity && ctx.identity.sub) || '';
+        }
+
+        // Membership check without a callback argument (indexOf on array is
+        // supported; avoids .includes()/.some() with a function argument).
+        function containsValue(list, value) {
+          return list.indexOf(value) >= 0;
+        }
+
+        // OnSubscribe (PulseOnSubscribeHandler): enforce property scope and
+        // per-user own-identity. Mirrors pulse.delivery.onsubscribe_handler.
+        // Note: AppSync Events cannot partially narrow a wildcard subscription,
+        // so the secure runtime rejects a raw '/pulse/alerts/*' wildcard and
+        // requires explicit per-property channels (the client enumerates its
+        // associated properties from its own claims).
+        export function onSubscribe(ctx) {
+          const path = ctx.info.channel.path;
+          const rawSegments = path.split('/');
+          const segments = [];
+          for (const s of rawSegments) {
+            if (s.length > 0) { segments.push(s); }
+          }
+          if (segments.length < 2 || segments[0] !== 'pulse' || segments[1] !== 'alerts') {
+            util.unauthorized();
+            return;
+          }
+          const rest = segments.slice(2);
+          const props = callerProperties(ctx);
+          const alias = callerAlias(ctx);
+          if (rest.length === 1) {
+            if (rest[0] === '*') { util.unauthorized(); return; }        // no raw wildcard
+            if (containsValue(props, rest[0])) { return; }               // associated property
+            util.unauthorized();
+            return;
+          }
+          if (rest.length === 2) {
+            if (containsValue(props, rest[0]) && rest[1] === alias) { return; }  // own channel
+            util.unauthorized();
+            return;
+          }
+          if (rest.length === 3 && rest[1] === 'detail') {
+            if (containsValue(props, rest[0])) { return; }
+            util.unauthorized();
+            return;
+          }
+          util.unauthorized();
+        }
+
+        // OnPublish: normalize/validate the event shape (not used for authz;
+        // publishing is a signed backend call).
+        export function onPublish(ctx) {
+          return ctx.events;
+        }
+
+  # Associate the LUMI WAF web ACL with the AppSync Events API (supported for
+  # AppSync). Only created when a web ACL ARN is supplied.
+  PulseRealtimeWafAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Condition: HasWaf
+    Properties:
+      ResourceArn: !GetAtt PulseRealtimeEventApi.ApiArn
+      WebACLArn: !Ref WafWebAclArn
+
+  # =================================================================
+  # TRIAGE AGENT (AgentCore Runtime) - execution role, log group, and
+  # SSM config. The Triage Agent is a containerized Strands agent on
+  # Amazon Bedrock AgentCore Runtime (design Decision 7), built and
+  # deployed OUT-OF-BAND via CodeBuild + AWS CLI (Task 25), mirroring the
+  # LUMI chat agent. It is NOT a CloudFormation resource; only its
+  # least-privilege runtime IAM role, its log group, and the SSM config it
+  # is configured from live here. The former pulse-triage-agent Lambda
+  # (pulse-pipeline.yaml) is removed in Task 7.4 - untouched here.
+  # =================================================================
+
+  # -----------------------------------------------------------------
+  # Triage AgentCore execution role - assumed by AgentCore Runtime to run
+  # the triage container. Least privilege (region-suffixed name):
+  # - bedrock-agentcore:InvokeGateway (MCP tool discovery/invocation over
+  #   the shared StayOS Gateway)
+  # - bedrock:InvokeModel* on Claude Sonnet (narrative brief)
+  # - dynamodb:GetItem + UpdateItem on pulse-alerts (conditional attach)
+  # - appsync:EventPublish scoped to the PULSE realtime API (ALERT_UPDATED)
+  # - ssm:GetParameter on the shared gateway endpoint + triage config params
+  # - ECR image pull + CloudWatch Logs write
+  # -----------------------------------------------------------------
+  PulseTriageAgentCoreRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-triage-agentcore-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        # Shared StayOS Gateway invocation for MCP tool discovery + tool calls.
+        - PolicyName: AgentCoreGateway
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "bedrock-agentcore:InvokeGateway"
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
+        # Bedrock model invocation for Claude Sonnet via the Converse API.
+        # us.anthropic.claude-sonnet-4-6 is a cross-region inference profile, so
+        # the foundation-model wildcard must span regions/partitions.
+        - PolicyName: BedrockInvokeModel
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "bedrock:InvokeModel"
+                  - "bedrock:InvokeModelWithResponseStream"
+                Resource:
+                  - "arn:aws:bedrock:*::foundation-model/anthropic.*"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+        # Conditional triage-brief attach to pulse-alerts (Decision 8). GetItem
+        # reads the item for the ALERT_UPDATED payload + terminal check;
+        # UpdateItem applies the conditional (status <> RESOLVED) attach.
+        - PolicyName: AlertsAttach
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:UpdateItem"
+                Resource:
+                  - !Ref AlertsTableArn
+        # Publish the ALERT_UPDATED (hasTriageBrief=true) event to the realtime
+        # API, scoped to the PULSE AppSync Events API.
+        - PolicyName: RealtimePublish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "appsync:EventPublish"
+                Resource:
+                  - !GetAtt PulseRealtimeEventApi.ApiArn
+                  - !Sub "${PulseRealtimeEventApi.ApiArn}/*"
+        # Read the shared gateway endpoint and the triage runtime config params
+        # from SSM (the deploy step sets container env from these).
+        - PolicyName: SsmConfigRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ssm:GetParameter"
+                  - "ssm:GetParameters"
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${StackPrefix}/gateway/*"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${StackPrefix}/triage/*"
+        # ECR image pull - AgentCore pulls the triage container at runtime.
+        - PolicyName: EcrImagePull
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "ecr:GetAuthorizationToken"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "ecr:BatchGetImage"
+                  - "ecr:GetDownloadUrlForLayer"
+                Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${SharedAgentEcrRepo}"
+        # CloudWatch Logs - container stdout/stderr and structured logging.
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "logs:PutResourcePolicy"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${StackPrefix}/agentcore/*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: api
+
+  # -----------------------------------------------------------------
+  # CloudWatch Log Group for triage agent container logs (structured JSON
+  # via Powertools). 14-day retention for demo/pilot operational visibility.
+  # -----------------------------------------------------------------
+  PulseTriageAgentCoreLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${StackPrefix}/agentcore/triage-agent"
+      RetentionInDays: 14
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: api
+
+  # -----------------------------------------------------------------
+  # SSM config for the triage runtime (SecureString not needed - none of
+  # these are secrets). The out-of-band deploy (Task 25) reads these to set
+  # the container env vars, and the runtime role is granted GetParameter on
+  # /${StackPrefix}/triage/*. The shared Gateway endpoint the runtime also
+  # needs lives at /${StackPrefix}/gateway/endpoint-url (owned by the LUMI
+  # shared-gateway deploy), which the role can read via the same policy.
+  # -----------------------------------------------------------------
+  PulseTriageModelIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${StackPrefix}/triage/model-id"
+      Type: String
+      Value: !Ref TriageModelId
+      Description: Bedrock model id for the Triage Agent runtime (TRIAGE_MODEL_ID)
+      Tags:
+        Project: StayOS
+        resilience-tier: business-critical
+        Component: api
+
+  PulseTriageAlertsTableParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${StackPrefix}/triage/alerts-table-name"
+      Type: String
+      Value: !Ref AlertsTableName
+      Description: pulse-alerts table name for the Triage Agent attach (ALERTS_TABLE_NAME)
+      Tags:
+        Project: StayOS
+        resilience-tier: business-critical
+        Component: api
+
+  PulseTriageRealtimeEndpointParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${StackPrefix}/triage/realtime-http-endpoint"
+      Type: String
+      Value: !Sub "https://${PulseRealtimeEventApi.Dns.Http}"
+      Description: AppSync Events HTTP publish endpoint for the Triage Agent (REALTIME_HTTP_ENDPOINT)
+      Tags:
+        Project: StayOS
+        resilience-tier: business-critical
+        Component: api
+
+  # =================================================================
+  # FORECASTING AGENT (AgentCore Runtime) - execution role + log group.
+  # The Forecasting Agent is a containerized Strands agent on Amazon
+  # Bedrock AgentCore Runtime (design "Runtime placement decision"),
+  # mirroring the Triage Agent one-for-one. Like the Triage Agent, the
+  # runtime itself is built (Finch) and deployed OUT-OF-BAND via
+  # CodeBuild + AWS CLI (per services/forecast-agent/agentcore.yaml), so
+  # it is NOT a CloudFormation resource here; only its least-privilege
+  # execution role and its container log group live in this stack (the
+  # ForecastModelId parameter above is published to the runtime by that
+  # out-of-band deploy). The daily EventBridge Scheduler + invoker that
+  # start a runtime session live in pulse-pipeline.yaml (Task 14).
+  # =================================================================
+
+  # -----------------------------------------------------------------
+  # Forecaster AgentCore execution role - assumed by AgentCore Runtime to
+  # run the pulse-forecaster container. LEAST PRIVILEGE (region-suffixed
+  # name), and deliberately ADVISORY-ONLY (Req 5.1): it can write ONLY the
+  # PULSE-owned pulse-alerts table - it has NO grant to write any LUMI
+  # operational table, NO dynamodb:TransactWriteItems, and NO
+  # lambda:InvokeFunction on the Action Executor. Grants:
+  # - dynamodb PutItem/UpdateItem/Query/GetItem on pulse-alerts + indexes
+  #   (create/update-in-place a predictive alert; Query the
+  #   propertyId-status-index for open-record reconciliation)
+  # - bedrock-agentcore:InvokeGateway (read-only MCP tools over the shared
+  #   StayOS Gateway - no new gateway; reuses GatewayEndpointUrl)
+  # - bedrock:InvokeModel* on Claude Sonnet (authors the Remediation_Plan;
+  #   mirrors the Triage role's cross-region inference-profile grant)
+  # - logs CreateLogStream/PutLogEvents on the shared /pulse/pipeline group
+  #   (the forecaster emits its structured logs to the unified pipeline log
+  #   group, like the Triage Agent and the rest of the pipeline)
+  # - appsync:EventPublish scoped to the PULSE realtime API (the delivery
+  #   layer publishes ALERT_UPDATED / ALERT_RESOLVED; mirrors the Triage /
+  #   delivery realtime-publish grant)
+  # - X-Ray put actions (single trace across Scheduler -> invoker ->
+  #   Runtime -> Gateway -> DynamoDB/Bedrock)
+  # -----------------------------------------------------------------
+  PulseForecasterAgentCoreRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-forecaster-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              # AgentCore Runtime assumes this role to run the container
+              # (same principal as the Triage AgentCore execution role).
+              Service: bedrock-agentcore.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        # PULSE-owned alerts table only (advisory posture). PutItem/UpdateItem
+        # create-or-update-in-place the predictive alert; Query/GetItem drive
+        # open-record lookup + reconciliation. Scoped to the table AND its
+        # indexes (Query uses propertyId-status-index). No DeleteItem, no
+        # TransactWriteItems, no LUMI operational-table ARN.
+        - PolicyName: AlertsReadWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:PutItem"
+                  - "dynamodb:UpdateItem"
+                  - "dynamodb:Query"
+                  - "dynamodb:GetItem"
+                Resource:
+                  - !Ref AlertsTableArn
+                  - !Sub "${AlertsTableArn}/index/*"
+        # Shared StayOS Gateway invocation for the read-only MCP tool subset
+        # (get_occupancy, get_revenue, get_sister_property_availability). Reuses
+        # the existing GatewayEndpointUrl - no new gateway is created.
+        - PolicyName: AgentCoreGateway
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "bedrock-agentcore:InvokeGateway"
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
+        # Bedrock model invocation for Claude Sonnet via the Converse API to
+        # author the Remediation_Plan. FORECAST_MODEL_ID
+        # (us.anthropic.claude-sonnet-4-6) is a cross-region inference profile,
+        # so the grant spans the inference-profile ARN plus the underlying
+        # cross-region foundation-model ARNs (mirrors the Triage role).
+        - PolicyName: BedrockInvokeModel
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "bedrock:InvokeModel"
+                  - "bedrock:InvokeModelWithResponseStream"
+                Resource:
+                  - "arn:aws:bedrock:*::foundation-model/anthropic.*"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+        # ECR image pull - AgentCore pulls the forecaster container at runtime
+        # from the SHARED ECR repo (same repo as the chat/triage agents, under
+        # the distinct 'forecaster-latest' tag). Mirrors the Triage role's
+        # EcrImagePull grant; without it CreateAgentRuntime fails with
+        # "Access denied while validating ECR URI".
+        - PolicyName: EcrImagePull
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "ecr:GetAuthorizationToken"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "ecr:BatchGetImage"
+                  - "ecr:GetDownloadUrlForLayer"
+                Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${SharedAgentEcrRepo}"
+        # Publish ALERT_UPDATED / ALERT_RESOLVED to the realtime API via the
+        # existing delivery layer (SigV4 to the AppSync Events endpoint),
+        # scoped to the PULSE realtime API (mirrors the Triage / delivery
+        # realtime-publish grant).
+        - PolicyName: RealtimePublish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "appsync:EventPublish"
+                Resource:
+                  - !GetAtt PulseRealtimeEventApi.ApiArn
+                  - !Sub "${PulseRealtimeEventApi.ApiArn}/*"
+        # CloudWatch Logs - the forecaster emits its structured JSON logs to
+        # the shared unified pipeline log group (/pulse/pipeline), AND its
+        # container stdout/stderr is captured by the AgentCore Runtime into the
+        # runtime log group (/aws/bedrock-agentcore/runtimes/*). Without the
+        # runtime + agentcore grants (which the Triage role has) AgentCore's log
+        # delivery is denied and NO runtime log group is ever created, so the
+        # agent runs but is invisible in CloudWatch (see docs/bugs.md BUG-007).
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "logs:PutResourcePolicy"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${StackPrefix}/agentcore/*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${StackPrefix}/pipeline"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${StackPrefix}/pipeline:*"
+        # X-Ray - the forecaster segment is part of the single end-to-end
+        # trace (Scheduler -> invoker -> Runtime -> Gateway -> DynamoDB/Bedrock).
+        - PolicyName: XRayTracing
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "xray:PutTraceSegments"
+                  - "xray:PutTelemetryRecords"
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: forecasting
+
+  # -----------------------------------------------------------------
+  # CloudWatch Log Group for the forecast agent container (structured JSON
+  # via Powertools). 14-day retention for demo/pilot operational visibility,
+  # mirroring the Triage Agent log group.
+  # -----------------------------------------------------------------
+  PulseForecasterAgentCoreLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${StackPrefix}/agentcore/forecast-agent"
+      RetentionInDays: 14
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: forecasting
+
+  # -----------------------------------------------------------------
+  # SSM config for the forecaster runtime model id (not a secret). The
+  # out-of-band CodeBuild/CLI runtime deploy reads this to set the
+  # FORECAST_MODEL_ID container env var, exactly as PulseTriageModelIdParam
+  # feeds the Triage Agent's TRIAGE_MODEL_ID. Sourced from the ForecastModelId
+  # parameter so the model id is env-configurable and never hardcoded.
+  # -----------------------------------------------------------------
+  PulseForecastModelIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${StackPrefix}/forecast/model-id"
+      Type: String
+      Value: !Ref ForecastModelId
+      Description: Bedrock model id for the Forecasting Agent runtime (FORECAST_MODEL_ID)
+      Tags:
+        Project: StayOS
+        resilience-tier: standard
+        Component: forecasting
+
+# -------------------------------------------------------------------
+# Outputs
+# The client fetches the realtime endpoints via GET /config/realtime;
+# the pipeline stack consumes RealtimeHttpEndpoint / RealtimeApiArn to
+# publish alert events (Task 13/20 wiring).
+# -------------------------------------------------------------------
+Outputs:
+  ApiEndpoint:
+    Description: PULSE HTTP API invoke URL (stage v1)
+    Value: !Sub "https://${PulseHttpApi}.execute-api.${AWS::Region}.amazonaws.com/v1"
+
+  RealtimeHttpEndpoint:
+    Description: AppSync Events HTTP publish endpoint base (code appends /event)
+    Value: !Sub "https://${PulseRealtimeEventApi.Dns.Http}"
+
+  RealtimeWssEndpoint:
+    Description: AppSync Events WebSocket (realtime) endpoint domain
+    Value: !Sub "wss://${PulseRealtimeEventApi.Dns.Realtime}/event/realtime"
+
+  RealtimeApiArn:
+    Description: AppSync Events API ARN (for appsync:EventPublish scoping)
+    Value: !GetAtt PulseRealtimeEventApi.ApiArn
+
+  RealtimeApiId:
+    Description: AppSync Events API ID
+    Value: !GetAtt PulseRealtimeEventApi.ApiId
+
+  TriageAgentCoreRoleArn:
+    Description: IAM role ARN assumed by the Triage Agent AgentCore Runtime container
+    Value: !GetAtt PulseTriageAgentCoreRole.Arn
+
+  TriageAgentCoreLogGroupName:
+    Description: CloudWatch log group name for the Triage Agent container
+    Value: !Ref PulseTriageAgentCoreLogGroup
+
+  ForecasterAgentCoreRoleArn:
+    Description: IAM role ARN assumed by the Forecasting Agent AgentCore Runtime container
+    Value: !GetAtt PulseForecasterAgentCoreRole.Arn
+
+  ForecasterAgentCoreLogGroupName:
+    Description: CloudWatch log group name for the Forecasting Agent container
+    Value: !Ref PulseForecasterAgentCoreLogGroup
+
+  OpsReadFunctionArn:
+    Description: ARN of the C3b VIPs/Ops read facade Lambda (pulse-ops-read)
+    Value: !GetAtt PulseOpsReadFunction.Arn

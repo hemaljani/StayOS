@@ -1,0 +1,177 @@
+# =============================================================================
+# AgentCore Runtime Configuration - PULSE Triage Agent
+# =============================================================================
+# Documents the runtime configuration for deploying the PULSE Triage Agent to
+# Amazon Bedrock AgentCore Runtime. This mirrors the LUMI chat agent's
+# agentcore.yaml (the proven StayOS platform pattern).
+#
+# DEPLOYMENT METHOD: CodeBuild + AWS CLI (Task 25)
+# ------------------------------------------------
+# Deployment is automated out-of-band from the CloudFormation nested stacks
+# (matching LUMI's agent model, design Decision 7):
+#   1. CodeBuild builds an ARM64 container image (Containerfile) and pushes to ECR
+#   2. AWS CLI (`aws bedrock-agentcore-control`) creates/updates the runtime
+#   3. The runtime ARN is written to SSM /${StackPrefix}/triage/runtime-arn so
+#      the Rule Engine can InvokeAgentRuntime (Task 7.3)
+#
+# The AgentCore CLI (`agentcore deploy`) is NOT used; build is via Finch/CodeBuild.
+# =============================================================================
+
+# -------------------------------------------------------------------
+# Agent Metadata
+# -------------------------------------------------------------------
+agent:
+  name: pulse-triage-agent
+  description: >
+    PULSE triage agent for hotel General Managers. Invoked asynchronously by the
+    Rule Engine (bedrock-agentcore:InvokeAgentRuntime, Decision 8) with
+    {alertId, alertType, propertyId, tier}. A Strands Agent backed by Claude
+    Sonnet gathers per-alert-type facts through the shared StayOS AgentCore
+    Gateway (MCP), generates a validated triageBrief (reusing pulse.triage for
+    strict-JSON validation and the deterministic structural guarantees), then
+    attaches it to pulse-alerts (conditional on non-terminal status) and
+    publishes ALERT_UPDATED (hasTriageBrief=true) via the shared realtime helper.
+
+# -------------------------------------------------------------------
+# Runtime Configuration
+# -------------------------------------------------------------------
+runtime:
+  # Python 3.12 runtime environment (matches requirements.txt / Containerfile)
+  language: python3.12
+
+  # ARM64 (Graviton) for cost efficiency, matching the LUMI chat agent
+  architecture: arm64
+
+  # Application entry point - BedrockAgentCoreApp starts Uvicorn on port 8080
+  entrypoint: server.py
+
+  # AgentCore protocol contract requires port 8080
+  port: 8080
+
+  # Container-based deployment via CodeBuild + ECR (built from the Containerfile
+  # in this directory, which also bundles the pulse package)
+  buildType: Container
+
+# -------------------------------------------------------------------
+# Environment Variables
+# -------------------------------------------------------------------
+# Set on the deployed AgentCore container via the create/update-agent-runtime
+# CLI call. Values come from CloudFormation stack outputs and SSM Parameter
+# Store (never hardcoded; PYQUALITY-06 / NAMING-02).
+# -------------------------------------------------------------------
+environment:
+  # Shared StayOS AgentCore Gateway MCP endpoint (Streamable HTTP, IAM auth).
+  # Sourced from SSM /${StackPrefix}/gateway/endpoint-url (the SAME shared
+  # Gateway the LUMI chat agent uses; the PULSE tools were added to that
+  # Gateway target in Task 7.1).
+  GATEWAY_ENDPOINT_URL: <from-ssm:/pulse/gateway/endpoint-url>
+
+  # Bedrock model id for the narrative brief (matches LUMI's chat model). Never
+  # hardcoded - the approved model can change without code (Decision 5).
+  TRIAGE_MODEL_ID: us.anthropic.claude-sonnet-4-6
+
+  # pulse-alerts physical table name - the conditional triageBrief attach target.
+  ALERTS_TABLE_NAME: <from-cloudformation:PulseDataStack.Outputs.AlertsTableName>
+
+  # AppSync Events HTTP publish endpoint for ALERT_UPDATED (best-effort; the
+  # publish is skipped when unset). Sourced from the pulse-api realtime API.
+  REALTIME_HTTP_ENDPOINT: <from-cloudformation:PulseApiStack.Outputs.RealtimeHttpEndpoint>
+
+  # AWS region for the Gateway SigV4 signer, Bedrock, and boto3 clients.
+  AWS_DEFAULT_REGION: us-east-1
+
+  # Structured logging level.
+  LOG_LEVEL: INFO
+
+# -------------------------------------------------------------------
+# IAM Execution Role
+# -------------------------------------------------------------------
+# The AgentCore container assumes this role at runtime. It provides:
+# - bedrock-agentcore:InvokeGateway for MCP tool discovery and invocation
+# - bedrock:InvokeModel / InvokeModelWithResponseStream on Claude Sonnet
+# - dynamodb:GetItem + UpdateItem on pulse-alerts (conditional brief attach)
+# - appsync:EventPublish scoped to the PULSE realtime API (ALERT_UPDATED)
+# - ssm:GetParameter on the gateway endpoint + triage runtime config params
+# - ecr image pull + CloudWatch Logs write
+#
+# Defined in: pulse/infrastructure/nested-stacks/pulse-api.yaml
+#   (PulseTriageAgentCoreRole)
+# Naming pattern: ${StackPrefix}-triage-agentcore-role-${AWS::Region}
+# -------------------------------------------------------------------
+iam:
+  executionRoleArn: arn:aws:iam::<ACCOUNT_ID>:role/pulse-triage-agentcore-role-us-east-1
+
+# -------------------------------------------------------------------
+# Logging Configuration
+# -------------------------------------------------------------------
+# Container logs route to CloudWatch Logs via Powertools Logger (structured
+# JSON). The log group is created by CloudFormation with 14-day retention.
+#
+# Defined in: pulse/infrastructure/nested-stacks/pulse-api.yaml
+#   (PulseTriageAgentCoreLogGroup)
+# -------------------------------------------------------------------
+logging:
+  logGroupName: /pulse/agentcore/triage-agent
+  retentionDays: 14
+
+# -------------------------------------------------------------------
+# Lifecycle Configuration
+# -------------------------------------------------------------------
+# This is a request-response service (one invocation triages one alert), so it
+# holds no long-lived sessions. The relaxed tier latency targets are enforced in
+# server.py (CRITICAL <= 30 s, WARNING <= 60 s, Decision 8 / Requirement 10.6);
+# on breach the invocation records a triage-failure and leaves the alert
+# brief-less (Requirement 1.7). maxLifetime is the platform default; no
+# invocation should approach it.
+# -------------------------------------------------------------------
+lifecycle:
+  # Reclaim the microVM after this idle period between invocations (seconds).
+  idleRuntimeSessionTimeout: 900
+
+  # Maximum container lifetime (seconds) - 8 hours absolute cap.
+  maxLifetime: 28800
+
+# -------------------------------------------------------------------
+# Health Check (AgentCore Protocol Contract)
+# -------------------------------------------------------------------
+# The container implements GET /ping returning {"status": "Healthy"} (this is a
+# stateless request-response service, so it never reports HealthyBusy).
+# -------------------------------------------------------------------
+healthCheck:
+  endpoint: /ping
+  healthyResponse: '{"status": "Healthy"}'
+
+# =============================================================================
+# DEPLOYMENT WORKFLOW (Task 25 - out-of-band from the nested stacks)
+# =============================================================================
+#
+# Prerequisites:
+#   1. Deploy the CloudFormation stacks (creates the IAM role, ECR repo,
+#      CodeBuild project, log group, and SSM params):
+#      $ make deploy-infra
+#   2. Ensure the shared StayOS Gateway endpoint is in SSM
+#      /${StackPrefix}/gateway/endpoint-url (LUMI gateway-deploy) and the PULSE
+#      tools are registered on its target (Task 7.1).
+#
+# Build (ARM64 container image via CodeBuild):
+#   - Stage backend/src/pulse into the build context as ./pulse
+#   - Zip the triage-agent source (excluding tests/__pycache__/agentcore.yaml)
+#   - Trigger CodeBuild (Graviton, native ARM64); the image is pushed to ECR
+#     ${AccountId}.dkr.ecr.${Region}.amazonaws.com/pulse-triage-agent:latest
+#   Local equivalent (AWS Finch, not docker):
+#     $ finch build --platform linux/arm64 -t pulse-triage-agent -f Containerfile .
+#
+# Deploy (AgentCore Runtime via AWS CLI):
+#   - First deploy: `aws bedrock-agentcore-control create-agent-runtime`
+#     (container config, role ARN, env vars incl. GATEWAY_ENDPOINT_URL from SSM,
+#     network mode PUBLIC); save the runtime ARN to SSM
+#     /${StackPrefix}/triage/runtime-arn (consumed by the Rule Engine, Task 7.3)
+#   - Subsequent deploys: `aws bedrock-agentcore-control update-agent-runtime`
+#   - Runtime name: ${StackPrefix}_triage_agent
+#
+# Local development:
+#   $ cd backend/services/triage-agent
+#   $ PYTHONPATH=../../src python server.py   # serves on http://localhost:8080
+#   # Set GATEWAY_ENDPOINT_URL, TRIAGE_MODEL_ID, ALERTS_TABLE_NAME,
+#   # REALTIME_HTTP_ENDPOINT, AWS_DEFAULT_REGION in your shell or .env first.
+# =============================================================================

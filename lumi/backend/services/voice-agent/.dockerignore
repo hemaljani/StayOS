@@ -1,0 +1,41 @@
+# .dockerignore for the StayOS LUMI Voice Agent container build
+# Excludes test files, caches, local config, and development artifacts
+# to keep the production image minimal and secure.
+
+# Python caches and compiled bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Test files - not needed in production
+tests/
+
+# AgentCore CLI config directory (deleted - no longer used)
+# Kept here in case the directory is recreated accidentally
+agentcore/
+
+# AgentCore manifest - informational only, not needed at runtime
+agentcore.yaml
+
+# Version control
+.git/
+.gitignore
+
+# IDE and OS artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artifacts
+*.egg-info/
+dist/
+build/

@@ -1,0 +1,4 @@
+# Cognito Client IDs are public values (embedded in browser JS bundles).
+# They are not secrets - they identify the app, not authenticate it.
+451397dfe9e29e2f74d6b2e2606c9612cd5f155e:frontend/.env.production:generic-api-key:3
+88658dfcba880e1a0f32625240c5823e4b4ddb7f:frontend/.env.production:generic-api-key:3

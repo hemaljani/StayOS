@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <!--
+    StayOS favicon: compact version of the platform mark (public/logo.svg).
+    OS-window tile holding the rising spectrum arc in the StayOS accent gradient
+    (blue #6b8fff -> violet #9c7cff), with an aperture dot at the crown.
+  -->
+  <defs>
+    <linearGradient id="stayosArcFav" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#6b8fff"/>
+      <stop offset="100%" stop-color="#9c7cff"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="7" fill="#080c18"/>
+  <path d="M 8 21 A 8 8 0 0 1 24 21" fill="none" stroke="url(#stayosArcFav)" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="7.5" y1="23" x2="24.5" y2="23" stroke="#334155" stroke-width="1.5" stroke-linecap="round"/>
+  <circle cx="16" cy="9" r="1.8" fill="#c4b5ff"/>
+</svg>

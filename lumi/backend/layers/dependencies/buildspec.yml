@@ -1,0 +1,23 @@
+version: 0.2
+
+phases:
+  build:
+    commands:
+      - test "$(uname -m)" = "x86_64"
+      - test "$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" = "3.12"
+      - rm -rf python stayos-dependencies-layer.zip
+      - mkdir -p python/lib/python3.12/site-packages
+      - >-
+        python3 -m pip install
+        --requirement requirements.txt
+        --target python/lib/python3.12/site-packages
+        --only-binary=:all:
+        --disable-pip-version-check
+        --no-warn-conflicts
+        --quiet
+      - >-
+        PYTHONPATH=python/lib/python3.12/site-packages
+        python3 -c
+        "import cffi, charset_normalizer, cryptography, jwt, requests, wrapt"
+      - zip -r stayos-dependencies-layer.zip python -x "*.pyc" "__pycache__/*" > /dev/null
+      - aws s3 cp stayos-dependencies-layer.zip "s3://${DEPLOY_BUCKET}/${LAYER_S3_KEY}" --quiet

@@ -1,0 +1,1799 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PULSE pipeline stack: the rule-evaluator, escalation, push, info-batcher, and
+  history-writer Lambdas with their DynamoDB stream mappings and EventBridge
+  Scheduler group for escalation and delivery.
+
+# -------------------------------------------------------------------
+# Parameters
+# -------------------------------------------------------------------
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: pulse
+    Description: Prefix for all resource names (StackPrefix = pulse)
+
+  TriageModelId:
+    Type: String
+    Default: "us.anthropic.claude-sonnet-4-6"
+    Description: Bedrock model ID for the Triage Agent (env-configurable, not hardcoded)
+
+  TriageRuntimeArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of the Triage Agent AgentCore Runtime (bedrock-agentcore runtime/*).
+      Empty until the runtime is deployed out-of-band; the value is set
+      post-deploy from the SSM triage/runtime-arn parameter and threaded into
+      the triage invoker's TRIAGE_RUNTIME_ARN env var. When empty, the invoker
+      skips the runtime invocation (the alert is still delivered).
+
+  ForecastAgentRuntimeArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of the Forecasting Agent AgentCore Runtime (pulse-forecaster).
+      Empty until the runtime is deployed out-of-band; the value is set
+      post-deploy from the SSM /pulse/forecast/runtime-arn parameter and
+      threaded into the forecaster invoker's FORECAST_AGENT_RUNTIME_ARN env
+      var. When empty, the invoker logs a warning and skips the session start.
+
+  EnableDemoSimulator:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: When true, create the demo scenario simulator (Lambda, schedule, IAM)
+
+  # --- Lambda packaging (aws cloudformation package uploads here) ---
+  DeployBucket:
+    Type: String
+    Default: "pulse-deploy-artifacts"
+    Description: >
+      S3 bucket holding the shared Lambda deployment package. Overridden at
+      deploy time; `aws cloudformation package` rewrites Code to this bucket.
+  LambdaCodeS3Key:
+    Type: String
+    Default: "functions/pulse-backend.zip"
+    Description: S3 key of the shared PULSE Lambda deployment package
+
+  # --- Foreground realtime (AppSync Events) publish target ---
+  RealtimeHttpEndpoint:
+    Type: String
+    Default: ""
+    Description: >
+      AppSync Events HTTP publish endpoint (from pulse-api, Task 16). Empty at
+      skeleton stage: realtime publish is best-effort and is skipped when unset.
+  RealtimeApiArn:
+    Type: String
+    Default: "*"
+    Description: >
+      AppSync Events API ARN for scoping appsync:EventPublish. Defaults to "*"
+      until the realtime API ARN is threaded from pulse-api (tightened later).
+
+  # --- Web Push (VAPID) secret ---
+  VapidSecretName:
+    Type: String
+    Default: "pulse/webpush/vapid"
+    Description: Secrets Manager name holding the VAPID private key (never logged)
+
+  # --- INFO batching interval ---
+  InfoBatchIntervalMin:
+    Type: Number
+    Default: 15
+    MinValue: 5
+    MaxValue: 60
+    Description: INFO alert batching interval in minutes (Requirement 13.3)
+
+  # --- Time-based alert auto-resolve sweeper ---
+  AlertTimeoutMinutes:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: >
+      Age (minutes) after which a still-open alert is auto-resolved by the
+      timeout sweeper (resolvedBy=system-timeout). Older alerts stay visible in
+      the live feed until this age, then move to resolved history.
+  AlertSweepRate:
+    Type: String
+    Default: "rate(5 minutes)"
+    Description: How often the alert timeout sweeper runs (EventBridge rate).
+
+  # --- PULSE table names / ARNs (from pulse-data) ---
+  AlertsTableName:
+    Type: String
+  AlertsTableArn:
+    Type: String
+  AlertsStreamArn:
+    Type: String
+  RulesTableName:
+    Type: String
+  RulesTableArn:
+    Type: String
+  AlertHistoryTableName:
+    Type: String
+  AlertHistoryTableArn:
+    Type: String
+  PushSubscriptionsTableName:
+    Type: String
+  PushSubscriptionsTableArn:
+    Type: String
+
+  # --- LUMI operational-table stream ARNs (source events) ---
+  ReservationsStreamArn:
+    Type: String
+  RoomsStreamArn:
+    Type: String
+  GuestsStreamArn:
+    Type: String
+  RevenuesStreamArn:
+    Type: String
+  WorkOrdersStreamArn:
+    Type: String
+
+  # --- LUMI operational-table ARNs (read for triage context; Action Executor
+  #     / Simulator write-back targets) ---
+  ReservationsTableArn:
+    Type: String
+    Default: ""
+  RoomsTableArn:
+    Type: String
+    Default: ""
+  GuestsTableArn:
+    Type: String
+    Default: ""
+  RevenuesTableArn:
+    Type: String
+    Default: ""
+  WorkOrdersTableArn:
+    Type: String
+    Default: ""
+
+  # --- LUMI operational-table NAMES (env vars for the Action Executor and
+  #     Demo Simulator write-backs; names are needed at runtime, ARNs for IAM) ---
+  ReservationsTableName:
+    Type: String
+    Default: ""
+    Description: stayos-reservations table name (Action Executor / Simulator env)
+  RoomsTableName:
+    Type: String
+    Default: ""
+    Description: stayos-rooms table name (Action Executor / Simulator env)
+  GuestsTableName:
+    Type: String
+    Default: ""
+    Description: stayos-guests table name (Action Executor / Simulator env)
+
+  # --- Demo simulator ambient schedule ---
+  SimulatorAmbientRate:
+    Type: String
+    Default: "rate(5 minutes)"
+    Description: >
+      Ambient demo-simulator schedule rate. The schedule is created DISABLED
+      (opt-in); this only sets the rate it fires at once enabled.
+
+# -------------------------------------------------------------------
+# Conditions
+# -------------------------------------------------------------------
+Conditions:
+  # Gate the demo simulator (Lambda + schedule + write IAM) so a real
+  # deployment can exclude it by setting EnableDemoSimulator=false (Task 20).
+  ShouldEnableDemoSimulator: !Equals [!Ref EnableDemoSimulator, "true"]
+
+# -------------------------------------------------------------------
+# Resources
+# -------------------------------------------------------------------
+Resources:
+
+  # =================================================================
+  # LAMBDA PACKAGE BUILD (CodeBuild, x86_64 Linux)
+  # Builds the shared pulse-backend.zip on Linux so native wheels (e.g.
+  # pydantic_core, pulled in by the pulse-ops-read [ops-read] MCP/strands
+  # extra) match the Lambda runtime (x86_64, python3.12). Building the zip on a
+  # non-Linux host packages host wheels that fail at runtime with
+  # "No module named 'pydantic_core._pydantic_core'" (BUG-017). Mirrors the
+  # StayOS build-on-CodeBuild pattern used for the agent containers; the zip is
+  # uploaded back to the deploy bucket at the Lambda code key. NO Docker/Finch.
+  # =================================================================
+  PulseBackendBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-backend-build-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        # Read the uploaded backend source zip, and write the built deployment
+        # zip back to the same deploy bucket (scoped to that bucket).
+        - PolicyName: S3SourceAndArtifact
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${DeployBucket}/*"
+              - Effect: Allow
+                Action: s3:GetBucketLocation
+                Resource: !Sub "arn:aws:s3:::${DeployBucket}"
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${StackPrefix}-backend-build:*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: pipeline
+
+  PulseBackendBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${StackPrefix}-backend-build"
+      Description: Builds the shared PULSE Lambda deployment zip on x86_64 Linux (correct native wheels)
+      ServiceRole: !GetAtt PulseBackendBuildRole.Arn
+      TimeoutInMinutes: 15
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        # amazonlinux x86_64 standard 5.0 ships Python 3.12 (matches the Lambda
+        # runtime architecture + version so native wheels are compatible).
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: DEPLOY_BUCKET
+            Value: !Ref DeployBucket
+          - Name: LAMBDA_CODE_S3_KEY
+            Value: !Ref LambdaCodeS3Key
+      Source:
+        Type: S3
+        Location: !Sub "${DeployBucket}/backend-source/backend-source.zip"
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                python: 3.12
+            build:
+              commands:
+                - echo "Building PULSE Lambda deployment package on x86_64 Linux..."
+                - rm -rf pkg && mkdir -p pkg
+                - python3 -m pip install --upgrade pip --quiet
+                # Runtime deps (mirror pyproject [project].dependencies + [ops-read]).
+                # Native wheels now match the Lambda runtime because this runs on
+                # amazonlinux x86_64 / py3.12.
+                - pip3 install ".[ops-read]" -t pkg --quiet --disable-pip-version-check
+                - cd pkg && zip -r ../pulse-backend.zip . -x "*.pyc" "__pycache__/*" > /dev/null && cd ..
+                - echo "Uploading s3://$DEPLOY_BUCKET/$LAMBDA_CODE_S3_KEY"
+                - aws s3 cp pulse-backend.zip "s3://$DEPLOY_BUCKET/$LAMBDA_CODE_S3_KEY" --quiet
+                - echo "Backend package build complete."
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: pipeline
+
+  # =================================================================
+  # OBSERVABILITY - unified log group for all pipeline Lambdas
+  # =================================================================
+  PipelineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${StackPrefix}/pipeline"
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: pipeline
+
+  # =================================================================
+  # EVENTBRIDGE SCHEDULER - group + target role
+  # One-shot escalation checkpoints (created at runtime by the escalation
+  # service), the safety-net sweep, and the INFO batch schedule all live in
+  # this group. The target role is what Scheduler assumes to invoke the
+  # escalation service and INFO batcher.
+  # =================================================================
+  PulsePipelineScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub "${StackPrefix}-escalation"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+
+  PulseSchedulerTargetRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-scheduler-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref "AWS::AccountId"
+      Policies:
+        - PolicyName: InvokePipelineTargets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Scheduler invokes the escalation service (one-shot checkpoints +
+              # safety-net sweep) and the INFO batcher (rate schedule). ARNs are
+              # built from the known function names via !Sub rather than !GetAtt
+              # to avoid a role<->function<->role dependency cycle.
+              - Effect: Allow
+                Action: "lambda:InvokeFunction"
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${StackPrefix}-escalation-service"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${StackPrefix}-info-batcher"
+                  # Time-based alert auto-resolve sweeper (rate schedule): resolves
+                  # any still-open alert older than the timeout window.
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${StackPrefix}-alert-timeout-sweeper"
+                  # Ambient demo-simulator schedule target (created DISABLED and
+                  # only when EnableDemoSimulator=true). Built by name via !Sub
+                  # so the grant does not depend on the conditional function.
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${StackPrefix}-demo-simulator"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: pipeline
+
+  # =================================================================
+  # IAM ROLES (least privilege, one per Lambda; ${AWS::Region} suffix)
+  # =================================================================
+
+  # ----- Rule Evaluator: consume operational streams, write alerts,
+  #       read rules, read operational tables, invoke the Triage Agent runtime. -----
+  PulseRuleEvaluatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-rule-evaluator-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: AlertsWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:PutItem"
+                  - "dynamodb:UpdateItem"
+                  - "dynamodb:GetItem"
+                  - "dynamodb:Query"
+                Resource:
+                  - !Ref AlertsTableArn
+                  - !Sub "${AlertsTableArn}/index/*"
+        - PolicyName: RulesRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:Query"
+                Resource: !Ref RulesTableArn
+        - PolicyName: OperationalRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Evaluators read source rows (and the prior image) to detect
+              # transitions. Read-only against operational data.
+              - Effect: Allow
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:Query"
+                Resource:
+                  - !Ref ReservationsTableArn
+                  - !Sub "${ReservationsTableArn}/index/*"
+                  - !Ref RoomsTableArn
+                  - !Sub "${RoomsTableArn}/index/*"
+                  - !Ref GuestsTableArn
+                  - !Sub "${GuestsTableArn}/index/*"
+                  - !Ref RevenuesTableArn
+                  - !Ref WorkOrdersTableArn
+                  - !Sub "${WorkOrdersTableArn}/index/*"
+        - PolicyName: OperationalStreamRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Consume the five operational-table streams (event-source maps).
+              - Effect: Allow
+                Action:
+                  - "dynamodb:GetRecords"
+                  - "dynamodb:GetShardIterator"
+                  - "dynamodb:DescribeStream"
+                  - "dynamodb:ListStreams"
+                Resource:
+                  - !Ref ReservationsStreamArn
+                  - !Ref RoomsStreamArn
+                  - !Ref GuestsStreamArn
+                  - !Ref RevenuesStreamArn
+                  - !Ref WorkOrdersStreamArn
+        - PolicyName: InvokeTriageInvoker
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Hand off triage for CRITICAL/WARNING alerts to the dedicated
+              # invoker Lambda via an asynchronous ("Event") invoke, so the
+              # stream-driven evaluator never blocks on the slow, synchronous
+              # InvokeAgentRuntime round trip (Decision 8). The invoker function
+              # name is threaded to this function via TRIAGE_INVOKER_FUNCTION_NAME.
+              # The literal ARN (not !GetAtt) avoids a role<->function<->role
+              # dependency cycle.
+              - Effect: Allow
+                Action: "lambda:InvokeFunction"
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${StackPrefix}-triage-invoker"
+        - PolicyName: ObservabilityAndPublish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackPrefix}-*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${StackPrefix}/pipeline:*"
+              - Effect: Allow
+                Action:
+                  - "xray:PutTraceSegments"
+                  - "xray:PutTelemetryRecords"
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: pipeline
+
+  # ----- Escalation Service: alerts read/write, scheduler management,
+  #       realtime publish, Web Push (subscriptions + VAPID secret). -----
+  PulseEscalationServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-escalation-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: AlertsReadWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:UpdateItem"
+                  - "dynamodb:Query"
+                Resource:
+                  - !Ref AlertsTableArn
+                  - !Sub "${AlertsTableArn}/index/*"
+        - PolicyName: SchedulerManage
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The service creates/updates/deletes one-shot checkpoint schedules
+              # at runtime, scoped to the escalation group.
+              - Effect: Allow
+                Action:
+                  - "scheduler:CreateSchedule"
+                  - "scheduler:UpdateSchedule"
+                  - "scheduler:GetSchedule"
+                  - "scheduler:DeleteSchedule"
+                Resource:
+                  - !Sub "arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${StackPrefix}-escalation/${StackPrefix}-esc-*"
+              - Effect: Allow
+                Action: "iam:PassRole"
+                Resource: !GetAtt PulseSchedulerTargetRole.Arn
+                Condition:
+                  StringEquals:
+                    "iam:PassedToService": "scheduler.amazonaws.com"
+        - PolicyName: SubscriptionsReadAndSecret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:Query"
+                Resource: !Ref PushSubscriptionsTableArn
+              - Effect: Allow
+                Action:
+                  - "secretsmanager:GetSecretValue"
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${VapidSecretName}-*"
+        - PolicyName: RealtimePublish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "appsync:EventPublish"
+                Resource: !Ref RealtimeApiArn
+        - PolicyName: Observability
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackPrefix}-*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${StackPrefix}/pipeline:*"
+              - Effect: Allow
+                Action:
+                  - "xray:PutTraceSegments"
+                  - "xray:PutTelemetryRecords"
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: pipeline
+
+  # ----- Push Service: read alerts + subscriptions, VAPID secret, publish. -----
+  PulsePushServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-push-service-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: AlertsAndSubscriptionsRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:GetItem"
+                Resource: !Ref AlertsTableArn
+              - Effect: Allow
+                Action:
+                  - "dynamodb:Query"
+                Resource: !Ref PushSubscriptionsTableArn
+        - PolicyName: SecretAndPublish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "secretsmanager:GetSecretValue"
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${VapidSecretName}-*"
+              - Effect: Allow
+                Action: "appsync:EventPublish"
+                Resource: !Ref RealtimeApiArn
+        - PolicyName: Observability
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackPrefix}-*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${StackPrefix}/pipeline:*"
+              - Effect: Allow
+                Action:
+                  - "xray:PutTraceSegments"
+                  - "xray:PutTelemetryRecords"
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: pipeline
+
+  # ----- INFO Batcher: query/update alerts (mark delivered), publish. -----
+  PulseInfoBatcherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-info-batcher-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: AlertsQueryUpdate
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:Query"
+                  - "dynamodb:Scan"
+                  - "dynamodb:UpdateItem"
+                Resource:
+                  - !Ref AlertsTableArn
+                  - !Sub "${AlertsTableArn}/index/*"
+        - PolicyName: RealtimePublish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "appsync:EventPublish"
+                Resource: !Ref RealtimeApiArn
+        - PolicyName: Observability
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackPrefix}-*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${StackPrefix}/pipeline:*"
+              - Effect: Allow
+                Action:
+                  - "xray:PutTraceSegments"
+                  - "xray:PutTelemetryRecords"
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: pipeline
+
+  # ----- History Writer: consume pulse-alerts stream, write history. -----
+  PulseHistoryWriterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-history-writer-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: HistoryWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:PutItem"
+                  - "dynamodb:Query"
+                Resource:
+                  - !Ref AlertHistoryTableArn
+                  - !Sub "${AlertHistoryTableArn}/index/*"
+        - PolicyName: AlertsStreamRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:GetRecords"
+                  - "dynamodb:GetShardIterator"
+                  - "dynamodb:DescribeStream"
+                  - "dynamodb:ListStreams"
+                Resource: !Ref AlertsStreamArn
+        - PolicyName: Observability
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackPrefix}-*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${StackPrefix}/pipeline:*"
+              - Effect: Allow
+                Action:
+                  - "xray:PutTraceSegments"
+                  - "xray:PutTelemetryRecords"
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: pipeline
+
+  # =================================================================
+  # LAMBDA FUNCTIONS (Runtime python3.12; shared deployment package;
+  # distinct Handler per component; JSON logs; X-Ray active).
+  # =================================================================
+
+  PulseRuleEvaluatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${StackPrefix}-rule-evaluator"
+      Description: Evaluates operational-stream changes against rules and creates alerts
+      Runtime: python3.12
+      Handler: pulse.rule_engine.handler.lambda_handler
+      MemorySize: 512
+      Timeout: 60
+      Role: !GetAtt PulseRuleEvaluatorRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref PipelineLogGroup
+        LogFormat: JSON
+      Code:
+        S3Bucket: !Ref DeployBucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          ALERTS_TABLE_NAME: !Ref AlertsTableName
+          RULES_TABLE_NAME: !Ref RulesTableName
+          ALERT_HISTORY_TABLE_NAME: !Ref AlertHistoryTableName
+          PUSH_SUBSCRIPTIONS_TABLE_NAME: !Ref PushSubscriptionsTableName
+          TRIAGE_MODEL_ID: !Ref TriageModelId
+          # Dedicated invoker Lambda that owns the blocking InvokeAgentRuntime
+          # round trip; the evaluator dispatches to it via an async ("Event")
+          # invoke so the stream handler never blocks on triage (Decision 8).
+          TRIAGE_INVOKER_FUNCTION_NAME: !Sub "${StackPrefix}-triage-invoker"
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: pipeline
+
+  # ----- Triage Invoker: dedicated async hop that owns the blocking
+  #       bedrock-agentcore:InvokeAgentRuntime call. The rule evaluator invokes
+  #       this function asynchronously ("Event") so the stream-driven evaluator
+  #       never blocks on the slow, synchronous triage round trip (Decision 8).
+  #       The runtime attaches the brief and publishes ALERT_UPDATED itself;
+  #       this function neither parses the response nor attaches the brief. -----
+  PulseTriageInvokerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-triage-invoker-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: InvokeTriageRuntime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Invoke the Triage Agent AgentCore Runtime for CRITICAL/WARNING
+              # alerts. Scoped to the account/region runtime ARN pattern; the
+              # specific runtime ARN is threaded via TRIAGE_RUNTIME_ARN.
+              - Effect: Allow
+                Action: "bedrock-agentcore:InvokeAgentRuntime"
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*"
+        - PolicyName: Observability
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackPrefix}-*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${StackPrefix}/pipeline:*"
+              - Effect: Allow
+                Action:
+                  - "xray:PutTraceSegments"
+                  - "xray:PutTelemetryRecords"
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: pipeline
+
+  PulseTriageInvokerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${StackPrefix}-triage-invoker"
+      Description: Async hop that performs the blocking Triage Agent InvokeAgentRuntime call
+      Runtime: python3.12
+      Handler: pulse.rule_engine.triage_invoker_handler.lambda_handler
+      MemorySize: 256
+      # Longer than the stream evaluator: this function blocks for the full
+      # synchronous InvokeAgentRuntime round trip (the agentic triage can take
+      # tens of seconds).
+      Timeout: 120
+      Role: !GetAtt PulseTriageInvokerRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref PipelineLogGroup
+        LogFormat: JSON
+      Code:
+        S3Bucket: !Ref DeployBucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          # The specific runtime ARN, set post-deploy from SSM
+          # /pulse/triage/runtime-arn. Empty until the runtime is deployed
+          # out-of-band; when empty this function logs a warning and no-ops.
+          TRIAGE_RUNTIME_ARN: !Ref TriageRuntimeArn
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: pipeline
+
+  # ----- Forecaster Invoker: thin EventBridge Scheduler target that starts an
+  #       AgentCore Runtime session for the pulse-forecaster agent (Req 1.4).
+  #       Mirrors the Triage Invoker shape: it owns the blocking
+  #       bedrock-agentcore:InvokeAgentRuntime start-session call and contains no
+  #       forecasting logic. Least privilege: InvokeAgentRuntime is scoped to the
+  #       pulse-forecaster runtime only (mirrors how PulseTriageInvokerRole scopes
+  #       its InvokeAgentRuntime grant to the triage runtime), plus Logs + X-Ray.
+  #       The Scheduler group + per-property schedules that fan into this function
+  #       are added by Task 14.1 (not here). -----
+  PulseForecasterInvokerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-forecaster-invoker-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: InvokeForecasterRuntime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Start an AgentCore Runtime session for the Forecasting Agent.
+              # Scoped to ONLY the pulse-forecaster runtime (least privilege): a
+              # concrete ARN when threaded via ForecastAgentRuntimeArn, and the
+              # named-runtime ARN pattern so the grant is still forecaster-only
+              # while that parameter is empty (the runtime is deployed
+              # out-of-band). Mirrors how PulseTriageInvokerRole scopes its
+              # InvokeAgentRuntime grant to the triage runtime.
+              - Effect: Allow
+                Action: "bedrock-agentcore:InvokeAgentRuntime"
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/pulse-forecaster*"
+        - PolicyName: Observability
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackPrefix}-*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${StackPrefix}/pipeline:*"
+              - Effect: Allow
+                Action:
+                  - "xray:PutTraceSegments"
+                  - "xray:PutTelemetryRecords"
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: forecasting
+
+  PulseForecasterInvokerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${StackPrefix}-forecaster-invoker"
+      Description: Thin Scheduler target that starts a pulse-forecaster AgentCore Runtime session
+      Runtime: python3.12
+      # NOTE: Unlike the sibling pipeline Lambdas (rule-evaluator, escalation,
+      # etc.) whose code lives inside the shared `pulse` package and are reached
+      # via dotted module paths (e.g. pulse.rule_engine.handler.lambda_handler),
+      # the forecast invoker lives at functions/forecast-invoker/lambda_function.py
+      # and is NOT inside the pulse package. Its handler is therefore the module
+      # path within its own package root: `lambda_function.lambda_handler`
+      # (design says handler `lambda_handler`). This assumes the deployment
+      # package places functions/forecast-invoker/lambda_function.py at the zip
+      # root; if the shared build instead nests it under the pulse package, the
+      # handler must be updated to match that layout at packaging time.
+      Handler: lambda_function.lambda_handler
+      # Thin invoker: it only starts a Runtime session (fire-and-forget style),
+      # so a small memory footprint and a short timeout are sufficient.
+      MemorySize: 128
+      Timeout: 30
+      Role: !GetAtt PulseForecasterInvokerRole.Arn
+      TracingConfig:
+        # Req (invoker tracing): capture the invoker segment and propagate the
+        # trace header into the AgentCore Runtime start-session call.
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref PipelineLogGroup
+        LogFormat: JSON
+      Code:
+        S3Bucket: !Ref DeployBucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          # The pulse-forecaster AgentCore Runtime ARN the invoker starts a
+          # session for. Set post-deploy from SSM /pulse/forecast/runtime-arn;
+          # empty until the runtime is deployed out-of-band, in which case the
+          # invoker logs a warning and no-ops (mirrors the triage invoker).
+          FORECAST_AGENT_RUNTIME_ARN: !Ref ForecastAgentRuntimeArn
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: forecasting
+
+  PulseEscalationServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${StackPrefix}-escalation-service"
+      Description: Time-based escalation chain (GM -> AGM -> MOD) and mandatory-review queue
+      Runtime: python3.12
+      Handler: pulse.escalation.service.lambda_handler
+      MemorySize: 256
+      Timeout: 60
+      Role: !GetAtt PulseEscalationServiceRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref PipelineLogGroup
+        LogFormat: JSON
+      Code:
+        S3Bucket: !Ref DeployBucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          ALERTS_TABLE_NAME: !Ref AlertsTableName
+          RULES_TABLE_NAME: !Ref RulesTableName
+          ALERT_HISTORY_TABLE_NAME: !Ref AlertHistoryTableName
+          PUSH_SUBSCRIPTIONS_TABLE_NAME: !Ref PushSubscriptionsTableName
+          TRIAGE_MODEL_ID: !Ref TriageModelId
+          # EventBridge Scheduler one-shot target (design Decision 2). The
+          # target is this function itself; build the ARN from its known name
+          # via !Sub (using !GetAtt on self would create a dependency cycle).
+          ESCALATION_SCHEDULE_GROUP: !Ref PulsePipelineScheduleGroup
+          ESCALATION_SCHEDULER_ROLE_ARN: !GetAtt PulseSchedulerTargetRole.Arn
+          ESCALATION_TARGET_ARN: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${StackPrefix}-escalation-service"
+          # Delivery seams
+          REALTIME_HTTP_ENDPOINT: !Ref RealtimeHttpEndpoint
+          VAPID_SECRET_NAME: !Ref VapidSecretName
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: pipeline
+
+  PulsePushServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${StackPrefix}-push-service"
+      Description: Dual-channel delivery - AppSync Events realtime + Web Push (VAPID)
+      Runtime: python3.12
+      Handler: pulse.delivery.push_service.lambda_handler
+      MemorySize: 256
+      Timeout: 60
+      Role: !GetAtt PulsePushServiceRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref PipelineLogGroup
+        LogFormat: JSON
+      Code:
+        S3Bucket: !Ref DeployBucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          ALERTS_TABLE_NAME: !Ref AlertsTableName
+          RULES_TABLE_NAME: !Ref RulesTableName
+          ALERT_HISTORY_TABLE_NAME: !Ref AlertHistoryTableName
+          PUSH_SUBSCRIPTIONS_TABLE_NAME: !Ref PushSubscriptionsTableName
+          TRIAGE_MODEL_ID: !Ref TriageModelId
+          REALTIME_HTTP_ENDPOINT: !Ref RealtimeHttpEndpoint
+          VAPID_SECRET_NAME: !Ref VapidSecretName
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: pipeline
+
+  PulseInfoBatcherFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${StackPrefix}-info-batcher"
+      Description: Batches undelivered INFO alerts (<=50 per batch) on an interval
+      Runtime: python3.12
+      Handler: pulse.delivery.info_batcher.lambda_handler
+      MemorySize: 256
+      Timeout: 120
+      Role: !GetAtt PulseInfoBatcherRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref PipelineLogGroup
+        LogFormat: JSON
+      Code:
+        S3Bucket: !Ref DeployBucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          ALERTS_TABLE_NAME: !Ref AlertsTableName
+          RULES_TABLE_NAME: !Ref RulesTableName
+          ALERT_HISTORY_TABLE_NAME: !Ref AlertHistoryTableName
+          PUSH_SUBSCRIPTIONS_TABLE_NAME: !Ref PushSubscriptionsTableName
+          TRIAGE_MODEL_ID: !Ref TriageModelId
+          REALTIME_HTTP_ENDPOINT: !Ref RealtimeHttpEndpoint
+          INFO_BATCH_INTERVAL_MIN: !Ref InfoBatchIntervalMin
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: pipeline
+
+  # ----- Alert Timeout Sweeper: scheduled auto-resolve of stale open alerts.
+  #       Scans pulse-alerts for open alerts older than AlertTimeoutMinutes and
+  #       resolves them (resolvedBy=system-timeout) + best-effort ALERT_RESOLVED.
+  #       Mirrors the info-batcher IAM shape (Query/Scan/UpdateItem + publish). -----
+  PulseAlertTimeoutSweeperRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-alert-timeout-sweeper-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: AlertsScanUpdate
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:Scan"
+                  - "dynamodb:UpdateItem"
+                Resource:
+                  - !Ref AlertsTableArn
+                  - !Sub "${AlertsTableArn}/index/*"
+        - PolicyName: RealtimePublish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "appsync:EventPublish"
+                Resource: !Ref RealtimeApiArn
+        - PolicyName: Observability
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackPrefix}-*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${StackPrefix}/pipeline:*"
+              - Effect: Allow
+                Action:
+                  - "xray:PutTraceSegments"
+                  - "xray:PutTelemetryRecords"
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: pipeline
+
+  PulseAlertTimeoutSweeperFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${StackPrefix}-alert-timeout-sweeper"
+      Description: Auto-resolves still-open alerts older than the timeout window
+      Runtime: python3.12
+      Handler: pulse.rule_engine.timeout_sweeper.lambda_handler
+      MemorySize: 256
+      Timeout: 120
+      Role: !GetAtt PulseAlertTimeoutSweeperRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref PipelineLogGroup
+        LogFormat: JSON
+      Code:
+        S3Bucket: !Ref DeployBucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          ALERTS_TABLE_NAME: !Ref AlertsTableName
+          REALTIME_HTTP_ENDPOINT: !Ref RealtimeHttpEndpoint
+          ALERT_TIMEOUT_MINUTES: !Ref AlertTimeoutMinutes
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: pipeline
+
+  PulseHistoryWriterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${StackPrefix}-history-writer"
+      Description: Appends versioned records to pulse-alert-history on alert changes
+      Runtime: python3.12
+      Handler: pulse.history.writer.lambda_handler
+      MemorySize: 256
+      Timeout: 60
+      Role: !GetAtt PulseHistoryWriterRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref PipelineLogGroup
+        LogFormat: JSON
+      Code:
+        S3Bucket: !Ref DeployBucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          ALERTS_TABLE_NAME: !Ref AlertsTableName
+          RULES_TABLE_NAME: !Ref RulesTableName
+          ALERT_HISTORY_TABLE_NAME: !Ref AlertHistoryTableName
+          PUSH_SUBSCRIPTIONS_TABLE_NAME: !Ref PushSubscriptionsTableName
+          TRIAGE_MODEL_ID: !Ref TriageModelId
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: pipeline
+
+  # =================================================================
+  # ACTION EXECUTOR (Task 18/20): closed-loop write-back + resolve.
+  # The primary path runs the executor in-process inside pulse-api on
+  # approval (same shared package). This standalone function makes the
+  # executor independently invocable (e.g. async re-drive) with the same
+  # code. Scoped UpdateItem + TransactWriteItems on the operational tables
+  # AND pulse-alerts; NO DeleteItem, NO table-level wildcard.
+  # =================================================================
+  PulseActionExecutorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-action-executor-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: OperationalWriteBack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Condition-clearing write-backs on the operational tables. Only
+              # UpdateItem + TransactWriteItems (no DeleteItem, no wildcard):
+              # the executor mutates existing rows, never deletes them.
+              - Effect: Allow
+                Action:
+                  - "dynamodb:UpdateItem"
+                  - "dynamodb:TransactWriteItems"
+                Resource:
+                  - !Ref ReservationsTableArn
+                  - !Ref RoomsTableArn
+                  - !Ref GuestsTableArn
+        - PolicyName: AlertsResolveTransaction
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The RESOLVED update shares the same transaction as the
+              # operational write-back, so pulse-alerts needs UpdateItem +
+              # TransactWriteItems (plus GetItem to load the alert on re-drive).
+              - Effect: Allow
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:UpdateItem"
+                  - "dynamodb:TransactWriteItems"
+                Resource: !Ref AlertsTableArn
+        - PolicyName: RealtimePublish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Best-effort post-commit ALERT_RESOLVED realtime event.
+              - Effect: Allow
+                Action: "appsync:EventPublish"
+                Resource: !Ref RealtimeApiArn
+        - PolicyName: Observability
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackPrefix}-*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${StackPrefix}/pipeline:*"
+              - Effect: Allow
+                Action:
+                  - "xray:PutTraceSegments"
+                  - "xray:PutTelemetryRecords"
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: pipeline
+
+  PulseActionExecutorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${StackPrefix}-action-executor"
+      Description: Closed-loop write-back + transactional RESOLVE for approved actions
+      Runtime: python3.12
+      Handler: pulse.action_executor.executor.lambda_handler
+      MemorySize: 256
+      Timeout: 30
+      Role: !GetAtt PulseActionExecutorRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref PipelineLogGroup
+        LogFormat: JSON
+      Code:
+        S3Bucket: !Ref DeployBucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          ALERTS_TABLE_NAME: !Ref AlertsTableName
+          RULES_TABLE_NAME: !Ref RulesTableName
+          ALERT_HISTORY_TABLE_NAME: !Ref AlertHistoryTableName
+          PUSH_SUBSCRIPTIONS_TABLE_NAME: !Ref PushSubscriptionsTableName
+          TRIAGE_MODEL_ID: !Ref TriageModelId
+          # Operational write-back targets (names for the client, ARNs for IAM).
+          RESERVATIONS_TABLE_NAME: !Ref ReservationsTableName
+          ROOMS_TABLE_NAME: !Ref RoomsTableName
+          GUESTS_TABLE_NAME: !Ref GuestsTableName
+          REALTIME_HTTP_ENDPOINT: !Ref RealtimeHttpEndpoint
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: pipeline
+
+  # =================================================================
+  # DEMO SIMULATOR (Task 19/20): scripted operational mutations that
+  # raise the triggering conditions. Demo-only: the function, its role,
+  # and the ambient schedule exist only when EnableDemoSimulator=true.
+  # Demo-only IAM grants PutItem + DeleteItem on the operational tables
+  # (the simulator both writes run items and deletes on reset).
+  # =================================================================
+  PulseDemoSimulatorRole:
+    Type: AWS::IAM::Role
+    Condition: ShouldEnableDemoSimulator
+    Properties:
+      RoleName: !Sub "${StackPrefix}-demo-simulator-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: OperationalDemoWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Demo-only: PutItem to raise a condition, DeleteItem to reset a
+              # scenario that had no pre-run record. Scoped to the operational
+              # tables (no wildcard). DeleteItem is permitted here (and NEVER
+              # for the Action Executor) because resetting is a demo affordance.
+              - Effect: Allow
+                Action:
+                  - "dynamodb:PutItem"
+                  - "dynamodb:DeleteItem"
+                Resource:
+                  - !Ref ReservationsTableArn
+                  - !Ref RoomsTableArn
+                  - !Ref GuestsTableArn
+        - PolicyName: Observability
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackPrefix}-*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${StackPrefix}/pipeline:*"
+              - Effect: Allow
+                Action:
+                  - "xray:PutTraceSegments"
+                  - "xray:PutTelemetryRecords"
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: pipeline
+
+  PulseDemoSimulatorFunction:
+    Type: AWS::Lambda::Function
+    Condition: ShouldEnableDemoSimulator
+    Properties:
+      FunctionName: !Sub "${StackPrefix}-demo-simulator"
+      Description: Demo scenario simulator - scripted operational mutations (demo-only)
+      Runtime: python3.12
+      Handler: pulse.demo_simulator.simulator.lambda_handler
+      MemorySize: 256
+      Timeout: 30
+      Role: !GetAtt PulseDemoSimulatorRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref PipelineLogGroup
+        LogFormat: JSON
+      Code:
+        S3Bucket: !Ref DeployBucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          # The simulator writes only to the operational tables (by name).
+          RESERVATIONS_TABLE_NAME: !Ref ReservationsTableName
+          ROOMS_TABLE_NAME: !Ref RoomsTableName
+          GUESTS_TABLE_NAME: !Ref GuestsTableName
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: pipeline
+
+  # Ambient demo schedule: fires the simulator on an interval so a live demo
+  # produces a steady trickle of alerts. Created DISABLED (opt-in) so it never
+  # mutates operational data unless a presenter explicitly enables it. Uses the
+  # shared PulseSchedulerTargetRole (its invoke list includes the simulator).
+  PulseDemoSimulatorAmbientSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: ShouldEnableDemoSimulator
+    Properties:
+      Name: !Sub "${StackPrefix}-demo-simulator-ambient"
+      GroupName: !Ref PulsePipelineScheduleGroup
+      State: DISABLED
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      ScheduleExpression: !Ref SimulatorAmbientRate
+      Target:
+        Arn: !GetAtt PulseDemoSimulatorFunction.Arn
+        RoleArn: !GetAtt PulseSchedulerTargetRole.Arn
+        Input: '{"scenarioId":"walk-risk","action":"run"}'
+
+  # Alert timeout sweep: fires on a fixed rate to auto-resolve any still-open
+  # alert older than AlertTimeoutMinutes. ENABLED (unlike the demo schedule)
+  # because it is a safe, idempotent housekeeping sweep. Uses the shared
+  # PulseSchedulerTargetRole (its invoke list includes the sweeper).
+  PulseAlertTimeoutSweeperSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${StackPrefix}-alert-timeout-sweeper"
+      GroupName: !Ref PulsePipelineScheduleGroup
+      State: ENABLED
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      ScheduleExpression: !Ref AlertSweepRate
+      Target:
+        Arn: !GetAtt PulseAlertTimeoutSweeperFunction.Arn
+        RoleArn: !GetAtt PulseSchedulerTargetRole.Arn
+
+  # =================================================================
+  # EVENT SOURCE MAPPINGS
+  # Operational-table streams -> rule-evaluator (one per stream).
+  # pulse-alerts stream -> history-writer (status-change fan-out).
+  # StartingPosition LATEST: only new changes. A short batching window
+  # keeps rule-eval start within the 5s target (Requirement 1.1).
+  # =================================================================
+  ReservationsStreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Ref ReservationsStreamArn
+      FunctionName: !GetAtt PulseRuleEvaluatorFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: 25
+      MaximumBatchingWindowInSeconds: 1
+      Enabled: true
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  RoomsStreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Ref RoomsStreamArn
+      FunctionName: !GetAtt PulseRuleEvaluatorFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: 25
+      MaximumBatchingWindowInSeconds: 1
+      Enabled: true
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  GuestsStreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Ref GuestsStreamArn
+      FunctionName: !GetAtt PulseRuleEvaluatorFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: 25
+      MaximumBatchingWindowInSeconds: 1
+      Enabled: true
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  RevenuesStreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Ref RevenuesStreamArn
+      FunctionName: !GetAtt PulseRuleEvaluatorFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: 25
+      MaximumBatchingWindowInSeconds: 1
+      Enabled: true
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  WorkOrdersStreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Ref WorkOrdersStreamArn
+      FunctionName: !GetAtt PulseRuleEvaluatorFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: 25
+      MaximumBatchingWindowInSeconds: 1
+      Enabled: true
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  AlertsHistoryStreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Ref AlertsStreamArn
+      FunctionName: !GetAtt PulseHistoryWriterFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: 25
+      MaximumBatchingWindowInSeconds: 1
+      Enabled: true
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  # =================================================================
+  # STATIC SCHEDULES
+  # - Safety-net sweep: re-fires due escalation checkpoints missed by a
+  #   one-shot. EventBridge Scheduler's minimum rate is 1 minute; the
+  #   Requirement 6.2 <=30s target is a follow-up (sub-minute needs a
+  #   different mechanism). Invokes the escalation service (action=sweep).
+  # - INFO batch: flushes accumulated INFO alerts on the configured interval.
+  # =================================================================
+  EscalationSweepSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${StackPrefix}-escalation-sweep"
+      GroupName: !Ref PulsePipelineScheduleGroup
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      ScheduleExpression: "rate(1 minute)"
+      Target:
+        Arn: !GetAtt PulseEscalationServiceFunction.Arn
+        RoleArn: !GetAtt PulseSchedulerTargetRole.Arn
+        Input: '{"action":"sweep"}'
+
+  InfoBatchSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${StackPrefix}-info-batch"
+      GroupName: !Ref PulsePipelineScheduleGroup
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      ScheduleExpression: !Sub "rate(${InfoBatchIntervalMin} minutes)"
+      Target:
+        Arn: !GetAtt PulseInfoBatcherFunction.Arn
+        RoleArn: !GetAtt PulseSchedulerTargetRole.Arn
+        Input: '{"action":"flush"}'
+
+  # =================================================================
+  # FORECASTER DAILY SCHEDULING (Task 14.1; Req 1.1, 1.2, 1.3, 1.6)
+  # A dedicated schedule group holds one daily schedule per pilot property.
+  # Each fires at local midnight in the property's IANA timezone and invokes
+  # the pulse-forecaster-invoker with that property's id, so the forecast
+  # session is generated per property in its own local morning. A dedicated
+  # scheduler-invoke role (scoped to ONLY the invoker) is used rather than the
+  # shared PulseSchedulerTargetRole, keeping the forecaster grant least-privilege.
+  # =================================================================
+
+  # Dedicated group for the per-property forecaster schedules. Isolating them
+  # from the escalation group keeps their lifecycle and naming self-contained.
+  PulseForecasterScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub "${StackPrefix}-forecaster-daily"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+
+  # Scheduler-invoke role for the forecaster schedules. Trusts EventBridge
+  # Scheduler with an aws:SourceAccount confused-deputy guard, and grants
+  # lambda:InvokeFunction on ONLY the forecaster invoker (least privilege).
+  # Mirrors PulseSchedulerTargetRole's shape; kept separate so the forecaster
+  # grant does not widen the shared pipeline scheduler role.
+  PulseForecasterSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-forecaster-scheduler-invoke-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref "AWS::AccountId"
+      Policies:
+        - PolicyName: InvokeForecasterInvoker
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Only the forecaster invoker. Built by name via !Sub (not !GetAtt)
+              # to avoid a role<->function<->role dependency cycle, matching the
+              # pattern used by PulseSchedulerTargetRole.
+              - Effect: Allow
+                Action: "lambda:InvokeFunction"
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${StackPrefix}-forecaster-invoker"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: forecasting
+
+  # ----- Per-property daily forecaster schedules (5 pilot properties) -----
+  # Each: cron(0 0 * * ? *) = daily at 00:00 local; ScheduleExpressionTimezone
+  # anchors that midnight to the property's IANA zone; FlexibleTimeWindow OFF
+  # fires exactly on time; Target.Input carries the matching propertyId; the
+  # RetryPolicy retries up to 3 times within a 60-minute event age (Req 1.6).
+
+  # ALOHA-CHI-001 - Chicago (America/Chicago)
+  PulseForecasterScheduleAlohaChi:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${StackPrefix}-forecaster-aloha-chi-001"
+      GroupName: !Ref PulseForecasterScheduleGroup
+      State: ENABLED
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      ScheduleExpression: "cron(0 0 * * ? *)"
+      ScheduleExpressionTimezone: America/Chicago
+      Target:
+        Arn: !GetAtt PulseForecasterInvokerFunction.Arn
+        RoleArn: !GetAtt PulseForecasterSchedulerRole.Arn
+        Input: '{"propertyId":"ALOHA-CHI-001"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAgeInSeconds: 3600
+
+  # ALOHA-MIA-001 - Miami (America/New_York)
+  PulseForecasterScheduleAlohaMia:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${StackPrefix}-forecaster-aloha-mia-001"
+      GroupName: !Ref PulseForecasterScheduleGroup
+      State: ENABLED
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      ScheduleExpression: "cron(0 0 * * ? *)"
+      ScheduleExpressionTimezone: America/New_York
+      Target:
+        Arn: !GetAtt PulseForecasterInvokerFunction.Arn
+        RoleArn: !GetAtt PulseForecasterSchedulerRole.Arn
+        Input: '{"propertyId":"ALOHA-MIA-001"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAgeInSeconds: 3600
+
+  # ALOHA-TYO-001 - Tokyo (Asia/Tokyo)
+  PulseForecasterScheduleAlohaTyo:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${StackPrefix}-forecaster-aloha-tyo-001"
+      GroupName: !Ref PulseForecasterScheduleGroup
+      State: ENABLED
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      ScheduleExpression: "cron(0 0 * * ? *)"
+      ScheduleExpressionTimezone: Asia/Tokyo
+      Target:
+        Arn: !GetAtt PulseForecasterInvokerFunction.Arn
+        RoleArn: !GetAtt PulseForecasterSchedulerRole.Arn
+        Input: '{"propertyId":"ALOHA-TYO-001"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAgeInSeconds: 3600
+
+  # ALOHA-MAD-001 - Madrid (Europe/Madrid)
+  PulseForecasterScheduleAlohaMad:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${StackPrefix}-forecaster-aloha-mad-001"
+      GroupName: !Ref PulseForecasterScheduleGroup
+      State: ENABLED
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      ScheduleExpression: "cron(0 0 * * ? *)"
+      ScheduleExpressionTimezone: Europe/Madrid
+      Target:
+        Arn: !GetAtt PulseForecasterInvokerFunction.Arn
+        RoleArn: !GetAtt PulseForecasterSchedulerRole.Arn
+        Input: '{"propertyId":"ALOHA-MAD-001"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAgeInSeconds: 3600
+
+  # ALOHA-BOM-001 - Mumbai (Asia/Kolkata)
+  PulseForecasterScheduleAlohaBom:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${StackPrefix}-forecaster-aloha-bom-001"
+      GroupName: !Ref PulseForecasterScheduleGroup
+      State: ENABLED
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      ScheduleExpression: "cron(0 0 * * ? *)"
+      ScheduleExpressionTimezone: Asia/Kolkata
+      Target:
+        Arn: !GetAtt PulseForecasterInvokerFunction.Arn
+        RoleArn: !GetAtt PulseForecasterSchedulerRole.Arn
+        Input: '{"propertyId":"ALOHA-BOM-001"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAgeInSeconds: 3600
+
+# -------------------------------------------------------------------
+# Outputs
+# -------------------------------------------------------------------
+Outputs:
+  RuleEvaluatorFunctionArn:
+    Description: ARN of the rule evaluator Lambda
+    Value: !GetAtt PulseRuleEvaluatorFunction.Arn
+
+  EscalationServiceFunctionArn:
+    Description: ARN of the escalation service Lambda
+    Value: !GetAtt PulseEscalationServiceFunction.Arn
+
+  PushServiceFunctionArn:
+    Description: ARN of the push service (dual-channel delivery) Lambda
+    Value: !GetAtt PulsePushServiceFunction.Arn
+
+  InfoBatcherFunctionArn:
+    Description: ARN of the INFO batcher Lambda
+    Value: !GetAtt PulseInfoBatcherFunction.Arn
+
+  HistoryWriterFunctionArn:
+    Description: ARN of the history writer Lambda
+    Value: !GetAtt PulseHistoryWriterFunction.Arn
+
+  ActionExecutorFunctionArn:
+    Description: ARN of the action executor Lambda (closed-loop write-back)
+    Value: !GetAtt PulseActionExecutorFunction.Arn
+
+  DemoSimulatorFunctionArn:
+    Condition: ShouldEnableDemoSimulator
+    Description: ARN of the demo scenario simulator Lambda (demo-only)
+    Value: !GetAtt PulseDemoSimulatorFunction.Arn
+
+  PipelineScheduleGroupName:
+    Description: EventBridge Scheduler group for escalation checkpoints and batches
+    Value: !Ref PulsePipelineScheduleGroup
+
+  SchedulerTargetRoleArn:
+    Description: IAM role EventBridge Scheduler assumes to invoke pipeline targets
+    Value: !GetAtt PulseSchedulerTargetRole.Arn

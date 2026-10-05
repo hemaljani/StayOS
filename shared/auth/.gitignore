@@ -1,0 +1,4 @@
+# Dependencies and tooling caches for the shared StayOS auth module.
+node_modules/
+*.tsbuildinfo
+coverage/

@@ -1,0 +1,79 @@
+# OS / editor noise not caught by feature-level .gitignore files.
+# Each feature directory (lumi/, pulse/) has its own .gitignore for its
+# own build artifacts, dependencies, and secrets — this file only covers
+# things that can appear anywhere in the repo, including at this root.
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python bytecode / caches — can appear anywhere (notably shared/, which has
+# no feature-level .gitignore of its own). Some .pyc files were committed
+# earlier; ignoring them here stops new ones and they can be untracked with
+# `git rm -r --cached **/__pycache__`.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Test / coverage artifacts (pytest, coverage.py) at any depth.
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.hypothesis/
+
+# Build logs emitted by the per-feature Makefiles (build-frontend, etc.).
+*build-frontend.log
+build.log
+
+# Kiro local tooling + specs/config for every feature directory (root, lumi,
+# pulse, and any future feature). Local IDE/agent state and specs, not app
+# source. Unanchored so it matches .kiro/ at any depth.
+.kiro/
+
+
+# Agent guide files (AGENTS.md) at any depth — local agent instructions,
+# not app source. Unanchored so it matches the repo root and every feature
+# directory (lumi/, pulse/, shared/, stayos-shell/, and any future one).
+# NOTE: files already committed stay tracked until explicitly `git rm --cached`.
+AGENTS.md
+
+# Data-orchestrator local build artifacts (packaged Lambda zip staging).
+shared/data-orchestrator/build/
+
+# Local-only deployment bug journal (working notes, not tracked).
+docs/bugs.md
+# Local UI design mockups (scratch, not part of the app).
+.design-mockups/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# JS/TS build output and dependencies (anywhere in the repo).
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+

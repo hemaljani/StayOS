@@ -1,0 +1,458 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  StayOS Voice Stack - Amazon Bedrock AgentCore Runtime infrastructure for the
+  voice agent. Provides Cognito Identity Pool for SigV4 browser authentication,
+  IAM execution role for the AgentCore container, and CloudWatch log group.
+  Replaces the previous ECS Fargate stack (VPC, ALB, CloudFront, ECS, ECR).
+  Supports REQ-2.1, REQ-2.2, REQ-3.1 through REQ-3.6, REQ-4.1 through REQ-4.7.
+
+# -------------------------------------------------------------------
+# Parameters
+# -------------------------------------------------------------------
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: lumi
+    Description: Prefix for all resource names (propagated from root stack)
+
+  AccountId:
+    Type: String
+    Description: AWS account ID for ARN construction
+
+  ReservationsTableName:
+    Type: String
+    Description: DynamoDB reservations table name (from dataset stack)
+
+  ReservationsTableArn:
+    Type: String
+    Description: DynamoDB reservations table ARN (for IAM policies)
+
+  RoomsTableName:
+    Type: String
+    Description: DynamoDB rooms table name (from dataset stack)
+
+  RoomsTableArn:
+    Type: String
+    Description: DynamoDB rooms table ARN (for IAM policies)
+
+  GuestsTableName:
+    Type: String
+    Description: DynamoDB guests table name (from dataset stack)
+
+  GuestsTableArn:
+    Type: String
+    Description: DynamoDB guests table ARN (for IAM policies)
+
+  RevenuesTableName:
+    Type: String
+    Description: DynamoDB revenues table name (from dataset stack)
+
+  RevenuesTableArn:
+    Type: String
+    Description: DynamoDB revenues table ARN (for IAM policies)
+
+  WorkOrdersTableName:
+    Type: String
+    Description: DynamoDB work orders table name (from dataset stack)
+
+  WorkOrdersTableArn:
+    Type: String
+    Description: DynamoDB work orders table ARN (for IAM policies)
+
+  SettingsTableName:
+    Type: String
+    Description: DynamoDB settings table name (from storage stack)
+
+  SettingsTableArn:
+    Type: String
+    Description: DynamoDB settings table ARN (for IAM policies)
+
+  UserPoolId:
+    Type: String
+    Description: Cognito User Pool ID (for identity verification in the voice agent container)
+
+  CognitoClientId:
+    Type: String
+    Description: Cognito App Client ID for Identity Pool provider mapping
+
+  DeployBucket:
+    Type: String
+    Description: S3 bucket name where voice agent source zip is uploaded for CodeBuild
+
+  BriefsTableName:
+    Type: String
+    Description: DynamoDB briefs table name (for VIP guest lookup from pre-generated briefs)
+
+  BriefsTableArn:
+    Type: String
+    Description: DynamoDB briefs table ARN (for IAM policies)
+
+# -------------------------------------------------------------------
+# Resources - AgentCore infrastructure (added in tasks 1.2 and 1.3)
+# -------------------------------------------------------------------
+Resources:
+  # -----------------------------------------------------------------
+  # Cognito Identity Pool - provides temporary AWS credentials to the
+  # browser for SigV4-signed WebSocket connections to AgentCore Runtime.
+  # Federated with the existing Cognito User Pool so authenticated GMs
+  # can exchange their ID token for short-lived AWS access keys.
+  # -----------------------------------------------------------------
+  VoiceIdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub "${StackPrefix}-voice-identity-pool"
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref CognitoClientId
+          ProviderName: !Sub "cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}"
+          ServerSideTokenCheck: true
+      IdentityPoolTags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+
+  # -----------------------------------------------------------------
+  # IAM Role for authenticated Identity Pool users. Grants permission
+  # to invoke the AgentCore Runtime WebSocket endpoint. This is the
+  # only action browser clients need - all other permissions stay
+  # server-side on the AgentCore execution role.
+  # -----------------------------------------------------------------
+  VoiceIdentityPoolAuthRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-voice-identity-auth-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "cognito-identity.amazonaws.com:aud": !Ref VoiceIdentityPool
+              "ForAnyValue:StringLike":
+                "cognito-identity.amazonaws.com:amr": authenticated
+      Policies:
+        - PolicyName: AgentCoreInvoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Allow authenticated users to connect to the voice agent via WebSocket
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntimeWithWebSocketStream
+                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AccountId}:runtime/*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+
+  # -----------------------------------------------------------------
+  # Identity Pool Role Attachment - maps the authenticated role to the
+  # Identity Pool so that GetCredentialsForIdentity returns credentials
+  # with the AgentCore invoke permission.
+  # -----------------------------------------------------------------
+  VoiceIdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref VoiceIdentityPool
+      Roles:
+        authenticated: !GetAtt VoiceIdentityPoolAuthRole.Arn
+
+  # -----------------------------------------------------------------
+  # AgentCore Execution Role - assumed by the AgentCore runtime to run
+  # the voice agent container. Grants least-privilege access to:
+  # - Bedrock Nova Sonic model (bidirectional streaming)
+  # - DynamoDB dataset tables (read-only for tool handlers)
+  # - DynamoDB settings table (read-only for language preference)
+  # - Cognito GetUser (identity verification via Access Token)
+  # -----------------------------------------------------------------
+  VoiceAgentCoreRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-voice-agentcore-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        # Bedrock model invocation for Nova Sonic bidirectional streaming
+        - PolicyName: BedrockNovaSonicStreaming
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.nova-2-sonic-v1:0"
+                  - "arn:aws:bedrock:*::foundation-model/amazon.nova-2-sonic-v1:0"
+        # Read-only access to the five dataset tables and their GSIs
+        - PolicyName: DynamoDBDatasetRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !Ref ReservationsTableArn
+                  - !Sub "${ReservationsTableArn}/index/*"
+                  - !Ref RoomsTableArn
+                  - !Sub "${RoomsTableArn}/index/*"
+                  - !Ref GuestsTableArn
+                  - !Sub "${GuestsTableArn}/index/*"
+                  - !Ref RevenuesTableArn
+                  - !Ref WorkOrdersTableArn
+                  - !Sub "${WorkOrdersTableArn}/index/*"
+        # Read-only access to settings table for GM language preference
+        - PolicyName: DynamoDBSettingsRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource:
+                  - !Ref SettingsTableArn
+                  - !Ref BriefsTableArn
+        # Cognito GetUser to validate Access Tokens and extract user claims
+        - PolicyName: CognitoGetUser
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Allow the container to validate Access Tokens via GetUser
+              - Effect: Allow
+                Action: cognito-idp:GetUser
+                Resource: !Sub "arn:aws:cognito-idp:${AWS::Region}:${AccountId}:userpool/${UserPoolId}"
+        # ECR image pull - AgentCore needs this to pull the container image at runtime
+        - PolicyName: EcrImagePull
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AccountId}:repository/${StackPrefix}-voice-agent"
+        # CloudWatch Logs - container stdout/stderr and unified traces delivery
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:PutResourcePolicy
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AccountId}:log-group:/${StackPrefix}/agentcore/*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+
+  # -----------------------------------------------------------------
+  # CloudWatch Log Group for AgentCore voice agent container logs.
+  # Uses structured logging via Powertools Logger. 14-day retention
+  # is sufficient for demo/pilot operational visibility.
+  # -----------------------------------------------------------------
+  VoiceAgentCoreLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${StackPrefix}/agentcore/voice-agent"
+      RetentionInDays: 14
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+
+  # -----------------------------------------------------------------
+  # ECR Repository for voice agent container images. CodeBuild pushes
+  # ARM64 images here; AgentCore Runtime pulls from here at deploy.
+  # Lifecycle policy retains only the last 5 images for cost control.
+  # -----------------------------------------------------------------
+  VoiceAgentEcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${StackPrefix}-voice-agent"
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the last 5 images for cost control",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+
+  # -----------------------------------------------------------------
+  # CodeBuild IAM Role - least-privilege permissions for building and
+  # pushing container images. Grants ECR push (for image upload),
+  # S3 read (for source zip download), and CloudWatch Logs write
+  # (for build log streaming).
+  # -----------------------------------------------------------------
+  VoiceAgentBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-voice-build-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        # ECR permissions for authenticating, pushing layers, and completing image uploads
+        - PolicyName: EcrPush
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: !GetAtt VoiceAgentEcrRepository.Arn
+        # S3 read for downloading the voice agent source zip
+        - PolicyName: S3SourceRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub "arn:aws:s3:::${DeployBucket}/voice-agent-source/*"
+              - Effect: Allow
+                Action: s3:GetBucketLocation
+                Resource: !Sub "arn:aws:s3:::${DeployBucket}"
+        # CloudWatch Logs for build log streaming
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AccountId}:log-group:/aws/codebuild/${StackPrefix}-voice-agent-build:*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+
+  # -----------------------------------------------------------------
+  # CodeBuild Project - builds the voice agent ARM64 container image
+  # from source uploaded to S3. Uses Graviton builders for native ARM64
+  # builds (cheaper and faster than emulated x86 builds). PrivilegedMode
+  # is required for running docker-in-docker during the build phase.
+  # Inline buildspec: ECR login, docker build with Containerfile, push
+  # with both :latest and a timestamped tag for rollback capability.
+  # -----------------------------------------------------------------
+  VoiceAgentBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${StackPrefix}-voice-agent-build"
+      Description: Builds ARM64 container image for LUMI voice agent (AgentCore Runtime)
+      ServiceRole: !GetAtt VoiceAgentBuildRole.Arn
+      TimeoutInMinutes: 10
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_REPO_URI
+            Value: !Sub "${AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${StackPrefix}-voice-agent"
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AccountId
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref "AWS::Region"
+      Source:
+        Type: S3
+        Location: !Sub "${DeployBucket}/voice-agent-source/voice-agent-source.zip"
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo "Logging in to Amazon ECR..."
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+                - IMAGE_TAG=$(date +%Y%m%d%H%M%S)
+            build:
+              commands:
+                - echo "Building ARM64 container image..."
+                - docker build --platform linux/arm64 -t $ECR_REPO_URI:latest -f Containerfile .
+                - docker tag $ECR_REPO_URI:latest $ECR_REPO_URI:$IMAGE_TAG
+            post_build:
+              commands:
+                - echo "Pushing image to ECR..."
+                - docker push $ECR_REPO_URI:latest
+                - docker push $ECR_REPO_URI:$IMAGE_TAG
+                - echo "Image pushed successfully - $ECR_REPO_URI:latest and $ECR_REPO_URI:$IMAGE_TAG"
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+
+# -------------------------------------------------------------------
+# Outputs - Frontend configuration values and role ARN for AgentCore
+# -------------------------------------------------------------------
+Outputs:
+  VoiceIdentityPoolId:
+    Description: Cognito Identity Pool ID for frontend credential exchange
+    Value: !Ref VoiceIdentityPool
+
+  VoiceAgentCoreRoleArn:
+    Description: IAM role ARN for AgentCore agent container execution
+    Value: !GetAtt VoiceAgentCoreRole.Arn
+
+  VoiceAgentEcrRepoUri:
+    Description: ECR repository URI for voice agent container images
+    Value: !GetAtt VoiceAgentEcrRepository.RepositoryUri
+
+  VoiceAgentBuildProjectName:
+    Description: CodeBuild project name for voice agent container builds
+    Value: !Ref VoiceAgentBuildProject

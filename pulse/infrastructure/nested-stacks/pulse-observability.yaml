@@ -1,0 +1,487 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PULSE observability stack: the CloudWatch dashboard, alarms (triage,
+  delivery, escalation, AppSync/realtime errors), and the pulse-alarms SNS
+  topic for the alert pipeline.
+
+# -------------------------------------------------------------------
+# Parameters
+# -------------------------------------------------------------------
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: pulse
+    Description: Prefix for all resource names (StackPrefix = pulse)
+
+  RealtimeApiId:
+    Type: String
+    Default: ""
+    Description: >
+      AppSync Events API ID (from the API stack RealtimeApiId output). Used as
+      the ApiId dimension for the AWS/AppSync realtime metrics on the dashboard
+      and connection/publish-error alarms. When empty, the AppSync alarms are
+      skipped and the AppSync dashboard widgets simply render no data.
+
+# -------------------------------------------------------------------
+# Conditions
+# -------------------------------------------------------------------
+Conditions:
+  # Only create the AppSync realtime alarms when an API id was supplied.
+  HasRealtimeApi: !Not [!Equals [!Ref RealtimeApiId, ""]]
+
+# -------------------------------------------------------------------
+# Resources
+# -------------------------------------------------------------------
+Resources:
+
+  # =================================================================
+  # SNS - alarm notification topic (all PULSE alarms publish here)
+  # =================================================================
+  PulseAlarmsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${StackPrefix}-alarms"
+      DisplayName: PULSE Alarms
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: observability
+
+  # =================================================================
+  # LOG METRIC FILTERS - derive pipeline failure counters from the
+  # unified pipeline log group. Powertools emits structured JSON with a
+  # `message` key; each filter matches the stable log marker its source
+  # component logs and increments a count metric in PULSE/Pipeline.
+  # =================================================================
+  PulseTriageFailureMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub "/${StackPrefix}/pipeline"
+      # Triage failure marker: the AgentCore triage runtime logs
+      # "Triage failed*" when it cannot produce/attach a brief.
+      FilterPattern: '{ $.message = "Triage failed*" }'
+      MetricTransformations:
+        - MetricName: TriageFailureCount
+          MetricNamespace: PULSE/Pipeline
+          MetricValue: "1"
+          DefaultValue: 0
+          Unit: Count
+
+  PulseDeliveryExhaustedMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub "/${StackPrefix}/pipeline"
+      # Web Push delivery-exhausted marker (pulse.delivery.web_push).
+      FilterPattern: '{ $.message = "Web Push delivery exhausted*" }'
+      MetricTransformations:
+        - MetricName: DeliveryExhaustedCount
+          MetricNamespace: PULSE/Pipeline
+          MetricValue: "1"
+          DefaultValue: 0
+          Unit: Count
+
+  PulseEscalationExhaustionMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub "/${StackPrefix}/pipeline"
+      # Escalation-exhaustion marker (pulse.escalation.service).
+      FilterPattern: '{ $.message = "Escalation exhausted*" }'
+      MetricTransformations:
+        - MetricName: EscalationExhaustionCount
+          MetricNamespace: PULSE/Pipeline
+          MetricValue: "1"
+          DefaultValue: 0
+          Unit: Count
+
+  PulseRealtimePublishErrorMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub "/${StackPrefix}/pipeline"
+      # Best-effort realtime publish failure marker
+      # (pulse.delivery.realtime_publish). Design: realtimePublishErrors.
+      FilterPattern: '{ $.message = "Realtime publish failed*" }'
+      MetricTransformations:
+        - MetricName: RealtimePublishErrors
+          MetricNamespace: PULSE/Pipeline
+          MetricValue: "1"
+          DefaultValue: 0
+          Unit: Count
+
+  # =================================================================
+  # LOG METRIC FILTERS - forecast agent run outcomes (task 16.1, Req 8.1)
+  # The forecast agent logs stable structured markers on every run outcome
+  # (app.py) and when a signal tool exhausts its retries (forecast/signals.py).
+  # Each filter matches the marker text on the shared pipeline log group and
+  # increments a Count metric in PULSE/Pipeline, mirroring the pipeline
+  # failure filters above.
+  # =================================================================
+  ForecastRunFailureMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub "/${StackPrefix}/pipeline"
+      # Forecast run-failure marker: app.py logs "Forecast run failure" when a
+      # forecast run raises/aborts before producing an outcome.
+      FilterPattern: '{ $.message = "Forecast run failure*" }'
+      MetricTransformations:
+        - MetricName: ForecastRunFailures
+          MetricNamespace: PULSE/Pipeline
+          MetricValue: "1"
+          DefaultValue: 0
+          Unit: Count
+
+  ForecastToolExhaustedMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub "/${StackPrefix}/pipeline"
+      # Tool-exhausted marker: forecast/signals.py logs "Signal tool failed
+      # after all attempts; degrading gracefully" when a signal tool exhausts
+      # its retries and the run continues degraded.
+      FilterPattern: '{ $.message = "Signal tool failed after all attempts*" }'
+      MetricTransformations:
+        - MetricName: ForecastToolExhausted
+          MetricNamespace: PULSE/Pipeline
+          MetricValue: "1"
+          DefaultValue: 0
+          Unit: Count
+
+  ForecastNoAlertMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub "/${StackPrefix}/pipeline"
+      # No-alert outcome marker: app.py logs "Forecast no-alert outcome" when a
+      # run completes successfully but decides no alert is warranted.
+      FilterPattern: '{ $.message = "Forecast no-alert outcome*" }'
+      MetricTransformations:
+        - MetricName: ForecastNoAlert
+          MetricNamespace: PULSE/Pipeline
+          MetricValue: "1"
+          DefaultValue: 0
+          Unit: Count
+
+  # =================================================================
+  # ALARMS - pipeline failure counters (log-derived) -> SNS
+  # =================================================================
+  PulseTriageFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${StackPrefix}-triage-failures-high"
+      AlarmDescription: One or more triage failures in a 5-minute window.
+      Namespace: PULSE/Pipeline
+      MetricName: TriageFailureCount
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref PulseAlarmsTopic
+
+  PulseDeliveryExhaustedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${StackPrefix}-delivery-exhausted-high"
+      AlarmDescription: One or more Web Push deliveries exhausted all retries.
+      Namespace: PULSE/Pipeline
+      MetricName: DeliveryExhaustedCount
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref PulseAlarmsTopic
+
+  PulseEscalationExhaustionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${StackPrefix}-escalation-exhaustion-high"
+      AlarmDescription: >
+        One or more CRITICAL alerts escalated through the whole chain without
+        acknowledgement (GM -> AGM -> MOD all notified).
+      Namespace: PULSE/Pipeline
+      MetricName: EscalationExhaustionCount
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref PulseAlarmsTopic
+
+  PulseRealtimePublishErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${StackPrefix}-realtime-publish-errors-high"
+      AlarmDescription: >
+        Elevated best-effort realtime (AppSync Events) publish failures from the
+        delivery path; open clients reconcile on reconnect but sustained errors
+        indicate a foreground-channel problem.
+      Namespace: PULSE/Pipeline
+      MetricName: RealtimePublishErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref PulseAlarmsTopic
+
+  # =================================================================
+  # ALARMS - forecast agent run outcomes (log-derived) -> SNS
+  # (task 16.1, Req 8.3 / 8.4). Mirror the pipeline failure alarms:
+  # Sum over a 5-minute window, fire at >= 1, missing data is not breaching.
+  # =================================================================
+  PulseForecastRunFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${StackPrefix}-forecast-run-failures-high"
+      AlarmDescription: One or more forecast agent runs failed in a 5-minute window.
+      Namespace: PULSE/Pipeline
+      MetricName: ForecastRunFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref PulseAlarmsTopic
+
+  PulseForecastToolExhaustedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${StackPrefix}-forecast-tool-exhausted-high"
+      AlarmDescription: >
+        One or more forecast signal tools exhausted all retries in a 5-minute
+        window; runs continue degraded but sustained exhaustion indicates a
+        signal-source problem.
+      Namespace: PULSE/Pipeline
+      MetricName: ForecastToolExhausted
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref PulseAlarmsTopic
+
+  # =================================================================
+  # ALARMS - AppSync Events realtime (built-in AWS/AppSync metrics)
+  # Created only when a RealtimeApiId is supplied. The AppSync Events
+  # metric dimension is ApiId (confirm against the emitted dimension at
+  # deploy time; the API stack exposes RealtimeApiId for this wiring).
+  # =================================================================
+  PulseRealtimePublishServerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasRealtimeApi
+    Properties:
+      AlarmName: !Sub "${StackPrefix}-appsync-publish-errors-high"
+      AlarmDescription: Elevated AppSync Events server-side publish errors.
+      Namespace: AWS/AppSync
+      MetricName: PublishServerError
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref RealtimeApiId
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref PulseAlarmsTopic
+
+  PulseRealtimeConnectErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasRealtimeApi
+    Properties:
+      AlarmName: !Sub "${StackPrefix}-appsync-connection-errors-high"
+      AlarmDescription: Elevated AppSync Events server-side connection errors.
+      Namespace: AWS/AppSync
+      MetricName: ConnectServerError
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref RealtimeApiId
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref PulseAlarmsTopic
+
+  # =================================================================
+  # DASHBOARD - pulse-overview
+  # Delivery-latency p50/p90/p99 per tier (custom EMF metric), pipeline
+  # failure counters, and AppSync Events realtime metrics. The dashboard
+  # time range (1h - 30d) is selectable in the console; each widget uses a
+  # 60s period so the percentile view stays responsive.
+  # =================================================================
+  PulseOverviewDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${StackPrefix}-overview"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text", "x": 0, "y": 0, "width": 24, "height": 1,
+              "properties": { "markdown": "# PULSE Overview - alert delivery latency, pipeline health, and realtime channel" }
+            },
+            {
+              "type": "metric", "x": 0, "y": 1, "width": 8, "height": 6,
+              "properties": {
+                "title": "CRITICAL delivery latency (ms)",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stacked": false,
+                "period": 60,
+                "yAxis": { "left": { "min": 0 } },
+                "metrics": [
+                  [ "PULSE/Delivery", "AlertDeliveryLatencyMs", "Tier", "CRITICAL", { "stat": "p50", "label": "p50" } ],
+                  [ "PULSE/Delivery", "AlertDeliveryLatencyMs", "Tier", "CRITICAL", { "stat": "p90", "label": "p90" } ],
+                  [ "PULSE/Delivery", "AlertDeliveryLatencyMs", "Tier", "CRITICAL", { "stat": "p99", "label": "p99" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 8, "y": 1, "width": 8, "height": 6,
+              "properties": {
+                "title": "WARNING delivery latency (ms)",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stacked": false,
+                "period": 60,
+                "yAxis": { "left": { "min": 0 } },
+                "metrics": [
+                  [ "PULSE/Delivery", "AlertDeliveryLatencyMs", "Tier", "WARNING", { "stat": "p50", "label": "p50" } ],
+                  [ "PULSE/Delivery", "AlertDeliveryLatencyMs", "Tier", "WARNING", { "stat": "p90", "label": "p90" } ],
+                  [ "PULSE/Delivery", "AlertDeliveryLatencyMs", "Tier", "WARNING", { "stat": "p99", "label": "p99" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 16, "y": 1, "width": 8, "height": 6,
+              "properties": {
+                "title": "INFO delivery latency (ms)",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stacked": false,
+                "period": 60,
+                "yAxis": { "left": { "min": 0 } },
+                "metrics": [
+                  [ "PULSE/Delivery", "AlertDeliveryLatencyMs", "Tier", "INFO", { "stat": "p50", "label": "p50" } ],
+                  [ "PULSE/Delivery", "AlertDeliveryLatencyMs", "Tier", "INFO", { "stat": "p90", "label": "p90" } ],
+                  [ "PULSE/Delivery", "AlertDeliveryLatencyMs", "Tier", "INFO", { "stat": "p99", "label": "p99" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 7, "width": 12, "height": 6,
+              "properties": {
+                "title": "Pipeline failure counters (5 min sum)",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stacked": false,
+                "period": 300,
+                "stat": "Sum",
+                "yAxis": { "left": { "min": 0 } },
+                "metrics": [
+                  [ "PULSE/Pipeline", "TriageFailureCount", { "label": "Triage failures" } ],
+                  [ "PULSE/Pipeline", "DeliveryExhaustedCount", { "label": "Delivery exhausted" } ],
+                  [ "PULSE/Pipeline", "EscalationExhaustionCount", { "label": "Escalation exhaustion" } ],
+                  [ "PULSE/Pipeline", "RealtimePublishErrors", { "label": "Realtime publish errors" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 7, "width": 12, "height": 6,
+              "properties": {
+                "title": "AppSync Events - active connections & subscriptions",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stacked": false,
+                "period": 60,
+                "stat": "Sum",
+                "yAxis": { "left": { "min": 0 } },
+                "metrics": [
+                  [ "AWS/AppSync", "ActiveConnections", "ApiId", "${RealtimeApiId}", { "label": "Active connections" } ],
+                  [ "AWS/AppSync", "ActiveSubscriptions", "ApiId", "${RealtimeApiId}", { "label": "Active subscriptions" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 13, "width": 12, "height": 6,
+              "properties": {
+                "title": "AppSync Events - publish & subscribe",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stacked": false,
+                "period": 60,
+                "stat": "Sum",
+                "yAxis": { "left": { "min": 0 } },
+                "metrics": [
+                  [ "AWS/AppSync", "PublishSuccess", "ApiId", "${RealtimeApiId}", { "label": "Publish success" } ],
+                  [ "AWS/AppSync", "SubscribeSuccess", "ApiId", "${RealtimeApiId}", { "label": "Subscribe success" } ],
+                  [ "AWS/AppSync", "BroadcastEventSuccess", "ApiId", "${RealtimeApiId}", { "label": "Broadcast success" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 13, "width": 12, "height": 6,
+              "properties": {
+                "title": "AppSync Events - errors",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stacked": false,
+                "period": 60,
+                "stat": "Sum",
+                "yAxis": { "left": { "min": 0 } },
+                "metrics": [
+                  [ "AWS/AppSync", "ConnectClientError", "ApiId", "${RealtimeApiId}", { "label": "Connect client error" } ],
+                  [ "AWS/AppSync", "ConnectServerError", "ApiId", "${RealtimeApiId}", { "label": "Connect server error" } ],
+                  [ "AWS/AppSync", "PublishServerError", "ApiId", "${RealtimeApiId}", { "label": "Publish server error" } ],
+                  [ "AWS/AppSync", "BroadcastEventServerError", "ApiId", "${RealtimeApiId}", { "label": "Broadcast server error" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 19, "width": 12, "height": 6,
+              "properties": {
+                "title": "Forecast agent run outcomes (5 min sum)",
+                "region": "${AWS::Region}",
+                "view": "timeSeries",
+                "stacked": false,
+                "period": 300,
+                "stat": "Sum",
+                "yAxis": { "left": { "min": 0 } },
+                "metrics": [
+                  [ "PULSE/Pipeline", "ForecastRunFailures", { "label": "Run failures" } ],
+                  [ "PULSE/Pipeline", "ForecastToolExhausted", { "label": "Tool exhausted" } ],
+                  [ "PULSE/Pipeline", "ForecastNoAlert", { "label": "No-alert outcomes" } ]
+                ]
+              }
+            }
+          ]
+        }
+
+# -------------------------------------------------------------------
+# Outputs
+# -------------------------------------------------------------------
+Outputs:
+  AlarmsTopicArn:
+    Description: SNS topic ARN all PULSE alarms publish to
+    Value: !Ref PulseAlarmsTopic
+
+  DashboardName:
+    Description: CloudWatch dashboard name for the PULSE overview
+    Value: !Sub "${StackPrefix}-overview"

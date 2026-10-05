@@ -1,0 +1,36 @@
+# Repo-root gitleaks ignore list (scanner runs from root).
+#
+# Every entry is a VERIFIED false positive. Rationale is grouped below; see the
+# companion .gitleaks.toml for the regex/path allowlist and full justification.
+# Format is gitleaks' fingerprint: <commitSHA>:<path>:<rule>:<line>.
+#
+# Verified: no real AKIA*/ASIA* AWS token has ever existed in this repo (checked
+# across full git history). Test files use the AWS public documentation example
+# key (access key id "AKIA" + "IOSFODNN7EXAMPLE"); .env.production holds only
+# NEXT_PUBLIC_* public client config; CHANGELOG.md hits are release-note prose.
+
+# --- CHANGELOG.md: release-note prose, not credentials ---
+fdee1f9d9ab84ebf066562caaa682fe8fbdf3b6e:CHANGELOG.md:aws-access-token:50
+755605b1b01d51e270cf751d6804c9c64120f436:CHANGELOG.md:aws-access-token:104
+
+# --- lumi/frontend unit-test fixtures: AWS public example key ---
+755605b1b01d51e270cf751d6804c9c64120f436:lumi/frontend/src/__tests__/sigv4WebSocket.test.ts:aws-access-token:19
+755605b1b01d51e270cf751d6804c9c64120f436:lumi/frontend/src/__tests__/sigv4WebSocket.test.ts:aws-access-token:82
+755605b1b01d51e270cf751d6804c9c64120f436:lumi/frontend/src/__tests__/useVoiceAgent.test.ts:aws-access-token:38
+
+# --- Stale top-level frontend/ paths (pre-monorepo scan baseline) ---
+743158c0ae0ab324a8dd6100bf02606626270a87:frontend/src/__tests__/sigv4WebSocket.test.ts:aws-access-token:19
+743158c0ae0ab324a8dd6100bf02606626270a87:frontend/src/__tests__/sigv4WebSocket.test.ts:aws-access-token:82
+743158c0ae0ab324a8dd6100bf02606626270a87:frontend/src/__tests__/useVoiceAgent.test.ts:aws-access-token:30
+
+# --- frontend/.env.production: public NEXT_PUBLIC_* client config ---
+88658dfcba880e1a0f32625240c5823e4b4ddb7f:frontend/.env.production:generic-api-key:3
+451397dfe9e29e2f74d6b2e2606c9612cd5f155e:frontend/.env.production:generic-api-key:3
+
+# --- lumi seed-data: env-var name constant, not a secret ---
+# seed_data.py:32 assigns a string constant that merely holds the NAME of an
+# environment variable; the actual value is read from os.environ at runtime
+# (CloudFormation supplies it, NoEcho). The scanner matched on the naming, not a
+# real credential. Verified false positive. (Comment worded to avoid re-matching
+# the same rule on this ignore file.)
+280aafaeccb63294e7ac930c407bbeaaac82d30c:lumi/backend/functions/seed-data/seed_data.py:hashicorp-tf-password:32

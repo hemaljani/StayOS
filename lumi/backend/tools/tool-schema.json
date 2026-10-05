@@ -1,0 +1,165 @@
+{
+  "schemaVersion": "1.0",
+  "tools": [
+    {
+      "name": "get_occupancy",
+      "description": "Get today's occupancy metrics including occupancy percentage, total arrivals, total departures, and available rooms for the property. Optionally accepts a date to query a specific day.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "propertyId": {
+            "type": "string",
+            "description": "Property identifier (injected by the calling agent from session context)"
+          },
+          "date": {
+            "type": "string",
+            "description": "ISO 8601 date string (YYYY-MM-DD) to query. Defaults to today if not provided."
+          }
+        },
+        "required": ["propertyId"]
+      }
+    },
+    {
+      "name": "get_revenue",
+      "description": "Get revenue key performance indicators including ADR (Average Daily Rate), RevPAR (Revenue Per Available Room), and comparisons versus budget and prior periods.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "propertyId": {
+            "type": "string",
+            "description": "Property identifier (injected by the calling agent from session context)"
+          },
+          "start_date": {
+            "type": "string",
+            "description": "ISO 8601 start date (YYYY-MM-DD) for the revenue period. Defaults to today."
+          },
+          "end_date": {
+            "type": "string",
+            "description": "ISO 8601 end date (YYYY-MM-DD) for the revenue period. Defaults to start_date."
+          }
+        },
+        "required": ["propertyId"]
+      }
+    },
+    {
+      "name": "get_vip_guests",
+      "description": "Get VIP guest arrivals and currently in-house VIP guests for the property. Returns guest names, loyalty tier, room assignment, and any noted occasion.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "propertyId": {
+            "type": "string",
+            "description": "Property identifier (injected by the calling agent from session context)"
+          },
+          "date": {
+            "type": "string",
+            "description": "ISO 8601 date string (YYYY-MM-DD) for VIP arrivals. Defaults to today."
+          }
+        },
+        "required": ["propertyId"]
+      }
+    },
+    {
+      "name": "get_room_status",
+      "description": "Get current room status including rooms out of order, out of service, or awaiting housekeeping. Returns room numbers, issue descriptions, and duration.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "propertyId": {
+            "type": "string",
+            "description": "Property identifier (injected by the calling agent from session context)"
+          }
+        },
+        "required": ["propertyId"]
+      }
+    },
+    {
+      "name": "get_work_orders",
+      "description": "Get open and overdue maintenance work orders for the property. Returns work order IDs, descriptions, priority levels, and age in hours.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "propertyId": {
+            "type": "string",
+            "description": "Property identifier (injected by the calling agent from session context)"
+          },
+          "status": {
+            "type": "string",
+            "description": "Filter by status. Must be one of: OPEN, IN_PROGRESS. If not provided, returns both open and in-progress."
+          }
+        },
+        "required": ["propertyId"]
+      }
+    },
+    {
+      "name": "get_sister_property_availability",
+      "description": "Get sister properties (other properties of the same brand) that currently have room availability, optionally for a given stay-date range and room type. Used to relocate walked guests when a property is oversold. Returns each sister property with its count of available rooms.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "propertyId": {
+            "type": "string",
+            "description": "Property identifier (injected by the calling agent from session context)"
+          },
+          "startDate": {
+            "type": "string",
+            "description": "ISO 8601 stay start date (YYYY-MM-DD). Echoed for context; availability is derived from current AVAILABLE room inventory."
+          },
+          "endDate": {
+            "type": "string",
+            "description": "ISO 8601 stay end date (YYYY-MM-DD). Defaults to startDate when omitted."
+          },
+          "roomType": {
+            "type": "string",
+            "description": "Optional room type to match (e.g. SUITE, KING_DELUXE, KING_STANDARD)."
+          }
+        },
+        "required": ["propertyId"]
+      }
+    },
+    {
+      "name": "get_walkable_guests",
+      "description": "Get confirmed guests eligible to be walked when a night is oversold, ordered lowest-loyalty first and capped at the room shortfall. Only guests whose loyalty tier is at or below the protection threshold are returned.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "propertyId": {
+            "type": "string",
+            "description": "Property identifier (injected by the calling agent from session context)"
+          },
+          "shortfall": {
+            "type": "integer",
+            "description": "Number of rooms oversold - the maximum number of walkable guests to return."
+          },
+          "loyaltyProtectionTier": {
+            "type": "string",
+            "description": "Guests at or below this tier are walkable. One of PLATINUM, TITANIUM, AMBASSADOR. Defaults to PLATINUM (least-elite only)."
+          },
+          "arrivalDate": {
+            "type": "string",
+            "description": "ISO 8601 arrival date (YYYY-MM-DD) of the oversold night. Defaults to today."
+          }
+        },
+        "required": ["propertyId", "shortfall"]
+      }
+    },
+    {
+      "name": "get_room_move_candidates",
+      "description": "Get rooms that are ready and available for reassignment, for example to move a VIP guest whose assigned room is not ready. Optionally matches a specific room type. Returns room numbers, room types, and status.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "propertyId": {
+            "type": "string",
+            "description": "Property identifier (injected by the calling agent from session context)"
+          },
+          "roomType": {
+            "type": "string",
+            "description": "Optional room type to match (e.g. SUITE, KING_DELUXE, KING_STANDARD)."
+          }
+        },
+        "required": ["propertyId"]
+      }
+    }
+  ]
+}

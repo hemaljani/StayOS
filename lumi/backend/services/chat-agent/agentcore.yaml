@@ -1,0 +1,211 @@
+# =============================================================================
+# AgentCore Runtime Configuration - LUMI Chat Agent
+# =============================================================================
+# This file documents the runtime configuration for deploying the LUMI text
+# chat agent to Amazon Bedrock AgentCore Runtime.
+#
+# DEPLOYMENT METHOD: CodeBuild + AWS CLI (via Makefile)
+# ---------------------------------------------------
+# Deployment is fully automated through `make deploy` which orchestrates:
+#   1. CodeBuild builds an ARM64 container image and pushes to ECR
+#   2. AWS CLI (`aws bedrock-agentcore-control`) creates/updates the runtime
+#
+# This follows the same pattern established by the voice agent
+# (backend/services/voice-agent). The AgentCore CLI (`agentcore deploy`) is
+# not used for either agent.
+#
+# See: Makefile targets `chat-build` and `chat-deploy` (Task 8)
+# See: infrastructure/nested-stacks/chat.yaml (ECR + CodeBuild + IAM resources)
+# =============================================================================
+
+# -------------------------------------------------------------------
+# Agent Metadata
+# -------------------------------------------------------------------
+agent:
+  name: stayos-chat-agent
+  description: >
+    LUMI text chat assistant for hotel General Managers. Bridges browser
+    WebSocket connections to a per-session Strands Agent backed by Claude
+    Sonnet, which answers property-scoped operational questions by
+    discovering and invoking the 5 read-only hotel operations tools through
+    the AgentCore Gateway (via MCP), rather than calling DynamoDB directly.
+
+# -------------------------------------------------------------------
+# Runtime Configuration
+# -------------------------------------------------------------------
+runtime:
+  # Python 3.12 runtime environment (matches requirements.txt dependencies)
+  language: python3.12
+
+  # ARM64 architecture for cost efficiency on Graviton-based microVMs
+  architecture: arm64
+
+  # Application entry point - BedrockAgentCoreApp starts Uvicorn on port 8080
+  entrypoint: server.py
+
+  # AgentCore protocol contract requires port 8080
+  port: 8080
+
+  # Container-based deployment via CodeBuild + ECR
+  # CodeBuild builds the ARM64 image from the Containerfile in this directory
+  # and pushes to ECR. The Makefile then points AgentCore at the ECR image URI.
+  buildType: Container
+
+# -------------------------------------------------------------------
+# Environment Variables
+# -------------------------------------------------------------------
+# These environment variables are set on the deployed AgentCore container
+# via the create-agent-runtime / update-agent-runtime CLI call.
+# Values come from the CloudFormation stack outputs (stayos-* resource names)
+# and SSM Parameter Store (Gateway endpoint URL from `gateway-deploy`).
+#
+# Unlike the voice agent, the chat agent does not query DynamoDB directly -
+# it discovers and calls tools through the AgentCore Gateway, so no dataset
+# table names are injected here.
+# -------------------------------------------------------------------
+environment:
+  # AgentCore Gateway MCP endpoint (Streamable HTTP, IAM auth). Sourced from
+  # SSM /${StackPrefix}/gateway/endpoint-url at deploy time (populated by the
+  # `gateway-deploy` Makefile target from Task 5).
+  GATEWAY_ENDPOINT_URL: <from-ssm:/stayos/gateway/endpoint-url>
+
+  # Informational - identity_resolver.py validates tokens via Cognito GetUser,
+  # which is scoped to a pool implicitly by the Access Token itself, so this
+  # variable documents the pool in use but is not read directly by the code.
+  COGNITO_USER_POOL_ID: <from-cloudformation:AuthStack.Outputs.UserPoolId>
+
+  # AWS region for boto3 clients, the Bedrock model invocation, and the
+  # Gateway SigV4 signer
+  AWS_DEFAULT_REGION: us-east-1
+
+# -------------------------------------------------------------------
+# IAM Execution Role
+# -------------------------------------------------------------------
+# The AgentCore container assumes this role at runtime. It provides:
+# - bedrock:InvokeModel / InvokeModelWithResponseStream on Claude Sonnet
+# - bedrock-agentcore:InvokeGateway for MCP tool discovery and invocation
+# - cognito-idp:GetUser on the User Pool (identity verification)
+# - ecr:GetAuthorizationToken / BatchGetImage / GetDownloadUrlForLayer for
+#   pulling the container image
+# - CloudWatch Logs write for structured container logging
+#
+# Defined in: infrastructure/nested-stacks/chat.yaml (ChatAgentCoreRole)
+# Naming pattern: ${StackPrefix}-chat-agentcore-role-${AWS::Region}
+# -------------------------------------------------------------------
+iam:
+  executionRoleArn: arn:aws:iam::<ACCOUNT_ID>:role/stayos-chat-agentcore-role-us-east-1
+
+# -------------------------------------------------------------------
+# Logging Configuration
+# -------------------------------------------------------------------
+# Container logs route to CloudWatch Logs via Powertools Logger (structured
+# JSON format). The log group is created by CloudFormation with 14-day
+# retention.
+#
+# Defined in: infrastructure/nested-stacks/chat.yaml (ChatAgentCoreLogGroup)
+# -------------------------------------------------------------------
+logging:
+  logGroupName: /stayos/agentcore/chat-agent
+  retentionDays: 14
+
+# -------------------------------------------------------------------
+# Lifecycle Configuration
+# -------------------------------------------------------------------
+# AgentCore Runtime enforces two platform-level timeouts that interact with
+# the application's own idle timeout:
+#
+# 1. Application idle timeout: 300 seconds of no inbound WebSocket message
+#    (IDLE_TIMEOUT_SECONDS in server.py) - sends sessionEnded to the browser.
+#    This is longer than the voice agent's 60s because chat is less bursty -
+#    GMs pause to read a response or compose a follow-up question.
+# 2. Platform idle timeout: Fires if no WebSocket messages for this duration.
+#    Set to 360 seconds (6 minutes) so it sits comfortably beyond the app's
+#    own 300-second idle timeout - the application timeout should always
+#    fire first in normal operation, and this is a safety net for cases
+#    where the application-level timer does not run (e.g., a stuck task).
+# 3. Platform max lifetime: Maximum session duration regardless of activity.
+#    8 hours is the default; no chat session should approach this limit.
+# -------------------------------------------------------------------
+lifecycle:
+  # Container idle timeout (seconds) - terminate if no activity.
+  # Set to exceed the app's 300s idle timeout (server.py IDLE_TIMEOUT_SECONDS)
+  # so the application's own graceful sessionEnded flow fires first.
+  idleRuntimeSessionTimeout: 360
+
+  # Maximum container lifetime (seconds) - 8 hours absolute cap
+  maxLifetime: 28800
+
+# -------------------------------------------------------------------
+# Health Check (AgentCore Protocol Contract)
+# -------------------------------------------------------------------
+# The container implements GET /ping returning:
+# - {"status": "Healthy"} when no active chat sessions
+# - {"status": "HealthyBusy"} when a chat session is in progress
+#
+# HealthyBusy prevents AgentCore from terminating the container while
+# a GM is mid-conversation.
+# -------------------------------------------------------------------
+healthCheck:
+  endpoint: /ping
+  healthyResponse: '{"status": "Healthy"}'
+  busyResponse: '{"status": "HealthyBusy"}'
+
+# =============================================================================
+# DEPLOYMENT WORKFLOW
+# =============================================================================
+#
+# Prerequisites:
+#   1. Deploy the CloudFormation stack first to create the IAM role, ECR
+#      repository, CodeBuild project, Tool Lambda, and log group:
+#      $ make deploy-infra
+#
+#   2. Deploy the AgentCore Gateway and register the Tool Lambda target
+#      (Task 5 - reads the Gateway endpoint URL that this agent depends on):
+#      $ make gateway-deploy
+#
+#   3. AWS CLI >= 2.27 (required for `bedrock-agentcore-control` subcommand)
+#      $ aws --version
+#
+# Build (container image via CodeBuild) - Task 8:
+#   $ make chat-build
+#
+#   This target:
+#   - Zips the chat agent source (excluding tests, __pycache__, .pytest_cache,
+#     agentcore/)
+#   - Uploads the zip to s3://${DEPLOY_BUCKET}/chat-agent-source/
+#   - Triggers CodeBuild (ARM64 Graviton build)
+#   - Waits for build completion
+#   - Image is pushed to ECR: ${AccountId}.dkr.ecr.${Region}.amazonaws.com/stayos-chat-agent:latest
+#
+# Deploy (AgentCore Runtime via AWS CLI) - Task 8:
+#   $ make chat-deploy
+#
+#   This target:
+#   - First deploy: calls `aws bedrock-agentcore-control create-agent-runtime`
+#     with container config, role ARN, env vars (including GATEWAY_ENDPOINT_URL
+#     read from SSM), lifecycle, network mode PUBLIC
+#   - Saves runtime ID to SSM at /${StackPrefix}/chat/runtime-id
+#   - Subsequent deploys: calls `aws bedrock-agentcore-control update-agent-runtime`
+#     with new container URI
+#   - Waits for runtime status to reach READY
+#   - Agent runtime is named `${StackPrefix}_chat_agent`
+#
+# Full pipeline (recommended):
+#   $ make deploy
+#   # Runs: preflight -> deploy-infra -> update-lambda-code -> gateway-deploy ->
+#   #        voice-build -> voice-deploy -> chat-build -> chat-deploy ->
+#   #        write-frontend-env -> build-frontend -> deploy-frontend
+#
+# Cleanup:
+#   $ make chat-destroy
+#   # Deletes the AgentCore Runtime and removes the SSM parameter
+#   # Stack deletion (make destroy) handles ECR + CodeBuild + Tool Lambda removal
+#
+# Local Development:
+#   For local development, run the server directly:
+#   $ cd backend/services/chat-agent
+#   $ python server.py
+#   # Agent runs locally on http://localhost:8080
+#   # Set GATEWAY_ENDPOINT_URL and AWS_DEFAULT_REGION in your shell or .env file
+#
+# =============================================================================

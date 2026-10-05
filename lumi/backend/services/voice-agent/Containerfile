@@ -1,0 +1,47 @@
+# Multi-stage Containerfile for the StayOS LUMI Voice Agent
+# Builds a minimal production image for AgentCore Runtime (ARM64 Graviton microVMs).
+# Uses python:3.12-slim for small footprint; runs as non-root user for security.
+# BedrockAgentCoreApp starts uvicorn internally on port 8080.
+
+# --- Stage 1: Builder ---
+# Install Python dependencies into a clean layer so the final image avoids
+# build tools, caches, and other pip artifacts.
+FROM public.ecr.aws/docker/library/python:3.12-slim AS builder
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+# Install production dependencies only; --no-cache-dir keeps the layer small
+RUN pip install --no-cache-dir -r requirements.txt
+
+# --- Stage 2: Runtime ---
+# Minimal image with only the runtime dependencies and application code.
+FROM public.ecr.aws/docker/library/python:3.12-slim
+
+WORKDIR /app
+
+# Create a non-root system user for running the application (security best practice)
+RUN groupadd --system --gid 1001 appuser \
+    && useradd --system --uid 1001 --gid appuser --no-create-home appuser
+
+# Copy installed packages from builder stage (owned by appuser)
+COPY --from=builder --chown=appuser:appuser /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder --chown=appuser:appuser /usr/local/bin /usr/local/bin
+
+# Copy application source code (tests, __pycache__, agentcore/ excluded via .dockerignore)
+COPY --chown=appuser:appuser . /app
+
+# Switch to non-root user
+USER appuser
+
+# AgentCore requires the application to listen on port 8080
+EXPOSE 8080
+
+# Health check hits the /ping endpoint that BedrockAgentCoreApp exposes.
+# AgentCore uses this to determine Healthy vs HealthyBusy status.
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/ping')"
+
+# BedrockAgentCoreApp starts uvicorn internally - just run the server module
+CMD ["python", "server.py"]

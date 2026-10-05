@@ -1,0 +1,39 @@
+# .dockerignore for the PULSE Triage Agent container build.
+# Excludes tests, caches, local config, and dev artifacts to keep the production
+# image minimal and secure. The bundled ./pulse package (staged by the build) IS
+# included; only its caches/tests are pruned by the patterns below.
+
+# Python caches and compiled bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Test files - not needed in production
+tests/
+
+# AgentCore manifest - informational only, not needed at runtime
+agentcore.yaml
+
+# Version control
+.git/
+.gitignore
+
+# IDE and OS artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artifacts
+*.egg-info/
+dist/
+build/

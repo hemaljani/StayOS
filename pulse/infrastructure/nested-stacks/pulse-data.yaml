@@ -1,0 +1,571 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PULSE data stack: the five PULSE-owned DynamoDB tables (alerts, rules,
+  alert-history, push-subscriptions, kitchen) with their GSIs, TTL, and the
+  pulse-alerts stream.
+
+# -------------------------------------------------------------------
+# Parameters
+# -------------------------------------------------------------------
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: pulse
+    Description: Prefix for all resource names (StackPrefix = pulse)
+
+  # --- Lambda packaging (aws cloudformation package uploads here) ---
+  # Same shared PULSE deployment package (pulse-backend.zip) every PULSE Lambda
+  # is built from; the kitchen seed handler lives inside it.
+  DeployBucket:
+    Type: String
+    Default: "pulse-deploy-artifacts"
+    Description: S3 bucket holding the shared PULSE Lambda deployment package
+  LambdaCodeS3Key:
+    Type: String
+    Default: "functions/pulse-backend.zip"
+    Description: S3 key of the shared PULSE Lambda deployment package
+
+  # --- Kitchen seed re-run trigger (Custom::SeedData bump-to-reseed) ---
+  KitchenSeedTrigger:
+    Type: String
+    Default: "2"
+    Description: >
+      Bump this value to force the kitchen seed custom resource to re-run on the
+      next deploy (mirrors LUMI's Custom::SeedData Trigger). The seed is
+      per-property idempotent and skips a property whose snapshot already exists,
+      so a bump safely fills in any missing property snapshots. (Bumped to "2"
+      to seed the full pilot estate after the single-property seed was widened.)
+
+  # --- Rules seed re-run trigger (bump-to-reseed) ---
+  RulesSeedTrigger:
+    Type: String
+    Default: "1"
+    Description: >
+      Bump this value to force the rules seed custom resource to re-run on the
+      next deploy. The seed is idempotent and skips a property whose rules
+      already exist (so operator edits via the /rules API are preserved).
+
+# -------------------------------------------------------------------
+# Resources
+# -------------------------------------------------------------------
+Resources:
+
+  # =================================================================
+  # pulse-alerts
+  # Live and in-flight alert lifecycle. Partition key alertId. Carries
+  # four GSIs for the per-property feed, per-GM lifecycle, tier/status
+  # filtering, and the mandatory-review / due-escalation queue. A
+  # DynamoDB Stream (NEW_AND_OLD_IMAGES) fans status changes out to
+  # pulse-alert-history and the escalation machinery.
+  # =================================================================
+  PulseAlertsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${StackPrefix}-alerts"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: alertId
+          AttributeType: S
+        - AttributeName: propertyId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+        - AttributeName: gmAlias
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: escalationStatus
+          AttributeType: S
+        - AttributeName: escalationNextCheckAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: alertId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        # Feed for a property, newest first; shift-handover window queries.
+        - IndexName: propertyId-createdAt-index
+          KeySchema:
+            - AttributeName: propertyId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        # A GM's alerts by lifecycle state; property scoping.
+        - IndexName: gmAlias-status-index
+          KeySchema:
+            - AttributeName: gmAlias
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        # Tier/status filtering; open-alert counts for KPIs; source-entity
+        # correlation lookups for the closed loop.
+        - IndexName: propertyId-status-index
+          KeySchema:
+            - AttributeName: propertyId
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        # Mandatory-review queue; 30s safety-net sweep for due escalations.
+        - IndexName: escalationStatus-escalationNextCheckAt-index
+          KeySchema:
+            - AttributeName: escalationStatus
+              KeyType: HASH
+            - AttributeName: escalationNextCheckAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      # NEW_AND_OLD_IMAGES: history fan-out and escalation need the prior
+      # image to detect status transitions, not just the new value.
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      # PITR: alert lifecycle is business-critical; recovery beats replay.
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: data
+
+  # =================================================================
+  # pulse-rules
+  # Admin-editable rule definitions, keyed by property and rule type.
+  # Single-partition access per property; no GSI needed.
+  # =================================================================
+  PulseRulesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${StackPrefix}-rules"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: propertyId
+          AttributeType: S
+        - AttributeName: ruleType
+          AttributeType: S
+      KeySchema:
+        - AttributeName: propertyId
+          KeyType: HASH
+        - AttributeName: ruleType
+          KeyType: RANGE
+      # PITR: rule definitions are configuration; protect against bad edits.
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: important
+        - Key: Component
+          Value: data
+
+  # =================================================================
+  # pulse-alert-history
+  # Append-only audit and shift-handover source. Composite key
+  # alertId + version (monotonic status-change sequence). TTL on
+  # expiresAt gives a rolling 90-day retention. GSI supports the
+  # shift-handover window query (by property, newest first).
+  # =================================================================
+  PulseAlertHistoryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${StackPrefix}-alert-history"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: alertId
+          AttributeType: S
+        - AttributeName: version
+          AttributeType: N
+        - AttributeName: propertyId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: alertId
+          KeyType: HASH
+        - AttributeName: version
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        # Shift-handover: all alerts for a property within a shift window,
+        # ordered by createdAt descending.
+        - IndexName: propertyId-createdAt-index
+          KeySchema:
+            - AttributeName: propertyId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      # TTL: expiresAt = createdAt + 90 days (epoch seconds); rolling retention.
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      # PITR: history is the audit trail; business-critical to preserve.
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: data
+
+  # =================================================================
+  # pulse-push-subscriptions
+  # Web Push (VAPID) subscription objects for the background wake-up
+  # channel only. Keyed by gmAlias + endpointHash (a GM may register
+  # several devices). The foreground AppSync Events channel is fully
+  # managed and needs no table.
+  # =================================================================
+  PulsePushSubscriptionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${StackPrefix}-push-subscriptions"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: gmAlias
+          AttributeType: S
+        - AttributeName: endpointHash
+          AttributeType: S
+      KeySchema:
+        - AttributeName: gmAlias
+          KeyType: HASH
+        - AttributeName: endpointHash
+          KeyType: RANGE
+      # PITR: subscriptions are cheap to re-register, but protect anyway.
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: important
+        - Key: Component
+          Value: data
+
+  # =================================================================
+  # pulse-kitchen
+  # Curated Kitchen/F&B snapshot for the Kitchen tab. One item per
+  # property (partition key propertyId ONLY) holding the whole snapshot
+  # as nested attributes (banquetCountdown, fbStats, deliverySla,
+  # kitchenOrders, channelMix, channelMixNote). Single-item GetItem per
+  # property; no GSI needed. Seeded by the KitchenSeed custom resource below
+  # (idempotent, re-runnable via a KitchenSeedTrigger bump or make
+  # kitchen-reseed), hence the lighter resilience tier.
+  # =================================================================
+  PulseKitchenTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${StackPrefix}-kitchen"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: propertyId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: propertyId
+          KeyType: HASH
+      # PITR: snapshot is re-seedable, but protect against accidental edits.
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: data
+
+  # =================================================================
+  # KITCHEN SEED - CloudFormation custom resource (mirrors LUMI Custom::SeedData)
+  # Seeds the pulse-kitchen snapshot for every pilot property on stack
+  # create/update via the shared PULSE Lambda deployment package. Per-property
+  # idempotent (skips a property whose snapshot already exists); Delete is a
+  # no-op that preserves data. Bump KitchenSeedTrigger to re-run.
+  # =================================================================
+
+  # Log group for the kitchen seed Lambda (explicit so retention is managed).
+  KitchenSeedLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${StackPrefix}-kitchen-seed"
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: data
+
+  # IAM role for the seed Lambda (least privilege; region-suffixed name).
+  # Writes and probes ONLY the pulse-kitchen table, plus CloudWatch Logs.
+  KitchenSeedLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-kitchen-seed-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: KitchenSeedWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # PutItem seeds the snapshot; GetItem/Scan/Query back the
+              # per-property idempotency probe. Scoped to the pulse-kitchen ARN.
+              - Effect: Allow
+                Action:
+                  - "dynamodb:PutItem"
+                  - "dynamodb:GetItem"
+                  - "dynamodb:Scan"
+                  - "dynamodb:Query"
+                Resource: !GetAtt PulseKitchenTable.Arn
+        - PolicyName: Observability
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackPrefix}-kitchen-seed:*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: data
+
+  # The seed Lambda (thin CFN custom-resource handler; shared deployment package).
+  KitchenSeedFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${StackPrefix}-kitchen-seed"
+      Description: PULSE kitchen snapshot seed (CloudFormation custom resource)
+      Runtime: python3.12
+      Handler: pulse.seed.kitchen_seed.lambda_handler
+      MemorySize: 256
+      Timeout: 60
+      Role: !GetAtt KitchenSeedLambdaRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref KitchenSeedLogGroup
+        LogFormat: JSON
+      Code:
+        S3Bucket: !Ref DeployBucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          # Resource identifier from the environment (PYQUALITY-06); never
+          # hardcoded. KITCHEN_TABLE_NAME is the seed target; ESTATE_PROPERTY_IDS
+          # is the comma-separated property set to seed a snapshot for (handler
+          # falls back to the five pilot demo properties when unset). Seeding
+          # every property is what lets the Kitchen tab work for all demo GMs.
+          KITCHEN_TABLE_NAME: !Ref PulseKitchenTable
+          ESTATE_PROPERTY_IDS: "ALOHA-CHI-001,ALOHA-MIA-001,ALOHA-TYO-001,ALOHA-MAD-001,ALOHA-BOM-001"
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: data
+
+  # The custom resource itself. ServiceToken points at the seed Lambda; the
+  # Trigger property re-runs the seed when KitchenSeedTrigger is bumped
+  # (mirrors LUMI's Custom::SeedData Trigger). DependsOn ensures the log group
+  # exists before the first invocation.
+  KitchenSeedCustomResource:
+    Type: Custom::KitchenSeed
+    DependsOn: KitchenSeedLogGroup
+    Properties:
+      ServiceToken: !GetAtt KitchenSeedFunction.Arn
+      Trigger: !Ref KitchenSeedTrigger
+
+  # =================================================================
+  # RULES SEED (Custom resource, shared PULSE Lambda package)
+  # Seeds the default enabled rule set (one rule per alert-producing type, per
+  # property) into pulse-rules on stack create/update, so the rule engine can
+  # produce alerts immediately after deploy. Without this the table is empty and
+  # every stream evaluation creates zero alerts. Idempotent (skips a property
+  # whose rules already exist, preserving /rules API edits); Delete is a no-op.
+  # Bump RulesSeedTrigger to re-run.
+  # =================================================================
+
+  # Log group for the rules seed Lambda (explicit so retention is managed).
+  RulesSeedLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${StackPrefix}-rules-seed"
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: data
+
+  # IAM role for the rules seed Lambda (least privilege; region-suffixed name).
+  # Writes and probes ONLY the pulse-rules table, plus CloudWatch Logs.
+  RulesSeedLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-rules-seed-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: RulesSeedWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # PutItem/BatchWriteItem seed the rules; Query backs the
+              # per-property idempotency probe. Scoped to the pulse-rules ARN.
+              - Effect: Allow
+                Action:
+                  - "dynamodb:PutItem"
+                  - "dynamodb:BatchWriteItem"
+                  - "dynamodb:Query"
+                Resource: !GetAtt PulseRulesTable.Arn
+        - PolicyName: Observability
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackPrefix}-rules-seed:*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: data
+
+  # The rules seed Lambda (thin CFN custom-resource handler; shared package).
+  RulesSeedFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${StackPrefix}-rules-seed"
+      Description: PULSE default rules seed (CloudFormation custom resource)
+      Runtime: python3.12
+      Handler: pulse.seed.rules_seed.lambda_handler
+      MemorySize: 256
+      Timeout: 120
+      Role: !GetAtt RulesSeedLambdaRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref RulesSeedLogGroup
+        LogFormat: JSON
+      Code:
+        S3Bucket: !Ref DeployBucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          # Resource identifiers from the environment (PYQUALITY-06); never
+          # hardcoded. RULES_TABLE_NAME is the seed target; ESTATE_PROPERTY_IDS
+          # is the comma-separated property set (handler falls back to the five
+          # pilot demo properties when unset).
+          RULES_TABLE_NAME: !Ref PulseRulesTable
+          ESTATE_PROPERTY_IDS: "ALOHA-CHI-001,ALOHA-MIA-001,ALOHA-TYO-001,ALOHA-MAD-001,ALOHA-BOM-001"
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: data
+
+  # The custom resource. ServiceToken points at the rules seed Lambda; the
+  # Trigger property re-runs the seed when RulesSeedTrigger is bumped. DependsOn
+  # ensures the log group exists before the first invocation.
+  RulesSeedCustomResource:
+    Type: Custom::RulesSeed
+    DependsOn: RulesSeedLogGroup
+    Properties:
+      ServiceToken: !GetAtt RulesSeedFunction.Arn
+      Trigger: !Ref RulesSeedTrigger
+
+# -------------------------------------------------------------------
+# Outputs
+# Exported for the pipeline/api stacks: table names for Lambda env
+# vars, ARNs for IAM policies, and the pulse-alerts stream ARN for
+# the history/escalation event-source mappings.
+# -------------------------------------------------------------------
+Outputs:
+  AlertsTableName:
+    Description: DynamoDB table name for PULSE alerts
+    Value: !Ref PulseAlertsTable
+
+  AlertsTableArn:
+    Description: ARN of the pulse-alerts table (for IAM policies)
+    Value: !GetAtt PulseAlertsTable.Arn
+
+  AlertsStreamArn:
+    Description: DynamoDB Stream ARN for pulse-alerts (history + escalation fan-out)
+    Value: !GetAtt PulseAlertsTable.StreamArn
+
+  RulesTableName:
+    Description: DynamoDB table name for PULSE rule definitions
+    Value: !Ref PulseRulesTable
+
+  RulesTableArn:
+    Description: ARN of the pulse-rules table (for IAM policies)
+    Value: !GetAtt PulseRulesTable.Arn
+
+  AlertHistoryTableName:
+    Description: DynamoDB table name for PULSE alert history
+    Value: !Ref PulseAlertHistoryTable
+
+  AlertHistoryTableArn:
+    Description: ARN of the pulse-alert-history table (for IAM policies)
+    Value: !GetAtt PulseAlertHistoryTable.Arn
+
+  PushSubscriptionsTableName:
+    Description: DynamoDB table name for Web Push subscriptions
+    Value: !Ref PulsePushSubscriptionsTable
+
+  PushSubscriptionsTableArn:
+    Description: ARN of the pulse-push-subscriptions table (for IAM policies)
+    Value: !GetAtt PulsePushSubscriptionsTable.Arn
+
+  KitchenTableName:
+    Description: DynamoDB table name for the PULSE Kitchen/F&B snapshot
+    Value: !Ref PulseKitchenTable
+
+  KitchenTableArn:
+    Description: ARN of the pulse-kitchen table (for IAM policies)
+    Value: !GetAtt PulseKitchenTable.Arn

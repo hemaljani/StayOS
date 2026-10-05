@@ -1,0 +1,53 @@
+# Build artifacts
+build/
+frontend/out/
+frontend/.next/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+backend/layers/dependencies/python/
+
+# Node
+node_modules/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Project docs (not tracked)
+aiplc-docs/
+KIRO-HANDOVER.md
+
+# GIF source screenshots
+/gif/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment-specific config (contains API URLs, Cognito IDs)
+frontend/.env.production
+
+# AgentCore Runtime state (each developer has their own runtime)
+.voice-runtime-id
+
+# Architecture diagram generator script (locally modified, not for commit)
+docs/generate-architecture-diagram.py
+
+# Per-account deployment notes (account-specific, not shared templates)
+docs/deployments/

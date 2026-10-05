@@ -1,0 +1,788 @@
+openapi: "3.0.3"
+info:
+  title: LUMI API - Part of StayOS
+  version: "1.1.0"
+  description: |
+    LUMI GM Daily Intelligence Brief API - a feature of StayOS, the operating
+    system for hotel associates. Provides endpoints for retrieving pre-generated
+    daily briefs (KPIs, action items, VIP arrivals, audio summaries) and managing
+    GM settings/preferences. All endpoints require Cognito JWT Bearer authentication.
+    Protected by AWS WAF with US-only geographic restriction.
+
+servers:
+  - url: https://{api-id}.execute-api.us-east-1.amazonaws.com/v1
+    description: Production API (us-east-1, protected by WAF + Cognito JWT)
+    variables:
+      api-id:
+        default: "your-api-gateway-id"
+        description: API Gateway REST API ID (from CloudFormation output ApiGatewayUrl)
+
+security:
+  - CognitoAuth: []
+
+paths:
+  /briefs/{propertyId}:
+    get:
+      operationId: getBrief
+      summary: Get the latest daily brief for a property
+      description: |
+        Returns the most recent daily brief for the specified property,
+        including KPIs, action items, VIP arrivals, and audio brief metadata.
+        The requesting GM must own the property (validated via Cognito claims).
+      tags:
+        - Briefs
+      parameters:
+        - name: propertyId
+          in: path
+          required: true
+          description: Property identifier (e.g., ALOHA-CHI-001)
+          schema:
+            type: string
+            example: ALOHA-CHI-001
+      responses:
+        "200":
+          description: Daily brief retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DailyBriefResponse"
+        "401":
+          description: Unauthorized - invalid or expired token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: UNAUTHORIZED
+                  message: Invalid or expired token
+        "403":
+          description: Forbidden - user does not own this property
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: FORBIDDEN
+                  message: You do not have access to this property's brief
+        "404":
+          description: No brief found for property
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: PROPERTY_NOT_FOUND
+                  message: No brief found for property ALOHA-CHI-001
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: INTERNAL_ERROR
+                  message: An internal error occurred
+
+  /briefs/{propertyId}/{briefDate}:
+    get:
+      operationId: getBriefByDate
+      summary: Get a specific dated brief for a property
+      description: |
+        Returns the brief for a specific property and date. Used by the
+        frontend to display full past brief detail views from the history carousel.
+      tags:
+        - Briefs
+      parameters:
+        - name: propertyId
+          in: path
+          required: true
+          description: Property identifier
+          schema:
+            type: string
+            example: ALOHA-CHI-001
+        - name: briefDate
+          in: path
+          required: true
+          description: Brief date in YYYY-MM-DD format
+          schema:
+            type: string
+            format: date
+            example: "2026-08-06"
+      responses:
+        "200":
+          description: Dated brief retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DailyBriefResponse"
+        "400":
+          description: Invalid date format
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: No brief found for property/date
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /briefs/history:
+    get:
+      operationId: getBriefHistory
+      summary: Get brief history summaries for a property
+      description: |
+        Returns a list of past brief summaries (date, status, key KPIs,
+        narrative preview) for the past-briefs carousel on the main dashboard.
+        Property is determined from the Cognito JWT claims (custom:propertyId).
+      tags:
+        - Briefs
+      parameters:
+        - name: days
+          in: query
+          required: false
+          description: Number of days of history to return
+          schema:
+            type: integer
+            default: 7
+            maximum: 30
+      responses:
+        "200":
+          description: Brief history retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BriefHistorySummary"
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /settings/{gmAlias}:
+    get:
+      operationId: getSettings
+      summary: Get GM settings
+      description: |
+        Returns the current configuration for the specified GM.
+        The requesting user must own the settings (gmAlias must match claims).
+      tags:
+        - Settings
+      parameters:
+        - name: gmAlias
+          in: path
+          required: true
+          description: GM alias identifier (e.g., jsmith)
+          schema:
+            type: string
+            example: jsmith
+      responses:
+        "200":
+          description: GM settings retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GmSettings"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Forbidden - cannot access another GM's settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: GM settings not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: SETTINGS_NOT_FOUND
+                  message: No settings found for GM jsmith
+
+    put:
+      operationId: putSettings
+      summary: Update GM settings
+      description: |
+        Updates the GM's configuration. Partial updates are supported -
+        only provided fields are updated. All fields are validated before persist.
+      tags:
+        - Settings
+      parameters:
+        - name: gmAlias
+          in: path
+          required: true
+          description: GM alias identifier
+          schema:
+            type: string
+            example: jsmith
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GmSettingsUpdate"
+            example:
+              briefDeliveryTime: "06:30"
+              alertToggles:
+                overbookingRisk: true
+                roomsOutOfOrder: true
+                vipArrivalAlert: true
+                upsellOpportunity: true
+                staffingConfirmed: true
+              kpiThresholds:
+                occupancyAlertBelow: 70
+                adrAlertBelow: 200
+              audioPreferences:
+                language: en-US
+                briefLength: standard
+      responses:
+        "200":
+          description: Settings updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GmSettings"
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: VALIDATION_ERROR
+                  message: "briefDeliveryTime must be in HH:MM format (00:00-23:59)"
+                  field: briefDeliveryTime
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: GM settings not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  securitySchemes:
+    CognitoAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Amazon Cognito JWT (access token or ID token)
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code
+              example: VALIDATION_ERROR
+            message:
+              type: string
+              description: Human-readable error description
+              example: "briefDeliveryTime must be in HH:MM format"
+            field:
+              type: string
+              description: Field name for validation errors (optional)
+              example: briefDeliveryTime
+
+    DailyBriefResponse:
+      type: object
+      required:
+        - property
+        - dailyKPIs
+        - actionItems
+        - vipArrivals
+        - audioBrief
+      properties:
+        property:
+          $ref: "#/components/schemas/Property"
+        dailyKPIs:
+          $ref: "#/components/schemas/DailyKPIs"
+        actionItems:
+          type: array
+          items:
+            $ref: "#/components/schemas/ActionItem"
+        vipArrivals:
+          type: array
+          items:
+            $ref: "#/components/schemas/VipArrival"
+        audioBrief:
+          $ref: "#/components/schemas/AudioBrief"
+
+    Property:
+      type: object
+      properties:
+        propertyId:
+          type: string
+          example: ALOHA-CHI-001
+        propertyName:
+          type: string
+          example: Aloha Grand Chicago
+        brand:
+          type: string
+          example: "Aloha Hotels & Resorts"
+        timezone:
+          type: string
+          example: America/Chicago
+        totalRooms:
+          type: integer
+          example: 368
+
+    DailyKPIs:
+      type: object
+      required:
+        - date
+        - asOf
+        - occupancy
+        - adr
+        - revPAR
+        - arrivals
+        - departures
+      properties:
+        date:
+          type: string
+          format: date
+          example: "2026-08-03"
+        asOf:
+          type: string
+          format: date-time
+          example: "2026-08-03T09:07:00-05:00"
+        occupancy:
+          $ref: "#/components/schemas/Occupancy"
+        adr:
+          $ref: "#/components/schemas/Adr"
+        revPAR:
+          $ref: "#/components/schemas/RevPar"
+        arrivals:
+          $ref: "#/components/schemas/Arrivals"
+        departures:
+          $ref: "#/components/schemas/Departures"
+        confirmedReservations:
+          type: integer
+          example: 374
+        availableRooms:
+          type: integer
+          example: 368
+
+    Occupancy:
+      type: object
+      properties:
+        current:
+          type: integer
+          description: Current occupancy percentage
+          example: 87
+        unit:
+          type: string
+          enum: [percent]
+          example: percent
+        vsLastWeek:
+          type: number
+          format: float
+          description: Delta vs same day last week
+          example: 4.2
+        vsBudget:
+          type: number
+          format: float
+          description: Delta vs budget
+          example: 2.1
+        forecast3pm:
+          type: integer
+          description: Forecasted occupancy at 3 PM
+          example: 91
+
+    Adr:
+      type: object
+      properties:
+        current:
+          type: integer
+          description: Current ADR in currency units
+          example: 248
+        currency:
+          type: string
+          example: USD
+        vsLastWeek:
+          type: number
+          format: float
+          example: 12
+        vsBudget:
+          type: number
+          format: float
+          example: 8
+        pacePctOfBudget:
+          type: integer
+          description: Pace as percentage of budget
+          example: 103
+
+    RevPar:
+      type: object
+      properties:
+        current:
+          type: integer
+          description: Current RevPAR in currency units
+          example: 216
+        currency:
+          type: string
+          example: USD
+        vsYOY:
+          type: number
+          format: float
+          description: Year-over-year percentage change
+          example: 7.1
+        budget:
+          type: integer
+          description: Budget target
+          example: 202
+
+    Arrivals:
+      type: object
+      properties:
+        total:
+          type: integer
+          example: 142
+        vipCount:
+          type: integer
+          example: 7
+        ambassadorCount:
+          type: integer
+          example: 3
+        titaniumCount:
+          type: integer
+          example: 4
+        platinumCount:
+          type: integer
+          example: 0
+
+    Departures:
+      type: object
+      properties:
+        total:
+          type: integer
+          example: 118
+        groupCheckouts:
+          type: integer
+          example: 1
+        groupRooms:
+          type: integer
+          example: 82
+
+    ActionItem:
+      type: object
+      required:
+        - id
+        - type
+        - severity
+        - title
+        - detail
+      properties:
+        id:
+          type: string
+          example: action-001
+        type:
+          type: string
+          enum:
+            - OVERBOOKING_RISK
+            - ROOMS_OUT_OF_ORDER
+            - VIP_ARRIVAL_ALERT
+            - UPSELL_OPPORTUNITY
+            - STAFFING_CONFIRMED
+          example: OVERBOOKING_RISK
+        severity:
+          type: string
+          enum: [URGENT, HIGH, MEDIUM, LOW]
+          example: URGENT
+        title:
+          type: string
+          example: "Overbooking Risk - +6 Rooms"
+        detail:
+          type: string
+          example: "374 confirmed vs 368 available. Walk strategy required by 7 AM."
+        data:
+          type: object
+          description: Type-specific payload (varies by action type)
+          additionalProperties: true
+        source:
+          type: string
+          description: Data source that generated this action
+          example: SPOG_XPMS
+        generatedAt:
+          type: string
+          format: date-time
+          example: "2026-08-03T06:00:00-05:00"
+
+    VipArrival:
+      type: object
+      required:
+        - guestId
+        - guestName
+        - loyaltyTier
+        - roomNumber
+      properties:
+        guestId:
+          type: string
+          example: ALH-MBR-00238471
+        guestName:
+          type: string
+          example: David Chen
+        initials:
+          type: string
+          example: DC
+        loyaltyTier:
+          type: string
+          enum: [AMBASSADOR, TITANIUM, PLATINUM]
+          example: AMBASSADOR
+        totalStays:
+          type: integer
+          example: 47
+        roomNumber:
+          type: string
+          example: "2401"
+        roomType:
+          type: string
+          enum: [PENTHOUSE, SUITE, KING_DELUXE, QUEEN_DELUXE, KING_STANDARD]
+          example: SUITE
+        estimatedArrival:
+          type: string
+          format: date-time
+          example: "2026-08-03T14:00:00-05:00"
+        specialOccasion:
+          type: string
+          nullable: true
+          enum: [ANNIVERSARY, BIRTHDAY, null]
+          example: ANNIVERSARY
+        preferences:
+          type: array
+          items:
+            type: string
+          example: ["HIGH_FLOOR", "FEATHER_FREE_BEDDING", "CHAMPAGNE_ARRIVAL"]
+        accountType:
+          type: string
+          enum: [PERSONAL, CORPORATE]
+          example: PERSONAL
+
+    AudioBrief:
+      type: object
+      required:
+        - briefId
+        - status
+      properties:
+        briefId:
+          type: string
+          example: brief-2026-08-03-ALOHA-CHI-001
+        durationSeconds:
+          type: integer
+          description: Audio duration in seconds
+          example: 74
+        status:
+          type: string
+          enum: [READY, GENERATING, FAILED, TEXT_ONLY]
+          example: READY
+        audioUrl:
+          type: string
+          format: uri
+          description: CloudFront URL for streaming the audio brief
+          example: "https://audio.lumi.example.com/briefs/2026/08/03/ALOHA-CHI-001/morning-brief.mp3"
+        transcriptSnippet:
+          type: string
+          description: First few sentences of the AI-generated narrative
+          example: "Good morning, Jennifer..."
+
+    GmSettings:
+      type: object
+      required:
+        - gmAlias
+        - propertyId
+        - briefDeliveryTime
+        - alertToggles
+        - kpiThresholds
+        - audioPreferences
+      properties:
+        gmAlias:
+          type: string
+          example: jsmith
+        propertyId:
+          type: string
+          example: ALOHA-CHI-001
+        briefDeliveryTime:
+          type: string
+          pattern: "^([01]\\d|2[0-3]):[0-5]\\d$"
+          description: "Brief delivery time in HH:MM format (24-hour)"
+          example: "06:30"
+        alertToggles:
+          $ref: "#/components/schemas/AlertToggles"
+        kpiThresholds:
+          $ref: "#/components/schemas/KpiThresholds"
+        audioPreferences:
+          $ref: "#/components/schemas/AudioPreferences"
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    GmSettingsUpdate:
+      type: object
+      description: Partial update - only include fields to change
+      properties:
+        briefDeliveryTime:
+          type: string
+          pattern: "^([01]\\d|2[0-3]):[0-5]\\d$"
+          description: "Brief delivery time in HH:MM format (24-hour)"
+          example: "06:30"
+        alertToggles:
+          $ref: "#/components/schemas/AlertToggles"
+        kpiThresholds:
+          $ref: "#/components/schemas/KpiThresholds"
+        audioPreferences:
+          $ref: "#/components/schemas/AudioPreferences"
+
+    AlertToggles:
+      type: object
+      properties:
+        overbookingRisk:
+          type: boolean
+          example: true
+        roomsOutOfOrder:
+          type: boolean
+          example: true
+        vipArrivalAlert:
+          type: boolean
+          example: true
+        upsellOpportunity:
+          type: boolean
+          example: true
+        staffingConfirmed:
+          type: boolean
+          example: true
+
+    KpiThresholds:
+      type: object
+      properties:
+        occupancyAlertBelow:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Alert when occupancy drops below this percentage
+          example: 70
+        adrAlertBelow:
+          type: integer
+          minimum: 0
+          maximum: 1000
+          description: Alert when ADR drops below this value
+          example: 200
+
+    AudioPreferences:
+      type: object
+      properties:
+        language:
+          type: string
+          enum: [en-US, es-ES, ja-JP, zh-CN]
+          description: Audio brief language
+          example: en-US
+        briefLength:
+          type: string
+          enum: [brief, standard, detailed]
+          description: Preferred brief length
+          example: standard
+
+    BriefHistorySummary:
+      type: object
+      required:
+        - briefDate
+        - status
+        - dailyKPIs
+      properties:
+        briefDate:
+          type: string
+          format: date
+          example: "2026-08-06"
+        status:
+          type: string
+          enum: [DELIVERED, GENERATED, FAILED]
+          example: DELIVERED
+        dailyKPIs:
+          type: object
+          properties:
+            occupancy:
+              type: object
+              properties:
+                current:
+                  type: integer
+                  example: 85
+            adr:
+              type: object
+              properties:
+                current:
+                  type: integer
+                  example: 248
+            revPAR:
+              type: object
+              properties:
+                current:
+                  type: integer
+                  example: 211
+        narrativePreview:
+          type: string
+          description: First sentence of the AI-generated narrative
+          example: "Buenos dias, Jennifer. Hoy es viernes, 7..."
+
+    OooRoomDetail:
+      type: object
+      description: Out-of-order room detail within ROOMS_OUT_OF_ORDER action item data
+      properties:
+        roomNumber:
+          type: string
+          example: "2102"
+        issue:
+          type: string
+          description: Issue type from the linked work order
+          example: IT_NETWORK
+        isPremium:
+          type: boolean
+          example: true
+        view:
+          type: string
+          enum: [LAKE, PARK, CITY, OCEAN, NONE]
+          example: LAKE
+        workOrderId:
+          type: string
+          example: WO-CHI-0146
+        openHours:
+          type: integer
+          description: Hours since work order creation (or estimated resolution hours if timestamp is unavailable)
+          example: 14

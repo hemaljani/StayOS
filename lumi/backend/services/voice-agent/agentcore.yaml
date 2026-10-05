@@ -1,0 +1,188 @@
+# =============================================================================
+# AgentCore Runtime Configuration - LUMI Voice Agent
+# =============================================================================
+# This file documents the runtime configuration for deploying the LUMI voice
+# agent to Amazon Bedrock AgentCore Runtime.
+#
+# DEPLOYMENT METHOD: CodeBuild + AWS CLI (via Makefile)
+# ---------------------------------------------------
+# Deployment is fully automated through `make deploy` which orchestrates:
+#   1. CodeBuild builds an ARM64 container image and pushes to ECR
+#   2. AWS CLI (`aws bedrock-agentcore-control`) creates/updates the runtime
+#
+# This replaces the previous AgentCore CLI workflow (`agentcore deploy`).
+# The AgentCore CLI and its config directory (agentcore/) are no longer used.
+#
+# See: Makefile targets `voice-build` and `voice-deploy`
+# See: infrastructure/nested-stacks/voice.yaml (ECR + CodeBuild resources)
+# =============================================================================
+
+# -------------------------------------------------------------------
+# Agent Metadata
+# -------------------------------------------------------------------
+agent:
+  name: stayos-voice-agent
+  description: >
+    LUMI voice assistant for hotel General Managers. Bridges browser WebSocket
+    connections to Amazon Nova Sonic bidirectional streams with property-scoped
+    DynamoDB tool handlers for occupancy, revenue, VIP guests, room status,
+    and work orders.
+
+# -------------------------------------------------------------------
+# Runtime Configuration
+# -------------------------------------------------------------------
+runtime:
+  # Python 3.12 runtime environment (matches requirements.txt dependencies)
+  language: python3.12
+
+  # ARM64 architecture for cost efficiency on Graviton-based microVMs
+  architecture: arm64
+
+  # Application entry point - BedrockAgentCoreApp starts Uvicorn on port 8080
+  entrypoint: server.py
+
+  # AgentCore protocol contract requires port 8080
+  port: 8080
+
+  # Container-based deployment via CodeBuild + ECR
+  # CodeBuild builds the ARM64 image from the Containerfile in this directory
+  # and pushes to ECR. The Makefile then points AgentCore at the ECR image URI.
+  buildType: Container
+
+# -------------------------------------------------------------------
+# Environment Variables
+# -------------------------------------------------------------------
+# These environment variables are set on the deployed AgentCore container
+# via the create-agent-runtime / update-agent-runtime CLI call.
+# Values come from the CloudFormation stack outputs (stayos-* resource names).
+# -------------------------------------------------------------------
+environment:
+  # DynamoDB table names (from dataset stack)
+  RESERVATIONS_TABLE_NAME: stayos-reservations
+  ROOMS_TABLE_NAME: stayos-rooms
+  GUESTS_TABLE_NAME: stayos-guests
+  REVENUES_TABLE_NAME: stayos-revenues
+  WORK_ORDERS_TABLE_NAME: stayos-work-orders
+
+  # Settings table (from storage stack)
+  SETTINGS_TABLE_NAME: stayos-settings
+
+  # AWS region for boto3 client initialization
+  AWS_DEFAULT_REGION: us-east-1
+
+# -------------------------------------------------------------------
+# IAM Execution Role
+# -------------------------------------------------------------------
+# The AgentCore container assumes this role at runtime. It provides:
+# - bedrock:InvokeModel on Nova Sonic model (bidirectional streaming)
+# - dynamodb:GetItem and dynamodb:Query on dataset tables (read-only)
+# - dynamodb:GetItem on settings table (language preference)
+# - cognito-idp:GetUser on the User Pool (identity verification)
+#
+# Defined in: infrastructure/nested-stacks/voice.yaml (VoiceAgentCoreRole)
+# Naming pattern: ${StackPrefix}-voice-agentcore-role-${AWS::Region}
+# -------------------------------------------------------------------
+iam:
+  executionRoleArn: arn:aws:iam::<ACCOUNT_ID>:role/stayos-voice-agentcore-role-us-east-1
+
+# -------------------------------------------------------------------
+# Logging Configuration
+# -------------------------------------------------------------------
+# Container logs route to CloudWatch Logs via Powertools Logger (structured
+# JSON format). The log group is created by CloudFormation with 14-day
+# retention.
+#
+# Defined in: infrastructure/nested-stacks/voice.yaml (VoiceAgentCoreLogGroup)
+# -------------------------------------------------------------------
+logging:
+  logGroupName: /stayos/agentcore/voice-agent
+  retentionDays: 14
+
+# -------------------------------------------------------------------
+# Lifecycle Configuration
+# -------------------------------------------------------------------
+# AgentCore Runtime enforces two platform-level timeouts that interact
+# with the application's 60-second audio idle timeout:
+#
+# 1. Application idle timeout: 60 seconds no audio input (hardcoded in
+#    nova_sonic_session.py) - sends sessionEnded to the browser
+# 2. Platform idle timeout: Fires if no WebSocket messages for this duration.
+#    Set to 2 minutes (120s) for cost savings - the application's 60-second
+#    timeout fires first in normal operation, so this is a safety net.
+# 3. Platform max lifetime: Maximum session duration regardless of activity.
+#    8 hours is the default; no voice session should approach this limit.
+# -------------------------------------------------------------------
+lifecycle:
+  # Container idle timeout (seconds) - terminate if no activity
+  # Set lower than default (15 min) since app handles 60s audio idle timeout
+  idleRuntimeSessionTimeout: 120
+
+  # Maximum container lifetime (seconds) - 8 hours absolute cap
+  maxLifetime: 28800
+
+# -------------------------------------------------------------------
+# Health Check (AgentCore Protocol Contract)
+# -------------------------------------------------------------------
+# The container implements GET /ping returning:
+# - {"status": "Healthy"} when no active voice sessions
+# - {"status": "HealthyBusy"} when a voice session is in progress
+#
+# HealthyBusy prevents AgentCore from terminating the container while
+# a GM is mid-conversation.
+# -------------------------------------------------------------------
+healthCheck:
+  endpoint: /ping
+  healthyResponse: '{"status": "Healthy"}'
+  busyResponse: '{"status": "HealthyBusy"}'
+
+# =============================================================================
+# DEPLOYMENT WORKFLOW
+# =============================================================================
+#
+# Prerequisites:
+#   1. Deploy the CloudFormation stack first to create the IAM role, ECR
+#      repository, CodeBuild project, Identity Pool, and log group:
+#      $ make deploy-infra
+#
+#   2. AWS CLI >= 2.27 (required for `bedrock-agentcore-control` subcommand)
+#      $ aws --version
+#
+# Build (container image via CodeBuild):
+#   $ make voice-build
+#
+#   This target:
+#   - Zips the voice agent source (excluding tests, __pycache__, .pytest_cache)
+#   - Uploads the zip to s3://${DEPLOY_BUCKET}/voice-agent-source/
+#   - Triggers CodeBuild (ARM64 Graviton build)
+#   - Waits for build completion
+#   - Image is pushed to ECR: ${AccountId}.dkr.ecr.${Region}.amazonaws.com/stayos-voice-agent:latest
+#
+# Deploy (AgentCore Runtime via AWS CLI):
+#   $ make voice-deploy
+#
+#   This target:
+#   - First deploy: calls `aws bedrock-agentcore-control create-agent-runtime`
+#     with container config, role ARN, env vars, lifecycle, network mode PUBLIC
+#   - Saves runtime ID to `.voice-runtime-id` (gitignored)
+#   - Subsequent deploys: calls `aws bedrock-agentcore-control update-agent-runtime`
+#     with new container URI
+#   - Waits for runtime status to reach READY
+#
+# Full pipeline (recommended):
+#   $ make deploy
+#   # Runs: preflight → deploy-infra → voice-build → voice-deploy →
+#   #        write-frontend-env → build-frontend → deploy-frontend
+#
+# Cleanup:
+#   $ make voice-destroy
+#   # Deletes the AgentCore Runtime and removes .voice-runtime-id
+#   # Stack deletion (make destroy) handles ECR + CodeBuild removal
+#
+# Local Development:
+#   For local development, run the server directly:
+#   $ cd backend/services/voice-agent
+#   $ python server.py
+#   # Agent runs locally on http://localhost:8080
+#   # Set environment variables in your shell or .env file
+#
+# =============================================================================

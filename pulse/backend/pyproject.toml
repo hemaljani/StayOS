@@ -1,0 +1,111 @@
+# PULSE backend project metadata, dependencies, and tooling configuration.
+# PULSE is StayOS Feature #2: a serverless-first, Python 3.12 real-time alert
+# pipeline. This file is the single source of truth for runtime/dev
+# dependencies and for ruff, black, and pytest configuration.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pulse-backend"
+version = "0.1.0"
+description = "PULSE (StayOS Feature #2) backend: real-time AI-triaged alert pipeline on AWS."
+requires-python = ">=3.12"
+readme = "README.md"
+
+# Runtime dependencies bundled into the Lambda deployment packages. boto3 /
+# botocore are pinned into the package (rather than relying on the runtime's
+# bundled version) to avoid version drift (PYQUALITY-06).
+dependencies = [
+    "boto3>=1.35,<2.0",
+    "botocore>=1.35,<2.0",
+    # The [tracer] extra pulls in aws-xray-sdk, which the Powertools Tracer
+    # (pulse.common.tracing.get_tracer, used by every runtime handler via
+    # @tracer.capture_lambda_handler) imports at module load. Without it the
+    # handlers fail to import at cold start ("No module named 'aws_xray_sdk'").
+    "aws-lambda-powertools[tracer]>=2.40,<3.0",
+    "pywebpush>=2.0,<3.0",
+]
+
+[project.optional-dependencies]
+# Runtime deps for the pulse-ops-read (VIPs/Ops) facade Lambda ONLY. That
+# handler reaches the shared StayOS AgentCore Gateway over MCP (SigV4-signed
+# Streamable HTTP), so it needs the Strands MCPClient and the IAM MCP transport.
+# The pins mirror the working Triage Agent container
+# (services/triage-agent/requirements.txt) so both consumers of the shared
+# Gateway resolve the same MCP stack. Kept OUT of base `dependencies` so the
+# other PULSE Lambdas (rule-evaluator, escalation, delivery, action-executor)
+# are not bloated with the heavy Strands/MCP tree. `make package-backend`
+# installs this extra so the deployed facade can import mcp_proxy_for_aws /
+# strands at runtime (they are lazy-imported inside GatewayToolClient.connect).
+ops-read = [
+    "strands-agents>=1.0.0,<2.0.0",
+    "mcp-proxy-for-aws>=1.6.0,<2.0.0",
+]
+# Development and testing dependencies (not shipped in the Lambda package).
+dev = [
+    "pytest>=8.3,<9.0",
+    "hypothesis>=6.100,<7.0",
+    "moto[dynamodb,bedrock,sns,secretsmanager]>=5.0,<6.0",
+    # Triage Agent tests import services/triage-agent/server.py, which requires
+    # BedrockAgentCoreApp at module load.
+    "bedrock-agentcore>=1.18.0",
+    "ruff>=0.6,<1.0",
+    "black>=24.0,<25.0",
+    "boto3-stubs[dynamodb,bedrock-runtime,scheduler,sns,secretsmanager]>=1.35,<2.0",
+]
+
+[tool.setuptools.packages.find]
+# The importable package lives under src/ (src layout) so tests import the
+# installed package, not loose files.
+where = ["src"]
+
+# ---------------------------------------------------------------------------
+# Ruff - linting (and import sorting via the isort rules).
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# E/W: pycodestyle, F: pyflakes, I: isort, UP: pyupgrade, B: bugbear,
+# D: pydocstyle (Google convention). These enforce the PYQUALITY rules.
+select = ["E", "W", "F", "I", "UP", "B", "D"]
+# D203/D213 conflict with the Google convention (D211/D212); ignore them.
+# UP045/UP007 push `X | None` over typing.Optional/Union, but PYQUALITY-01
+# explicitly endorses the typing module forms (and LUMI's code uses them), so
+# we keep Optional/Union and silence those two pyupgrade rules.
+ignore = ["D203", "D213", "UP045", "UP007"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+# Group PULSE imports as first-party so import ordering is stable.
+known-first-party = ["pulse"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests do not require module/function docstrings.
+"tests/**" = ["D100", "D101", "D102", "D103", "D104"]
+
+# ---------------------------------------------------------------------------
+# Black - formatting.
+# ---------------------------------------------------------------------------
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+# ---------------------------------------------------------------------------
+# Pytest - test discovery and defaults.
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# Point the import machinery at the src layout so `import pulse` works when
+# running pytest from the backend/ directory without an editable install.
+pythonpath = ["src"]
+addopts = "-ra"

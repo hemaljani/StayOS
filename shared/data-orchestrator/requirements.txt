@@ -1,0 +1,11 @@
+# Runtime dependencies for the StayOS Unified Data Orchestrator step Lambdas.
+# Vendored into the single deployment zip by `make package` (pip install -t).
+#
+# aws-lambda-powertools supplies the structured Logger the handlers use
+# (PYQUALITY-03). It is NOT in the base Lambda python3.12 runtime, so it must be
+# bundled. Pinned to the same version LUMI's dependency layer uses
+# (lumi/backend/layers/dependencies/requirements.txt) to keep Powertools
+# behavior consistent across the platform.
+# boto3 / botocore are provided by the Lambda runtime and are intentionally not
+# pinned here.
+aws-lambda-powertools==2.40.0

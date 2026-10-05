@@ -1,0 +1,907 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  StayOS Data Stack - WAF WebACL, S3 buckets, CloudFront distributions, DynamoDB tables
+  (application and hotel operations dataset), and Secrets Manager secrets. Consolidates
+  storage, dataset, WAF, and AI infrastructure.
+
+# -------------------------------------------------------------------
+# Parameters
+# -------------------------------------------------------------------
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: lumi
+
+  AccountId:
+    Type: String
+
+# -------------------------------------------------------------------
+# Resources
+# -------------------------------------------------------------------
+Resources:
+
+  # =================================================================
+  # WAF
+  # =================================================================
+
+  # -----------------------------------------------------------------
+  # WAFv2 WebACL: Central access control list for CloudFront
+  # Scope CLOUDFRONT requires deployment in us-east-1.
+  # Default action is Allow - only requests matching explicit block
+  # rules are denied. Rules evaluated in ascending priority order.
+  # -----------------------------------------------------------------
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${StackPrefix}-web-acl"
+      Scope: CLOUDFRONT
+      Description: !Sub "${StackPrefix} WebACL - protects CloudFront distributions with managed rules and US-only geo-restriction"
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${StackPrefix}-web-acl"
+        SampledRequestsEnabled: true
+      Rules:
+        # Priority 1: OWASP Top 10 common attack patterns (XSS, SQLi, path traversal, etc.)
+        - Name: !Sub "${StackPrefix}-common-rules"
+          Priority: 1
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${StackPrefix}-common-rules"
+            SampledRequestsEnabled: true
+
+        # Priority 2: Known bad inputs (Log4j/Log4Shell, SSRF patterns, Java deserialization, etc.)
+        - Name: !Sub "${StackPrefix}-known-bad-inputs"
+          Priority: 2
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${StackPrefix}-known-bad-inputs"
+            SampledRequestsEnabled: true
+
+        # Priority 3: IP reputation list (known malicious IPs, botnets, compromised hosts)
+        - Name: !Sub "${StackPrefix}-ip-reputation"
+          Priority: 3
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${StackPrefix}-ip-reputation"
+            SampledRequestsEnabled: true
+
+        # Priority 4: Geographic restriction - block all non-US traffic
+        # Uses NotStatement to match requests NOT from US, then blocks them.
+        # This ensures only US-based users can access the application.
+        - Name: !Sub "${StackPrefix}-geo-us-only"
+          Priority: 4
+          Action:
+            Block: {}
+          Statement:
+            NotStatement:
+              Statement:
+                GeoMatchStatement:
+                  CountryCodes:
+                    - US
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${StackPrefix}-geo-us-only"
+            SampledRequestsEnabled: true
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+
+  # =================================================================
+  # S3 BUCKETS
+  # =================================================================
+
+  # -----------------------------------------------------------------
+  # S3 Bucket: Frontend (PWA static assets - Next.js static export)
+  # Block Public Access enforced; content served exclusively via CloudFront OAC.
+  # SSE-S3 encryption at rest. Versioning disabled (static assets are
+  # overwritten on each deployment and old versions are not needed).
+  # -----------------------------------------------------------------
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${StackPrefix}-frontend-${AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: storage
+
+  # -----------------------------------------------------------------
+  # S3 Bucket: Audio (MP3 brief files generated by Polly)
+  # Same security posture as frontend bucket. Lifecycle rule expires
+  # audio files under briefs/ prefix after 90 days - briefs are
+  # regenerated daily so historical audio beyond 90 days is not needed.
+  # -----------------------------------------------------------------
+  AudioBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${StackPrefix}-audio-${AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          # Expire audio brief files after 90 days to control storage costs.
+          # Audio is regenerated daily per property so older files are unnecessary.
+          - Id: ExpireAudioBriefsAfter90Days
+            Status: Enabled
+            Prefix: "briefs/"
+            ExpirationInDays: 90
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: storage
+
+  # -----------------------------------------------------------------
+  # S3 Bucket Policy: Frontend
+  # Grants read access exclusively to the CloudFront frontend distribution
+  # via the OAC. The condition restricts access to only this specific
+  # distribution ARN, preventing other distributions from accessing the bucket.
+  # -----------------------------------------------------------------
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOACRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                "AWS:SourceArn": !Sub "arn:aws:cloudfront::${AccountId}:distribution/${FrontendDistribution}"
+
+  # -----------------------------------------------------------------
+  # S3 Bucket Policy: Audio
+  # Same pattern as frontend - restricts S3 read access to only the
+  # audio CloudFront distribution. Audio files (guest briefs) contain
+  # sensitive operational data and must not be publicly accessible (REQ-25).
+  # -----------------------------------------------------------------
+  AudioBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AudioBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOACRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${AudioBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                "AWS:SourceArn": !Sub "arn:aws:cloudfront::${AccountId}:distribution/${AudioDistribution}"
+
+  # =================================================================
+  # CLOUDFRONT
+  # =================================================================
+
+  # -----------------------------------------------------------------
+  # CloudFront Origin Access Control: Frontend
+  # OAC replaces legacy Origin Access Identity (OAI). Uses SigV4 signing
+  # to authenticate CloudFront requests to S3 without making the bucket public.
+  # -----------------------------------------------------------------
+  FrontendOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${StackPrefix}-frontend-oac"
+        Description: !Sub "OAC for ${StackPrefix} frontend S3 bucket"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # -----------------------------------------------------------------
+  # CloudFront Origin Access Control: Audio
+  # Separate OAC for the audio bucket to maintain least-privilege
+  # isolation between the two distributions.
+  # -----------------------------------------------------------------
+  AudioOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${StackPrefix}-audio-oac"
+        Description: !Sub "OAC for ${StackPrefix} audio S3 bucket"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # -----------------------------------------------------------------
+  # CloudFront Function: URL Rewriter
+  # Appends index.html to requests ending with / (subdirectory requests).
+  # CloudFront DefaultRootObject only works for the root path (/),
+  # NOT for subdirectories like /login/ or /settings/. Without this
+  # function, S3 returns 403 for /login/ and the custom error response
+  # incorrectly serves the root index.html instead of /login/index.html.
+  # This is the standard pattern for Next.js static exports with trailingSlash.
+  # -----------------------------------------------------------------
+  FrontendUrlRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "${StackPrefix}-url-rewrite"
+      AutoPublish: true
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+          // If URI ends with / append index.html (subdirectory default document)
+          if (uri.endsWith('/')) {
+            request.uri += 'index.html';
+          }
+          // If URI has no file extension, append /index.html (trailing slash normalization)
+          else if (!uri.includes('.')) {
+            request.uri += '/index.html';
+          }
+          return request;
+        }
+      FunctionConfig:
+        Comment: !Sub "Rewrites subdirectory URIs to index.html for ${StackPrefix} frontend"
+        Runtime: cloudfront-js-2.0
+
+  # -----------------------------------------------------------------
+  # CloudFront Distribution: Frontend (shared StayOS distribution)
+  # Serves THREE static-export apps from one origin on the shared
+  # StayOS S3 bucket:
+  #   - "/"       -> the StayOS shell (login + feature launcher)
+  #   - "/lumi/*" -> LUMI (basePath /lumi)
+  #   - "/pulse/*"-> PULSE (basePath /pulse)
+  # Key configuration:
+  # - DefaultRootObject: index.html (the shell's entry point at the root)
+  # - URL rewrite function: appends index.html to subdirectory/extensionless
+  #   requests; path-agnostic, so it serves /lumi/ and /pulse/ pages too
+  # - Custom error responses: 403/404 fallback to the root /index.html (shell)
+  # - SecurityHeadersPolicy: adds CSP, X-Content-Type-Options, etc.
+  # - PriceClass_100: US/Europe edge locations (cost-effective for pilot)
+  # - HTTP/2 + HTTP/3 for optimal mobile performance
+  # -----------------------------------------------------------------
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${StackPrefix} frontend distribution"
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        WebACLId: !GetAtt WebAcl.Arn
+        Origins:
+          - Id: FrontendS3Origin
+            # RegionalDomainName avoids redirect issues that DomainName can cause
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref FrontendOriginAccessControl
+            S3OriginConfig:
+              # Empty string is required when using OAC (not OAI)
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: FrontendS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          # CachingOptimized managed policy - recommended for S3 static content
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          # AWS managed SecurityHeadersPolicy - adds security headers (CSP, HSTS, etc.)
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+          Compress: true
+          # CloudFront Function rewrites /login/ to /login/index.html before
+          # the request reaches S3, so each pre-rendered page is served correctly.
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt FrontendUrlRewriteFunction.FunctionARN
+        # SPA fallback: for truly unknown routes (no static export exists),
+        # serve the root index.html so the client-side router can show 404.
+        # With the URL rewrite function in place, known pages like /login/
+        # resolve directly to /login/index.html without hitting these error rules.
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: storage
+
+  # -----------------------------------------------------------------
+  # CloudFront Distribution: Audio
+  # Serves audio brief MP3 files for streaming playback in the PWA.
+  # No DefaultRootObject needed (files accessed by full key path).
+  # CachingOptimized policy provides 24-hour default TTL which is
+  # appropriate since audio briefs are generated once daily.
+  # -----------------------------------------------------------------
+  AudioDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${StackPrefix} audio distribution"
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        WebACLId: !GetAtt WebAcl.Arn
+        Origins:
+          - Id: AudioS3Origin
+            DomainName: !GetAtt AudioBucket.RegionalDomainName
+            OriginAccessControlId: !Ref AudioOriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: AudioS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          # CachingOptimized - 86400s (24h) default TTL, suitable for daily audio
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          Compress: true
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: storage
+
+  # =================================================================
+  # DYNAMODB TABLES (APPLICATION)
+  # =================================================================
+
+  # -----------------------------------------------------------------
+  # DynamoDB Table: Settings
+  # Stores per-GM configuration (delivery time, alert toggles, thresholds).
+  # Single-item access pattern via gmAlias primary key - no GSIs needed.
+  # PAY_PER_REQUEST chosen because pilot traffic is low and unpredictable;
+  # avoids paying for idle provisioned capacity during off-hours.
+  # PITR enabled for disaster recovery - allows restoring to any point
+  # within the last 35 days in case of accidental data corruption.
+  # -----------------------------------------------------------------
+  SettingsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      TableName: !Sub "${StackPrefix}-settings"
+      AttributeDefinitions:
+        - AttributeName: gmAlias
+          AttributeType: S
+      KeySchema:
+        - AttributeName: gmAlias
+          KeyType: HASH
+      # PAY_PER_REQUEST: scales to zero cost when idle, no capacity planning needed
+      BillingMode: PAY_PER_REQUEST
+      # PITR: continuous backups for 35 days - protects against accidental deletes
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: data
+
+  # -----------------------------------------------------------------
+  # DynamoDB Table: Briefs
+  # Stores generated brief metadata for fast API retrieval.
+  # Composite key (propertyId + briefDate) supports the primary access
+  # pattern: "get latest brief for a property" via Query with ScanIndexForward=false.
+  # TTL enabled to automatically expire briefs after 30 days - keeps
+  # table size bounded without manual cleanup or scheduled jobs.
+  # PAY_PER_REQUEST chosen for same reasons as settings table.
+  # PITR enabled as brief generation is expensive (Bedrock + Polly costs);
+  # recovering data is cheaper than regenerating lost briefs.
+  # -----------------------------------------------------------------
+  BriefsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      TableName: !Sub "${StackPrefix}-briefs"
+      AttributeDefinitions:
+        - AttributeName: propertyId
+          AttributeType: S
+        - AttributeName: briefDate
+          AttributeType: S
+      KeySchema:
+        - AttributeName: propertyId
+          KeyType: HASH
+        - AttributeName: briefDate
+          KeyType: RANGE
+      # PAY_PER_REQUEST: scales to zero cost when idle, no capacity planning needed
+      BillingMode: PAY_PER_REQUEST
+      # TTL: automatically deletes briefs older than 30 days (epoch stored in ttl attribute)
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      # PITR: continuous backups - brief regeneration is expensive so recovery is preferred
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: data
+
+  # =================================================================
+  # DYNAMODB TABLES (DATASET)
+  # =================================================================
+
+  # -----------------------------------------------------------------
+  # DynamoDB Table: Reservations
+  # Stores 30 days of reservation records per property. Composite key
+  # allows efficient queries for a single property's reservations by date.
+  # GSI on arrivalDate supports "arrivals today" queries for the orchestrator
+  # and AI agents. TTL expires records 60 days after creation to keep the
+  # table bounded without manual cleanup.
+  # PAY_PER_REQUEST: low and unpredictable read traffic outside brief generation.
+  # -----------------------------------------------------------------
+  ReservationsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      TableName: !Sub "${StackPrefix}-reservations"
+      BillingMode: PAY_PER_REQUEST
+      # Streams enabled for StayOS PULSE (Feature #2) change-data-capture.
+      # NEW_AND_OLD_IMAGES so PULSE rule evaluators can detect transitions
+      # (e.g. confirmed count crossing available). Additive and non-breaking:
+      # no key/attribute/GSI/read-path change - only turns on the stream.
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: propertyId
+          AttributeType: S
+        - AttributeName: dateReservationId
+          AttributeType: S
+        - AttributeName: arrivalDate
+          AttributeType: S
+      KeySchema:
+        - AttributeName: propertyId
+          KeyType: HASH
+        - AttributeName: dateReservationId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        # GSI: Query arrivals for a property on a specific date.
+        # Used by orchestrator to pull today's arrivals and by agents for date range queries.
+        - IndexName: propertyId-arrivalDate-index
+          KeySchema:
+            - AttributeName: propertyId
+              KeyType: HASH
+            - AttributeName: arrivalDate
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      # TTL: Automatically expire reservation records after 60 days
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      # PITR: Continuous backups for 35 days - protects against accidental deletes
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: data
+
+  # -----------------------------------------------------------------
+  # DynamoDB Table: Rooms
+  # Living inventory of all rooms across 5 properties (~2,000 items total).
+  # Each room has status, type, floor, view, and premium flag.
+  # GSI on statusRoomNumber supports "all OOO rooms for property X" queries
+  # via prefix filtering (e.g., status#roomNumber composite sort key).
+  # No TTL - room inventory is permanent reference data.
+  # PAY_PER_REQUEST: low read traffic with occasional batch updates during seeding.
+  # -----------------------------------------------------------------
+  RoomsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      TableName: !Sub "${StackPrefix}-rooms"
+      BillingMode: PAY_PER_REQUEST
+      # Streams enabled for StayOS PULSE (Feature #2) change-data-capture.
+      # NEW_AND_OLD_IMAGES so PULSE can detect room-status transitions
+      # (e.g. Ready -> Dirty). Additive and non-breaking - stream only.
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: propertyId
+          AttributeType: S
+        - AttributeName: roomNumber
+          AttributeType: S
+        - AttributeName: statusRoomNumber
+          AttributeType: S
+      KeySchema:
+        - AttributeName: propertyId
+          KeyType: HASH
+        - AttributeName: roomNumber
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        # GSI: Query rooms by status for a property (e.g., all OOO rooms).
+        # Composite sort key statusRoomNumber allows prefix queries on status.
+        - IndexName: propertyId-statusRoomNumber-index
+          KeySchema:
+            - AttributeName: propertyId
+              KeyType: HASH
+            - AttributeName: statusRoomNumber
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      # PITR: Continuous backups - room inventory is critical reference data
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: data
+
+  # -----------------------------------------------------------------
+  # DynamoDB Table: Guests
+  # Stores 50 VIP guest profiles per property (250 items total).
+  # Each guest has loyalty tier, preferences, corporate account, and
+  # special occasion flags. GSI on loyaltyTierGuestId supports
+  # "all Ambassador guests for property X" queries.
+  # No TTL - guest profiles are permanent reference data.
+  # PAY_PER_REQUEST: very low read traffic, queried only during brief generation.
+  # -----------------------------------------------------------------
+  GuestsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      TableName: !Sub "${StackPrefix}-guests"
+      BillingMode: PAY_PER_REQUEST
+      # Streams enabled for StayOS PULSE (Feature #2) change-data-capture.
+      # NEW_AND_OLD_IMAGES so PULSE can detect VIP check-in / profile
+      # changes. Additive and non-breaking - stream only.
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: propertyId
+          AttributeType: S
+        - AttributeName: guestId
+          AttributeType: S
+        - AttributeName: loyaltyTierGuestId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: propertyId
+          KeyType: HASH
+        - AttributeName: guestId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        # GSI: Query guests by loyalty tier for a property.
+        # Supports agent queries like "all Ambassador guests at property X".
+        - IndexName: propertyId-loyaltyTierGuestId-index
+          KeySchema:
+            - AttributeName: propertyId
+              KeyType: HASH
+            - AttributeName: loyaltyTierGuestId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      # PITR: Continuous backups - guest profiles are critical reference data
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: data
+
+  # -----------------------------------------------------------------
+  # DynamoDB Table: Revenues
+  # Daily revenue/KPI snapshots per property (150 items for 30 days x 5 properties).
+  # Simple date-range queries support "revenue trend over last 7/14/30 days".
+  # No GSI needed - all queries are single-partition with date sort key range.
+  # TTL expires records after 90 days to keep table bounded.
+  # PAY_PER_REQUEST: very low traffic, queried once per property per brief generation.
+  # -----------------------------------------------------------------
+  RevenuesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      TableName: !Sub "${StackPrefix}-revenues"
+      BillingMode: PAY_PER_REQUEST
+      # Streams enabled for StayOS PULSE (Feature #2) change-data-capture.
+      # NEW_AND_OLD_IMAGES for revenue-driven rule evaluation. Additive
+      # and non-breaking - stream only.
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: propertyId
+          AttributeType: S
+        - AttributeName: date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: propertyId
+          KeyType: HASH
+        - AttributeName: date
+          KeyType: RANGE
+      # TTL: Automatically expire revenue records after 90 days
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      # PITR: Continuous backups - revenue data supports business decisions
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: data
+
+  # -----------------------------------------------------------------
+  # DynamoDB Table: Work Orders
+  # Tracks maintenance work order lifecycles (OPEN -> IN_PROGRESS -> RESOLVED).
+  # 3-8 new work orders per property per week over the 30-day window.
+  # GSI on statusCreatedAt supports "all open work orders older than 24 hours"
+  # queries for the orchestrator and AI agents.
+  # TTL expires resolved work orders after 60 days.
+  # PAY_PER_REQUEST: low traffic with occasional status updates.
+  # -----------------------------------------------------------------
+  WorkOrdersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      TableName: !Sub "${StackPrefix}-work-orders"
+      BillingMode: PAY_PER_REQUEST
+      # Streams enabled for StayOS PULSE (Feature #2) change-data-capture.
+      # NEW_AND_OLD_IMAGES so PULSE can detect work-order status
+      # transitions. Additive and non-breaking - stream only.
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: propertyId
+          AttributeType: S
+        - AttributeName: workOrderId
+          AttributeType: S
+        - AttributeName: statusCreatedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: propertyId
+          KeyType: HASH
+        - AttributeName: workOrderId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        # GSI: Query work orders by status and creation time.
+        # Supports "open work orders older than 24h" via prefix + range on statusCreatedAt.
+        - IndexName: propertyId-statusCreatedAt-index
+          KeySchema:
+            - AttributeName: propertyId
+              KeyType: HASH
+            - AttributeName: statusCreatedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      # TTL: Automatically expire resolved work orders after 60 days
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      # PITR: Continuous backups - work order history supports operational analysis
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: data
+
+  # =================================================================
+  # SECRETS MANAGER
+  # =================================================================
+
+  # Secrets Manager secret for SPOG API authentication.
+  # Placeholder value - replace with actual API key before production use.
+  SpogApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      Name: !Sub "${StackPrefix}/spog/api-key"
+      Description: API key for SPOG (Single Pane of Glass) platform access
+      SecretString: '{"apiKey": "placeholder-replace-before-production"}'
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: ai
+
+  # Secrets Manager secret for MDP API authentication.
+  # Placeholder value - replace with actual API key before production use.
+  MdpApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: RetainExceptOnCreate
+    Properties:
+      Name: !Sub "${StackPrefix}/mdp/api-key"
+      Description: API key for Master Data Platform (MDP) access
+      SecretString: '{"apiKey": "placeholder-replace-before-production"}'
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: ai
+
+# -------------------------------------------------------------------
+# Outputs
+# Exported for use by other nested stacks (compute stack needs bucket
+# names and table names for Lambda env vars, ARNs for IAM policies;
+# root stack needs distribution domains).
+# -------------------------------------------------------------------
+Outputs:
+  WebAclArn:
+    Description: ARN of the WAF WebACL for CloudFront distribution association
+    Value: !GetAtt WebAcl.Arn
+
+  FrontendBucketName:
+    Description: Name of the S3 bucket hosting PWA static assets
+    Value: !Ref FrontendBucket
+
+  AudioBucketName:
+    Description: Name of the S3 bucket storing audio brief MP3 files
+    Value: !Ref AudioBucket
+
+  FrontendDistributionId:
+    Description: CloudFront distribution ID for frontend (used for cache invalidation)
+    Value: !Ref FrontendDistribution
+
+  FrontendDistributionDomain:
+    Description: CloudFront domain name for the frontend distribution
+    Value: !GetAtt FrontendDistribution.DomainName
+
+  AudioDistributionDomain:
+    Description: CloudFront domain name for the audio distribution
+    Value: !GetAtt AudioDistribution.DomainName
+
+  SettingsTableName:
+    Description: DynamoDB table name for GM settings
+    Value: !Ref SettingsTable
+
+  SettingsTableArn:
+    Description: ARN of the settings table (for IAM policies)
+    Value: !GetAtt SettingsTable.Arn
+
+  BriefsTableName:
+    Description: DynamoDB table name for generated briefs
+    Value: !Ref BriefsTable
+
+  BriefsTableArn:
+    Description: ARN of the briefs table (for IAM policies)
+    Value: !GetAtt BriefsTable.Arn
+
+  ReservationsTableName:
+    Description: DynamoDB table name for hotel reservations
+    Value: !Ref ReservationsTable
+
+  ReservationsTableArn:
+    Description: ARN of the reservations table (for IAM policies)
+    Value: !GetAtt ReservationsTable.Arn
+
+  RoomsTableName:
+    Description: DynamoDB table name for room inventory
+    Value: !Ref RoomsTable
+
+  RoomsTableArn:
+    Description: ARN of the rooms table (for IAM policies)
+    Value: !GetAtt RoomsTable.Arn
+
+  GuestsTableName:
+    Description: DynamoDB table name for VIP guest profiles
+    Value: !Ref GuestsTable
+
+  GuestsTableArn:
+    Description: ARN of the guests table (for IAM policies)
+    Value: !GetAtt GuestsTable.Arn
+
+  RevenuesTableName:
+    Description: DynamoDB table name for daily revenue/KPI data
+    Value: !Ref RevenuesTable
+
+  RevenuesTableArn:
+    Description: ARN of the revenues table (for IAM policies)
+    Value: !GetAtt RevenuesTable.Arn
+
+  WorkOrdersTableName:
+    Description: DynamoDB table name for maintenance work orders
+    Value: !Ref WorkOrdersTable
+
+  WorkOrdersTableArn:
+    Description: ARN of the work orders table (for IAM policies)
+    Value: !GetAtt WorkOrdersTable.Arn
+
+  SpogSecretArn:
+    Description: ARN of the SPOG API key secret
+    Value: !Ref SpogApiKeySecret
+
+  MdpSecretArn:
+    Description: ARN of the MDP API key secret
+    Value: !Ref MdpApiKeySecret
+
+  # -----------------------------------------------------------------
+  # DynamoDB Stream ARNs (added for StayOS PULSE, Feature #2)
+  # Exported so the PULSE pipeline stack can attach stream event-source
+  # mappings on its rule-evaluator Lambda. Consumed by PULSE only; LUMI
+  # itself does not read these streams.
+  # -----------------------------------------------------------------
+  ReservationsStreamArn:
+    Description: DynamoDB Stream ARN for the reservations table (PULSE consumer)
+    Value: !GetAtt ReservationsTable.StreamArn
+
+  RoomsStreamArn:
+    Description: DynamoDB Stream ARN for the rooms table (PULSE consumer)
+    Value: !GetAtt RoomsTable.StreamArn
+
+  GuestsStreamArn:
+    Description: DynamoDB Stream ARN for the guests table (PULSE consumer)
+    Value: !GetAtt GuestsTable.StreamArn
+
+  RevenuesStreamArn:
+    Description: DynamoDB Stream ARN for the revenues table (PULSE consumer)
+    Value: !GetAtt RevenuesTable.StreamArn
+
+  WorkOrdersStreamArn:
+    Description: DynamoDB Stream ARN for the work-orders table (PULSE consumer)
+    Value: !GetAtt WorkOrdersTable.StreamArn

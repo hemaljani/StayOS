@@ -1,0 +1,8 @@
+# StayOS shell build artifacts, dependencies, and local env.
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+coverage/
+.env.production
+.env.local

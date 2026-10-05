@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+tsconfig.tsbuildinfo
+
+# Build artifacts
+build/
+
+# Environment (contains API URLs, Cognito IDs, VAPID keys)
+.env
+.env.local
+.env.*.local
+frontend/.env.production
+
+# AgentCore runtime state (each developer has their own runtime)
+.triage-runtime-id
+
+# Project docs (not tracked) — matches the same convention in lumi/.gitignore
+aiplc-docs/
+KIRO-HANDOVER.md
+
+# OS
+.DS_Store
+Thumbs.db

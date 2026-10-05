@@ -1,0 +1,51 @@
+# PULSE Forecasting Agent service - Python dependencies
+# Predictive AgentCore Runtime container: a Strands agent that runs AHEAD of the
+# reactive Rule Engine. On a per-property daily schedule it reads forward-looking
+# operational signals via the shared StayOS AgentCore Gateway (MCP over SigV4),
+# runs a pure deterministic Forecast Engine to predict an oversell / walk risk,
+# has Claude Sonnet AUTHOR (never recompute) a Remediation_Plan around the fixed
+# numbers, then emits an advisory FORECAST_OVERSELL alert into pulse-alerts and
+# publishes ALERT_UPDATED / ALERT_RESOLVED via the shared realtime helper.
+#
+# This dependency set mirrors the PULSE Triage Agent one-for-one
+# (services/triage-agent/requirements.txt) so both PULSE agents resolve the same
+# Strands + MCP + AWS SDK stack on AgentCore Runtime.
+
+# AgentCore SDK (includes Starlette, Uvicorn). Provides BedrockAgentCoreApp,
+# the /ping health check, and the /invocations request-response entrypoint.
+bedrock-agentcore>=1.18.0
+
+# Strands Agents SDK - the Agent class, BedrockModel (Claude Sonnet via the
+# Converse API), and MCPClient (strands.tools.mcp.mcp_client) used to discover
+# and invoke the shared Gateway's read-only tools. MCP client support ships
+# inside the core strands-agents package (no separate MCP package needed).
+strands-agents>=1.0.0,<2.0.0
+
+# SigV4-signed MCP client transport for connecting to the AgentCore Gateway over
+# Streamable HTTP with IAM auth (aws_iam_streamablehttp_client) - the same
+# transport the Triage Agent and LUMI chat agent use.
+mcp-proxy-for-aws>=1.6.0,<2.0.0
+
+# AWS SDK - bundled into the image (not relying on the runtime's version) for
+# the Bedrock Converse plan authoring, the conditional pulse-alerts write
+# (DynamoDB), and the SigV4-signed AppSync Events publish (PYQUALITY-06).
+boto3>=1.35.0,<2.0.0
+botocore>=1.35.0,<2.0.0
+
+# Structured JSON logging and best-effort EMF metrics (Powertools works outside
+# Lambda). Used by the service and by the reused pulse.common/pulse.delivery code.
+aws-lambda-powertools>=2.40.0,<3.0.0
+
+# End-to-end X-Ray tracing for the agent container (subsegments for the
+# pulse-alerts writes and the Bedrock Converse call; trace-header propagation
+# into Gateway MCP calls). See the Observability section of the design.
+aws-xray-sdk>=2.14.0
+
+# HTTP client for IMDS credential fetching on AgentCore Runtime (matches the
+# Triage Agent / LUMI chat agent).
+requests>=2.31.0
+
+# NOTE: the `pulse` package (pulse.common.*, pulse.delivery.*, pulse.action_executor.*)
+# is NOT a PyPI dependency - it is copied into the image from the backend src/
+# layout by the container build (see Containerfile). It is bundled, not
+# pip-installed from an index.

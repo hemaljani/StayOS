@@ -1,0 +1,717 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  StayOS Chat Stack - Tool Lambda, chat agent ECR/CodeBuild, AgentCore
+  execution role, and regional WAFv2 WebACL for Gateway protection.
+
+# -------------------------------------------------------------------
+# Parameters
+# -------------------------------------------------------------------
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: lumi
+    Description: Prefix for all resource names (propagated from root stack)
+
+  AccountId:
+    Type: String
+    Description: AWS account ID for ARN construction
+
+  DependenciesLayerArn:
+    Type: String
+    Description: ARN of the shared Lambda dependencies layer (boto3, Powertools) from the compute stack
+
+  ReservationsTableName:
+    Type: String
+    Description: DynamoDB reservations table name (from dataset stack)
+
+  ReservationsTableArn:
+    Type: String
+    Description: DynamoDB reservations table ARN (for IAM policies)
+
+  RoomsTableName:
+    Type: String
+    Description: DynamoDB rooms table name (from dataset stack)
+
+  RoomsTableArn:
+    Type: String
+    Description: DynamoDB rooms table ARN (for IAM policies)
+
+  GuestsTableName:
+    Type: String
+    Description: DynamoDB guests table name (from dataset stack)
+
+  GuestsTableArn:
+    Type: String
+    Description: DynamoDB guests table ARN (for IAM policies)
+
+  RevenuesTableName:
+    Type: String
+    Description: DynamoDB revenues table name (from dataset stack)
+
+  RevenuesTableArn:
+    Type: String
+    Description: DynamoDB revenues table ARN (for IAM policies)
+
+  WorkOrdersTableName:
+    Type: String
+    Description: DynamoDB work orders table name (from dataset stack)
+
+  WorkOrdersTableArn:
+    Type: String
+    Description: DynamoDB work orders table ARN (for IAM policies)
+
+  BriefsTableName:
+    Type: String
+    Description: DynamoDB briefs table name (for VIP guest lookup from pre-generated briefs)
+
+  BriefsTableArn:
+    Type: String
+    Description: DynamoDB briefs table ARN (for IAM policies)
+
+  UserPoolId:
+    Type: String
+    Description: Cognito User Pool ID (for identity verification in the chat agent container)
+
+  CognitoClientId:
+    Type: String
+    Description: Cognito App Client ID (passed for reference but not directly used in this stack)
+
+  DeployBucket:
+    Type: String
+    Description: S3 bucket name where source zips are uploaded for CodeBuild and Lambda deployment
+
+# -------------------------------------------------------------------
+# Resources
+# -------------------------------------------------------------------
+Resources:
+
+  # =================================================================
+  # TOOL LAMBDA - Implements the 5 read-only hotel operations tools
+  # invoked by AgentCore Gateway. Reuses the same DynamoDB query
+  # patterns as the voice agent tool_handlers.py.
+  # =================================================================
+
+  # -----------------------------------------------------------------
+  # Tool Lambda IAM Role - least-privilege for querying dataset tables.
+  # Read-only DynamoDB access scoped to the 6 tables + their GSIs,
+  # CloudWatch Logs write for the unified log group, and X-Ray trace
+  # submission for distributed tracing.
+  # -----------------------------------------------------------------
+  ToolLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-tools-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        # Read-only access to the 6 dataset tables and their GSIs
+        - PolicyName: DynamoDBDatasetRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !Ref ReservationsTableArn
+                  - !Sub "${ReservationsTableArn}/index/*"
+                  - !Ref RoomsTableArn
+                  - !Sub "${RoomsTableArn}/index/*"
+                  - !Ref GuestsTableArn
+                  - !Sub "${GuestsTableArn}/index/*"
+                  - !Ref RevenuesTableArn
+                  - !Ref WorkOrdersTableArn
+                  - !Sub "${WorkOrdersTableArn}/index/*"
+                  - !Ref BriefsTableArn
+              # Scan restricted to the rooms base table only. The PULSE
+              # get_sister_property_availability tool enumerates the estate's
+              # distinct propertyIds via a projected (propertyId-only) scan when
+              # the ESTATE_PROPERTY_IDS env var is not set. Read-only and scoped
+              # to a single small table (~2,000 items).
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                Resource:
+                  - !Ref RoomsTableArn
+        # CloudWatch Logs write for the unified /stayos/application log group
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AccountId}:log-group:/stayos/application:*"
+        # X-Ray trace submission for distributed tracing via Powertools Tracer
+        - PolicyName: XRayTracing
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+
+  # -----------------------------------------------------------------
+  # Tool Lambda Function - implements the LUMI read-only tools
+  # (get_occupancy, get_revenue, get_vip_guests, get_room_status,
+  # get_work_orders) plus the additive PULSE read-only tools
+  # (get_sister_property_availability, get_walkable_guests,
+  # get_room_move_candidates) on the shared Gateway target (Decision 7).
+  # Invoked by the AgentCore Gateway when agents call tools via MCP.
+  # Uses Powertools Logger and Tracer for structured observability.
+  # -----------------------------------------------------------------
+  ToolLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${StackPrefix}-tools"
+      Description: Read-only hotel operations tools for AgentCore Gateway (MCP Lambda target)
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Architectures:
+        - x86_64
+      MemorySize: 256
+      Timeout: 30
+      Role: !GetAtt ToolLambdaRole.Arn
+      Layers:
+        - !Ref DependenciesLayerArn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        # Points to the unified log group defined in compute.yaml
+        LogGroup: /stayos/application
+        LogFormat: JSON
+      Code:
+        # Placeholder - real code deployed via `make update-lambda-code`
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {"status": "unavailable", "message": "Code not yet deployed"}
+      Environment:
+        Variables:
+          RESERVATIONS_TABLE_NAME: !Ref ReservationsTableName
+          ROOMS_TABLE_NAME: !Ref RoomsTableName
+          GUESTS_TABLE_NAME: !Ref GuestsTableName
+          REVENUES_TABLE_NAME: !Ref RevenuesTableName
+          WORK_ORDERS_TABLE_NAME: !Ref WorkOrdersTableName
+          BRIEFS_TABLE_NAME: !Ref BriefsTableName
+          LOG_LEVEL: INFO
+          POWERTOOLS_SERVICE_NAME: stayos-tools
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+
+  # -----------------------------------------------------------------
+  # Tool Lambda Resource-Based Policy - allows AgentCore Gateway
+  # (bedrock-agentcore.amazonaws.com) to invoke this function when
+  # routing MCP tool calls from connected agents.
+  # -----------------------------------------------------------------
+  ToolLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ToolLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: bedrock-agentcore.amazonaws.com
+      SourceAccount: !Ref AccountId
+
+  # -----------------------------------------------------------------
+  # Tool Lambda Log Group - NOT created here. The Lambda uses the
+  # unified /stayos/application log group defined in compute.yaml via
+  # LoggingConfig above. This avoids duplicate log group creation.
+  # -----------------------------------------------------------------
+  # (Intentionally omitted - log group exists in compute stack)
+
+  # =================================================================
+  # CHAT AGENT - ECR, CodeBuild, IAM Role, and Log Group
+  # =================================================================
+
+  # -----------------------------------------------------------------
+  # ECR Repository for chat agent container images. CodeBuild pushes
+  # ARM64 images here; AgentCore Runtime pulls from here at deploy.
+  # Lifecycle policy retains only the last 5 images for cost control.
+  # -----------------------------------------------------------------
+  ChatAgentEcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${StackPrefix}-chat-agent"
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the last 5 images for cost control",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+
+  # -----------------------------------------------------------------
+  # CodeBuild IAM Role - least-privilege permissions for building and
+  # pushing chat agent container images. Grants ECR push (for image
+  # upload), S3 read (for source zip download), and CloudWatch Logs
+  # write (for build log streaming).
+  # -----------------------------------------------------------------
+  ChatAgentBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-chat-build-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        # ECR permissions for authenticating, pushing layers, and completing image uploads
+        - PolicyName: EcrPush
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: !GetAtt ChatAgentEcrRepository.Arn
+        # S3 read for downloading the chat agent source zip
+        - PolicyName: S3SourceRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub "arn:aws:s3:::${DeployBucket}/chat-agent-source/*"
+              - Effect: Allow
+                Action: s3:GetBucketLocation
+                Resource: !Sub "arn:aws:s3:::${DeployBucket}"
+        # CloudWatch Logs for build log streaming
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AccountId}:log-group:/aws/codebuild/${StackPrefix}-chat-agent-build:*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+
+  # -----------------------------------------------------------------
+  # CodeBuild Project - builds the chat agent ARM64 container image
+  # from source uploaded to S3. Uses Graviton builders for native ARM64
+  # builds (cheaper and faster than emulated x86 builds). PrivilegedMode
+  # is required for running docker-in-docker during the build phase.
+  # Inline buildspec: ECR login, docker build with Containerfile, push
+  # with both :latest and a timestamped tag for rollback capability.
+  # -----------------------------------------------------------------
+  ChatAgentBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${StackPrefix}-chat-agent-build"
+      Description: Builds ARM64 container image for LUMI chat agent (AgentCore Runtime)
+      ServiceRole: !GetAtt ChatAgentBuildRole.Arn
+      TimeoutInMinutes: 10
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_REPO_URI
+            Value: !Sub "${AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${StackPrefix}-chat-agent"
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AccountId
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref "AWS::Region"
+      Source:
+        Type: S3
+        Location: !Sub "${DeployBucket}/chat-agent-source/chat-agent-source.zip"
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo "Logging in to Amazon ECR..."
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+                - IMAGE_TAG=$(date +%Y%m%d%H%M%S)
+            build:
+              commands:
+                - echo "Building ARM64 container image..."
+                - docker build --platform linux/arm64 -t $ECR_REPO_URI:latest -f Containerfile .
+                - docker tag $ECR_REPO_URI:latest $ECR_REPO_URI:$IMAGE_TAG
+            post_build:
+              commands:
+                - echo "Pushing image to ECR..."
+                - docker push $ECR_REPO_URI:latest
+                - docker push $ECR_REPO_URI:$IMAGE_TAG
+                - echo "Image pushed successfully - $ECR_REPO_URI:latest and $ECR_REPO_URI:$IMAGE_TAG"
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+
+  # -----------------------------------------------------------------
+  # Chat AgentCore Execution Role - assumed by the AgentCore runtime
+  # to run the chat agent container. Grants least-privilege access to:
+  # - Bedrock Anthropic models (Claude Sonnet for reasoning)
+  # - AgentCore Gateway (MCP tool invocation)
+  # - Cognito GetUser (identity verification via Access Token)
+  # - ECR image pull (container image at runtime)
+  # - CloudWatch Logs (structured logging from the container)
+  # -----------------------------------------------------------------
+  ChatAgentCoreRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackPrefix}-chat-agentcore-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        # Bedrock model invocation for Claude Sonnet via Converse API
+        # Bedrock model invocation for Claude Sonnet via Converse API.
+        # us.anthropic.claude-sonnet-4-6 is a cross-region inference profile
+        # (not a direct foundation-model ARN), so it needs its own resource
+        # entry - the inference profile ARN routes to models in multiple US
+        # regions, hence the foundation-model wildcard covers all partitions.
+        - PolicyName: BedrockConverse
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - "arn:aws:bedrock:*::foundation-model/anthropic.*"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AccountId}:inference-profile/*"
+        # AgentCore Gateway invocation for MCP tool calls
+        - PolicyName: AgentCoreGateway
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeGateway
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AccountId}:gateway/*"
+        # Cognito GetUser to validate Access Tokens and extract user claims
+        - PolicyName: CognitoGetUser
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: cognito-idp:GetUser
+                Resource: !Sub "arn:aws:cognito-idp:${AWS::Region}:${AccountId}:userpool/${UserPoolId}"
+        # ECR image pull - AgentCore needs this to pull the container image at runtime
+        - PolicyName: EcrImagePull
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AccountId}:repository/${StackPrefix}-chat-agent"
+        # CloudWatch Logs - container stdout/stderr and structured logging
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:PutResourcePolicy
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AccountId}:log-group:/${StackPrefix}/agentcore/*"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+
+  # -----------------------------------------------------------------
+  # CloudWatch Log Group for chat agent container logs. Uses structured
+  # logging via Powertools Logger. 14-day retention is sufficient for
+  # demo/pilot operational visibility.
+  # -----------------------------------------------------------------
+  ChatAgentCoreLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${StackPrefix}/agentcore/chat-agent"
+      RetentionInDays: 14
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+
+  # =================================================================
+  # WAFv2 WEBACL - Regional WebACL for AgentCore Gateway protection.
+  # Associated with the Gateway post-creation via CLI. Provides defense
+  # against common web exploits, known bad inputs, IP reputation threats,
+  # and volumetric attacks (rate limiting).
+  # =================================================================
+
+  # -----------------------------------------------------------------
+  # Regional WAFv2 WebACL with 3 AWS managed rule groups and a custom
+  # rate-based rule. Default action is Allow - only matched threats
+  # are blocked. FAIL_CLOSE mode (default) ensures requests are
+  # rejected when WAF evaluation is unavailable.
+  # -----------------------------------------------------------------
+  GatewayWafWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${StackPrefix}-gateway-waf"
+      Scope: REGIONAL
+      Description: WAF protection for AgentCore Gateway - blocks common exploits, bad inputs, and volumetric attacks
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${StackPrefix}-gateway-waf"
+      Rules:
+        # Rule 1: Core rule set - protection against common web exploits (XSS, SQLi, etc.)
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${StackPrefix}-common-rules"
+        # Rule 2: Known bad inputs - blocks requests with known malicious patterns
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${StackPrefix}-bad-inputs"
+        # Rule 3: IP reputation - blocks requests from known malicious IPs
+        - Name: AWSManagedRulesAmazonIpReputationList
+          Priority: 3
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${StackPrefix}-ip-reputation"
+        # Rule 4: Rate limiting - 2000 requests per 5 minutes per source IP
+        - Name: RateLimitPerIP
+          Priority: 4
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 2000
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${StackPrefix}-rate-limit"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+
+  # =================================================================
+  # OBSERVABILITY - CloudWatch Alarms and Log Insights Queries for
+  # the Tool Lambda and Gateway. Complements the ObservabilityStack's
+  # alarms/queries for the API and orchestrator (compute.yaml).
+  # =================================================================
+
+  # -----------------------------------------------------------------
+  # Fires when Tool Lambda errors exceed 3 in 15 minutes. Indicates
+  # the chat agent's tool calls (via Gateway) may be failing, which
+  # degrades chat responses without necessarily affecting the voice
+  # agent (which calls tool_handlers.py in-process, not this Lambda).
+  # -----------------------------------------------------------------
+  ToolsErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${StackPrefix}-tools-errors-high"
+      AlarmDescription: Tool Lambda errors exceeding threshold - chat agent tool calls via Gateway may be failing
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub "${StackPrefix}-tools"
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # -----------------------------------------------------------------
+  # Fires when the Gateway rejects requests because AWS WAF was
+  # unreachable and the configured failure mode is FAIL_CLOSE (the
+  # default). Sustained non-zero values mean legitimate chat traffic
+  # is being dropped due to a WAF availability issue, not a real
+  # security block (that shows up as WafBlocks instead).
+  # -----------------------------------------------------------------
+  GatewayWafFailCloseAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${StackPrefix}-gateway-waf-failclose"
+      AlarmDescription: Gateway requests rejected because AWS WAF was unreachable (FAIL_CLOSE) - WAF availability issue
+      Namespace: AWS/Bedrock-AgentCore
+      MetricName: WafFailCloses
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # -----------------------------------------------------------------
+  # Log Insights Query: Recent chat agent errors. Scoped to the chat
+  # agent's dedicated log group (not the unified /stayos/application
+  # group, since the AgentCore Runtime container logs there instead).
+  # -----------------------------------------------------------------
+  ChatErrorsQuery:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub "${StackPrefix}/chat-errors"
+      LogGroupNames:
+        - /stayos/agentcore/chat-agent
+      QueryString: |
+        fields @timestamp, level, message, connection_id, property_id, error_type
+        | filter level = "ERROR"
+        | sort @timestamp desc
+        | limit 100
+
+  # -----------------------------------------------------------------
+  # Log Insights Query: Tool invocation latency by tool name (avg,
+  # p95, p99). Scoped to the unified log group since the Tool Lambda
+  # (unlike the chat agent container) logs there via LoggingConfig.
+  # -----------------------------------------------------------------
+  ChatToolLatencyQuery:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub "${StackPrefix}/chat-tool-latency"
+      LogGroupNames:
+        - /stayos/application
+      QueryString: |
+        fields @timestamp, tool_name, duration_ms, property_id
+        | filter service = "stayos-tools" and message = "Tool invocation completed"
+        | stats avg(duration_ms) as avg_ms, pct(duration_ms, 95) as p95_ms, pct(duration_ms, 99) as p99_ms by tool_name
+
+  # -----------------------------------------------------------------
+  # Log Insights Query: Chat session start/end events per connection,
+  # with gm_alias and the start/end timestamps needed to derive
+  # session duration.
+  # -----------------------------------------------------------------
+  ChatSessionsQuery:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub "${StackPrefix}/chat-sessions"
+      LogGroupNames:
+        - /stayos/agentcore/chat-agent
+      QueryString: |
+        fields @timestamp, connection_id, gm_alias, message
+        | filter message = "Chat session started" or message = "Chat session ended"
+        | stats count() as event_count, earliest(@timestamp) as sessionStart, latest(@timestamp) as sessionEnd, latest(gm_alias) as gm_alias by connection_id
+        | sort sessionEnd desc
+        | limit 50
+
+# -------------------------------------------------------------------
+# Outputs - Lambda ARN, role ARNs, ECR URI, build project name, WAF ARN
+# -------------------------------------------------------------------
+Outputs:
+  ToolLambdaArn:
+    Description: ARN of the Tool Lambda function for Gateway target registration
+    Value: !GetAtt ToolLambdaFunction.Arn
+
+  ToolLambdaName:
+    Description: Name of the Tool Lambda function for code deployment
+    Value: !Ref ToolLambdaFunction
+
+  ChatAgentCoreRoleArn:
+    Description: IAM role ARN for chat agent AgentCore container execution
+    Value: !GetAtt ChatAgentCoreRole.Arn
+
+  ChatAgentEcrRepoUri:
+    Description: ECR repository URI for chat agent container images
+    Value: !GetAtt ChatAgentEcrRepository.RepositoryUri
+
+  ChatAgentBuildProjectName:
+    Description: CodeBuild project name for chat agent container builds
+    Value: !Ref ChatAgentBuildProject
+
+  GatewayWafWebAclArn:
+    Description: WAFv2 WebACL ARN for association with AgentCore Gateway
+    Value: !GetAtt GatewayWafWebAcl.Arn

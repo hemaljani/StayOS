@@ -1,0 +1,14 @@
+{
+  "name": "PULSE | StayOS",
+  "short_name": "PULSE",
+  "description": "Real-time tiered alerts for hotel General Managers - Part of StayOS",
+  "start_url": "/pulse/",
+  "scope": "/pulse/",
+  "display": "standalone",
+  "background_color": "#080c18",
+  "theme_color": "#080c18",
+  "icons": [
+    { "src": "/pulse/icons/icon-192.svg", "sizes": "192x192", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/pulse/icons/icon-512.svg", "sizes": "512x512", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

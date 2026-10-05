@@ -1,0 +1,133 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  StayOS Auth Stack - Cognito User Pool and App Client for GM authentication.
+  Admin-only user creation enforces controlled onboarding for hotel pilot.
+  Supports REQ-19 (Authentication and Authorization).
+
+# -------------------------------------------------------------------
+# Parameters
+# -------------------------------------------------------------------
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: lumi
+    Description: Prefix for all resource names (propagated from root stack)
+
+# -------------------------------------------------------------------
+# Resources
+# -------------------------------------------------------------------
+Resources:
+
+  # -----------------------------------------------------------------
+  # Cognito User Pool: GM Accounts
+  # AllowAdminCreateUserOnly: true - GMs cannot self-register; accounts
+  # are provisioned by the LUMI admin during hotel onboarding. This
+  # prevents unauthorized access during the controlled pilot phase.
+  # UsernameAttributes: [email] - GMs log in with their email address
+  # rather than a separate username (simpler UX for non-technical users).
+  # Password policy requires uppercase, lowercase, and numbers but NOT
+  # symbols - balances security with usability for GMs on mobile devices.
+  # Custom attributes (propertyId, gmAlias) are immutable after creation
+  # to maintain data integrity between Cognito and DynamoDB records.
+  # -----------------------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${StackPrefix}-users"
+      # Admin-only creation: prevents self-registration during controlled pilot
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      # Email auto-verification: marks email as verified when admin creates user
+      AutoVerifiedAttributes:
+        - email
+      # GMs log in with email - no separate username to remember
+      UsernameAttributes:
+        - email
+      # Case-insensitive email matching - prevents duplicate accounts
+      UsernameConfiguration:
+        CaseSensitive: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireUppercase: true
+          # No symbols required - mobile-friendly for GMs on hotel floor
+          RequireSymbols: false
+          # Temporary password expires after 7 days - forces password change on first login
+          TemporaryPasswordValidityDays: 7
+      # Custom attributes link Cognito user to their property and DynamoDB settings.
+      # Mutable: false ensures these cannot be changed after account creation,
+      # maintaining referential integrity with DynamoDB records.
+      Schema:
+        - Name: propertyId
+          AttributeDataType: String
+          Mutable: false
+          Required: false
+        - Name: gmAlias
+          AttributeDataType: String
+          Mutable: false
+          Required: false
+      # Cognito uses UserPoolTags (key-value map) instead of standard Tags array
+      UserPoolTags:
+        Project: StayOS
+        resilience-tier: standard
+        Component: auth
+
+  # -----------------------------------------------------------------
+  # Cognito User Pool Client: SPA (PWA Frontend)
+  # GenerateSecret: false - public client for single-page app (SPA).
+  # Client secrets cannot be safely stored in browser-based apps; the
+  # SPA relies on short-lived tokens instead of a client secret.
+  # Auth flows:
+  #   - ALLOW_USER_PASSWORD_AUTH: direct username/password login from SPA
+  #   - ALLOW_REFRESH_TOKEN_AUTH: silent token refresh without re-login
+  # USER_SRP_AUTH omitted for simplicity in MVP; can be added later for
+  # enhanced security (password never leaves client).
+  # PreventUserExistenceErrors: ENABLED - returns generic error messages
+  # so attackers cannot enumerate valid email addresses via login attempts.
+  # Token validity: 1-hour access/ID tokens balance security with UX;
+  # 30-day refresh token allows GMs to stay logged in across shifts.
+  # -----------------------------------------------------------------
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${StackPrefix}-client"
+      UserPoolId: !Ref UserPool
+      # No client secret: SPA cannot securely store secrets in the browser
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        # Direct email/password auth from the PWA login form
+        - ALLOW_USER_PASSWORD_AUTH
+        # Silent token refresh - keeps GMs logged in without re-entering credentials
+        - ALLOW_REFRESH_TOKEN_AUTH
+      # Security: generic error on invalid login prevents email enumeration attacks
+      PreventUserExistenceErrors: ENABLED
+      # Access token: 1 hour - short-lived for security, refreshed silently
+      AccessTokenValidity: 1
+      # ID token: 1 hour - matches access token lifetime
+      IdTokenValidity: 1
+      # Refresh token: 30 days - GMs stay logged in across daily shifts
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+# -------------------------------------------------------------------
+# Outputs
+# Exported for use by other nested stacks (compute stack needs User Pool ID
+# for token validation; frontend needs Client ID for auth SDK initialization).
+# -------------------------------------------------------------------
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+
+  UserPoolArn:
+    Description: Cognito User Pool ARN (for API Gateway authorizer)
+    Value: !GetAtt UserPool.Arn
+
+  UserPoolClientId:
+    Description: Cognito App Client ID (for frontend auth)
+    Value: !Ref UserPoolClient

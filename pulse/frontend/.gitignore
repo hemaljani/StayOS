@@ -1,0 +1,19 @@
+# Dependencies
+/node_modules
+
+# Next.js build output
+/.next
+/out
+next-env.d.ts
+tsconfig.tsbuildinfo
+
+# Environment (never commit real credentials)
+.env
+.env.local
+.env.production
+
+# Test / coverage
+/coverage
+
+# OS
+.DS_Store

@@ -1,0 +1,62 @@
+# Multi-stage Containerfile for the PULSE Triage Agent (AgentCore Runtime).
+# Builds a minimal ARM64 (Graviton microVM) image, mirroring the LUMI chat
+# agent. BedrockAgentCoreApp starts uvicorn internally on port 8080 and serves
+# GET /ping and POST /invocations (request-response triage).
+#
+# Build engine: AWS Finch (Docker-compatible CLI). Locally:
+#   finch build --platform linux/arm64 -t pulse-triage-agent -f Containerfile .
+# In CI, CodeBuild (Task 25) builds this on native ARM64 and pushes to ECR.
+#
+# EXPECTED BUILD CONTEXT LAYOUT (staged by the build in Task 25):
+#   ./server.py ./gateway.py ./situation.py ./narrative.py ./attach.py
+#   ./config.py ./__init__.py ./requirements.txt ./Containerfile
+#   ./pulse/                <- the PULSE package tree copied from backend/src/pulse
+#                              so pulse.triage.* / pulse.common.* / pulse.delivery.*
+#                              (including the triage prompt .txt templates) resolve.
+# The build step copies backend/src/pulse into ./pulse before invoking the build;
+# this Containerfile then bundles it (it is NOT pip-installed from an index).
+
+# --- Stage 1: Builder ---
+# Install third-party dependencies into a clean layer so the final image avoids
+# build tools and pip caches.
+FROM public.ecr.aws/docker/library/python:3.12-slim AS builder
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+# Install production dependencies only; --no-cache-dir keeps the layer small.
+RUN pip install --no-cache-dir -r requirements.txt
+
+# --- Stage 2: Runtime ---
+# Minimal image with only the runtime dependencies and application code.
+FROM public.ecr.aws/docker/library/python:3.12-slim
+
+WORKDIR /app
+
+# Create a non-root system user for running the application (security best practice).
+RUN groupadd --system --gid 1001 appuser \
+    && useradd --system --uid 1001 --gid appuser --no-create-home appuser
+
+# Copy installed third-party packages from the builder stage (owned by appuser).
+COPY --from=builder --chown=appuser:appuser /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder --chown=appuser:appuser /usr/local/bin /usr/local/bin
+
+# Copy the application source (flat service modules AND the bundled ./pulse
+# package). Tests, __pycache__, and local artifacts are excluded via
+# .dockerignore. Because WORKDIR is /app, Python adds /app to sys.path, so both
+# `import gateway` and `import pulse.triage` resolve at runtime.
+COPY --chown=appuser:appuser . /app
+
+# Switch to the non-root user.
+USER appuser
+
+# AgentCore requires the application to listen on port 8080.
+EXPOSE 8080
+
+# Health check hits the /ping endpoint that BedrockAgentCoreApp exposes.
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/ping')"
+
+# BedrockAgentCoreApp starts uvicorn internally - just run the server module.
+CMD ["python", "server.py"]

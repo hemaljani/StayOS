@@ -1,0 +1,80 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* LUMI "Coastal Blue" theme tokens (RGB channels). :root = light (default);
+   .dark = Coastal Blue dark. Referenced via rgb(var(--c-*) / <alpha-value>).
+   Shared theme preference toggles <html class="dark"> across shell/LUMI/PULSE. */
+:root {
+  --c-background: 238 243 247;
+  --c-background-2: 231 238 245;
+  --c-surface: 255 255 255;
+  --c-surface-2: 228 236 243;
+  --c-ink: 30 41 55;
+  --c-ink-soft: 90 107 125;
+  --c-ink-faint: 154 169 184;
+  --c-line: 215 225 234;
+  --c-accent: 63 124 192;
+  --c-accent-deep: 47 95 156;
+  --c-accent-secondary: 125 111 208;
+  --c-success: 47 143 136;
+  --c-warning: 217 145 40;
+  --c-danger: 209 86 106;
+  --c-tier-ambassador: 198 138 46;  /* #c68a2e */
+  --c-tier-titanium: 140 150 164;    /* #8c96a4 */
+  --c-tier-platinum: 63 124 192;     /* #3f7cc0 */
+  --c-white: 255 255 255;
+  --c-gray-200: 30 41 55;
+  --c-gray-300: 59 71 87;
+  --c-gray-400: 90 107 125;
+  --c-gray-500: 122 135 152;
+  --c-gray-600: 154 169 184;
+  --c-gray-700: 215 225 234;
+  --c-gray-800: 219 228 236;
+  --c-gray-900: 228 236 243;
+}
+
+.dark {
+  --c-background: 15 23 34;
+  --c-background-2: 19 28 41;
+  --c-surface: 24 34 47;
+  --c-surface-2: 32 44 59;
+  --c-ink: 238 243 247;
+  --c-ink-soft: 169 183 198;
+  --c-ink-faint: 107 122 141;
+  --c-line: 42 55 70;
+  --c-accent: 91 155 216;
+  --c-accent-deep: 63 124 192;
+  --c-accent-secondary: 149 129 224;
+  --c-success: 63 176 162;
+  --c-warning: 232 169 68;
+  --c-danger: 224 104 123;
+  --c-tier-ambassador: 217 164 65;  /* #d9a441 */
+  --c-tier-titanium: 167 178 192;    /* #a7b2c0 */
+  --c-tier-platinum: 91 155 216;     /* #5b9bd8 */
+  --c-white: 255 255 255;
+  --c-gray-200: 238 243 247;
+  --c-gray-300: 200 211 222;
+  --c-gray-400: 169 183 198;
+  --c-gray-500: 138 154 171;
+  --c-gray-600: 107 122 141;
+  --c-gray-700: 42 55 70;
+  --c-gray-800: 36 46 61;
+  --c-gray-900: 32 44 59;
+}
+
+html,
+body {
+  background-color: rgb(var(--c-background));
+  color: rgb(var(--c-ink));
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+}
+
+:root {
+  --sat: env(safe-area-inset-top);
+  --sab: env(safe-area-inset-bottom);
+  --sal: env(safe-area-inset-left);
+  --sar: env(safe-area-inset-right);
+}

@@ -1,0 +1,360 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  StayOS PULSE root stack: orchestrates the PULSE data, pipeline, API, and
+  observability nested stacks for the real-time GM alert layer.
+
+# UserPoolArn is a deliberately-retained platform input (documented on the
+# parameter): the deploy contract and Makefile pass it, but the API stack
+# derives the JWT issuer from UserPoolId, so no resource Refs the ARN today.
+# Suppress the "parameter not used" warning rather than drop a required input.
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks:
+        - W2001
+
+# -------------------------------------------------------------------
+# Parameters
+# -------------------------------------------------------------------
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: pulse
+    Description: Prefix for all resource names (StackPrefix = pulse)
+
+  DeployBucket:
+    Type: String
+    Default: "pulse-deploy-artifacts"
+    Description: >
+      S3 bucket holding the shared PULSE Lambda deployment package
+      (pulse-backend.zip). Account-scoped by the Makefile
+      (pulse-deploy-<account-id>) for global uniqueness and NAMING-02
+      compliance, then threaded into the data/pipeline/api nested stacks so
+      every Lambda Code.S3Bucket reference stays in sync. The default is a
+      non-unique fallback only.
+
+  TriageModelId:
+    Type: String
+    Default: "us.anthropic.claude-sonnet-4-6"
+    Description: Bedrock model ID for the Triage Agent (env-configurable)
+
+  TriageRuntimeArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of the Triage Agent AgentCore Runtime (deployed out-of-band). Empty
+      until the runtime exists; set post-deploy from the SSM triage/runtime-arn
+      parameter and threaded into the pipeline stack so the rule evaluator can
+      fire bedrock-agentcore:InvokeAgentRuntime.
+
+  ForecastModelId:
+    Type: String
+    Default: "us.anthropic.claude-sonnet-4-6"
+    Description: >
+      Bedrock model ID for the Forecasting Agent (env-configurable). Threaded to
+      the api stack, which publishes it to the pulse-forecaster runtime as
+      FORECAST_MODEL_ID via the out-of-band CodeBuild/CLI deploy (mirrors
+      TriageModelId).
+
+  ForecastRuntimeArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of the Forecasting Agent AgentCore Runtime (pulse-forecaster, deployed
+      out-of-band). Empty until the runtime exists; set post-deploy from the SSM
+      forecast/runtime-arn parameter and threaded into the pipeline stack so the
+      forecaster invoker can fire bedrock-agentcore:InvokeAgentRuntime.
+
+  GatewayEndpointUrl:
+    Type: String
+    Default: ""
+    Description: >
+      Shared StayOS AgentCore Gateway MCP endpoint URL (SSM parameter
+      /<StackPrefix>/gateway/endpoint-url, owned by the LUMI shared-gateway
+      deploy). Threaded to the pulse-ops-read C3b VIPs/Ops facade as
+      GATEWAY_ENDPOINT_URL. Empty until the shared Gateway exists.
+
+  EnableDemoSimulator:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: When true, deploy the demo scenario simulator and its API routes
+
+  SimulatorAmbientRate:
+    Type: String
+    Default: "rate(5 minutes)"
+    Description: >
+      Ambient demo-simulator schedule rate (the schedule is created DISABLED;
+      this only sets the rate it fires at once a presenter enables it).
+
+  FrontendOrigin:
+    Type: String
+    Default: "*"
+    Description: >
+      Allowed CORS origin for the browser PWA (threaded to the API stack). The
+      PWA sends the Cognito JWT in the Authorization header (not cookies), so a
+      permissive "*" is safe; set to the exact CloudFront origin to lock down.
+
+  # -----------------------------------------------------------------
+  # Shared LUMI platform ARNs (reused, not created by PULSE)
+  # -----------------------------------------------------------------
+  UserPoolId:
+    Type: String
+    Description: LUMI Cognito user pool ID (REST authorizer + AppSync Events auth)
+
+  UserPoolArn:
+    Type: String
+    Description: >
+      LUMI Cognito user pool ARN. Retained as a documented platform input; the
+      API stack derives the JWT issuer from UserPoolId, so no stack consumes the
+      ARN directly at present.
+
+  UserPoolClientId:
+    Type: String
+    Default: ""
+    Description: LUMI Cognito app client ID (HTTP API JWT authorizer audience)
+
+  VapidPublicKey:
+    Type: String
+    Default: ""
+    Description: VAPID public key served to the PWA for Web Push subscription
+
+  WafWebAclArn:
+    Type: String
+    Default: ""
+    Description: >
+      LUMI REGIONAL WAFv2 web ACL ARN to associate with the API / AppSync Events
+      API. MUST be a REGIONAL-scope ACL (e.g. LUMI's GatewayWafWebAclArn output),
+      NOT the CLOUDFRONT-scope ACL (LUMI's WebAclArn) - associating a
+      CLOUDFRONT-scope ACL with a regional resource fails. Optional (leave empty
+      to skip WAF association); deploy-all intentionally leaves it unset.
+
+  # -----------------------------------------------------------------
+  # LUMI operational-table DynamoDB Stream ARNs (source of change events)
+  # Exported by the LUMI data stack after Streams enablement (Task 2.2).
+  # -----------------------------------------------------------------
+  ReservationsStreamArn:
+    Type: String
+    Description: DynamoDB Stream ARN for stayos-reservations
+  RoomsStreamArn:
+    Type: String
+    Description: DynamoDB Stream ARN for stayos-rooms
+  GuestsStreamArn:
+    Type: String
+    Description: DynamoDB Stream ARN for stayos-guests
+  RevenuesStreamArn:
+    Type: String
+    Description: DynamoDB Stream ARN for stayos-revenues
+  WorkOrdersStreamArn:
+    Type: String
+    Description: DynamoDB Stream ARN for stayos-work-orders
+
+  # -----------------------------------------------------------------
+  # LUMI operational-table ARNs (Action Executor / Simulator write-back)
+  # Optional at skeleton stage; supplied when Task 20 wires write-back.
+  # -----------------------------------------------------------------
+  ReservationsTableArn:
+    Type: String
+    Default: ""
+  RoomsTableArn:
+    Type: String
+    Default: ""
+  GuestsTableArn:
+    Type: String
+    Default: ""
+  RevenuesTableArn:
+    Type: String
+    Default: ""
+  WorkOrdersTableArn:
+    Type: String
+    Default: ""
+
+  # -----------------------------------------------------------------
+  # LUMI operational-table NAMES (Action Executor / Simulator env vars).
+  # The write-back components need the table name at runtime (env) and the
+  # ARN for IAM scoping; both are threaded into the pipeline and API stacks.
+  # -----------------------------------------------------------------
+  ReservationsTableName:
+    Type: String
+    Default: ""
+    Description: stayos-reservations table name
+  RoomsTableName:
+    Type: String
+    Default: ""
+    Description: stayos-rooms table name
+  GuestsTableName:
+    Type: String
+    Default: ""
+    Description: stayos-guests table name
+
+Resources:
+  # -----------------------------------------------------------------
+  # Data: the four PULSE DynamoDB tables, GSIs, TTL, and the
+  # pulse-alerts stream. No dependencies - created first.
+  # -----------------------------------------------------------------
+  DataStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: nested-stacks/pulse-data.yaml
+      Parameters:
+        StackPrefix: !Ref StackPrefix
+        DeployBucket: !Ref DeployBucket
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: data
+
+  # -----------------------------------------------------------------
+  # Pipeline: rule/triage/escalation/delivery Lambdas, stream
+  # event-source mappings, Bedrock IAM, schedulers, and the
+  # conditional demo simulator. Depends on DataStack (table/stream
+  # ARNs) and consumes the LUMI operational stream ARNs.
+  # -----------------------------------------------------------------
+  PipelineStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: nested-stacks/pulse-pipeline.yaml
+      Parameters:
+        StackPrefix: !Ref StackPrefix
+        DeployBucket: !Ref DeployBucket
+        TriageModelId: !Ref TriageModelId
+        TriageRuntimeArn: !Ref TriageRuntimeArn
+        ForecastAgentRuntimeArn: !Ref ForecastRuntimeArn
+        EnableDemoSimulator: !Ref EnableDemoSimulator
+        AlertsTableName: !GetAtt DataStack.Outputs.AlertsTableName
+        AlertsTableArn: !GetAtt DataStack.Outputs.AlertsTableArn
+        AlertsStreamArn: !GetAtt DataStack.Outputs.AlertsStreamArn
+        RulesTableName: !GetAtt DataStack.Outputs.RulesTableName
+        RulesTableArn: !GetAtt DataStack.Outputs.RulesTableArn
+        AlertHistoryTableName: !GetAtt DataStack.Outputs.AlertHistoryTableName
+        AlertHistoryTableArn: !GetAtt DataStack.Outputs.AlertHistoryTableArn
+        PushSubscriptionsTableName: !GetAtt DataStack.Outputs.PushSubscriptionsTableName
+        PushSubscriptionsTableArn: !GetAtt DataStack.Outputs.PushSubscriptionsTableArn
+        ReservationsStreamArn: !Ref ReservationsStreamArn
+        RoomsStreamArn: !Ref RoomsStreamArn
+        GuestsStreamArn: !Ref GuestsStreamArn
+        RevenuesStreamArn: !Ref RevenuesStreamArn
+        WorkOrdersStreamArn: !Ref WorkOrdersStreamArn
+        ReservationsTableArn: !Ref ReservationsTableArn
+        RoomsTableArn: !Ref RoomsTableArn
+        GuestsTableArn: !Ref GuestsTableArn
+        RevenuesTableArn: !Ref RevenuesTableArn
+        WorkOrdersTableArn: !Ref WorkOrdersTableArn
+        # Operational table names + ambient rate for the Action Executor and
+        # (conditional) Demo Simulator write-backs (Task 20).
+        ReservationsTableName: !Ref ReservationsTableName
+        RoomsTableName: !Ref RoomsTableName
+        GuestsTableName: !Ref GuestsTableName
+        SimulatorAmbientRate: !Ref SimulatorAmbientRate
+        # Foreground realtime (AppSync Events) publish target, produced by the
+        # ApiStack (Task 16). Threaded here so the pipeline delivery/escalation/
+        # executor/batcher Lambdas can publish realtime events and scope
+        # appsync:EventPublish to the realtime API ARN.
+        RealtimeHttpEndpoint: !GetAtt ApiStack.Outputs.RealtimeHttpEndpoint
+        RealtimeApiArn: !GetAtt ApiStack.Outputs.RealtimeApiArn
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: pipeline
+
+  # -----------------------------------------------------------------
+  # API: REST API Gateway + pulse-api Lambda + Cognito authorizer +
+  # WAF association, and the AppSync Events realtime API. Depends on
+  # DataStack (table ARNs) and the shared Cognito/WAF ARNs.
+  # -----------------------------------------------------------------
+  ApiStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: nested-stacks/pulse-api.yaml
+      Parameters:
+        StackPrefix: !Ref StackPrefix
+        DeployBucket: !Ref DeployBucket
+        EnableDemoSimulator: !Ref EnableDemoSimulator
+        FrontendOrigin: !Ref FrontendOrigin
+        UserPoolId: !Ref UserPoolId
+        UserPoolClientId: !Ref UserPoolClientId
+        WafWebAclArn: !Ref WafWebAclArn
+        VapidPublicKey: !Ref VapidPublicKey
+        # Shared StayOS Gateway endpoint for the pulse-ops-read C3b facade.
+        GatewayEndpointUrl: !Ref GatewayEndpointUrl
+        # Bedrock model id published to the pulse-forecaster runtime as
+        # FORECAST_MODEL_ID by the out-of-band deploy (Forecasting Agent).
+        ForecastModelId: !Ref ForecastModelId
+        AlertsTableName: !GetAtt DataStack.Outputs.AlertsTableName
+        AlertsTableArn: !GetAtt DataStack.Outputs.AlertsTableArn
+        RulesTableName: !GetAtt DataStack.Outputs.RulesTableName
+        RulesTableArn: !GetAtt DataStack.Outputs.RulesTableArn
+        AlertHistoryTableName: !GetAtt DataStack.Outputs.AlertHistoryTableName
+        AlertHistoryTableArn: !GetAtt DataStack.Outputs.AlertHistoryTableArn
+        PushSubscriptionsTableName: !GetAtt DataStack.Outputs.PushSubscriptionsTableName
+        PushSubscriptionsTableArn: !GetAtt DataStack.Outputs.PushSubscriptionsTableArn
+        KitchenTableName: !GetAtt DataStack.Outputs.KitchenTableName
+        KitchenTableArn: !GetAtt DataStack.Outputs.KitchenTableArn
+        # Operational write-back targets for the in-process Action Executor
+        # (names for the runtime client; ARNs scope its IAM policy).
+        ReservationsTableArn: !Ref ReservationsTableArn
+        RoomsTableArn: !Ref RoomsTableArn
+        GuestsTableArn: !Ref GuestsTableArn
+        ReservationsTableName: !Ref ReservationsTableName
+        RoomsTableName: !Ref RoomsTableName
+        GuestsTableName: !Ref GuestsTableName
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: business-critical
+        - Key: Component
+          Value: api
+
+  # -----------------------------------------------------------------
+  # Observability: CloudWatch dashboard, alarms, SNS topic, X-Ray.
+  # Depends on PipelineStack (its metric filters read the unified
+  # pipeline log group) and consumes the AppSync Events API id from
+  # ApiStack for the realtime dashboard widgets and error alarms.
+  # -----------------------------------------------------------------
+  ObservabilityStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - PipelineStack
+    Properties:
+      TemplateURL: nested-stacks/pulse-observability.yaml
+      Parameters:
+        StackPrefix: !Ref StackPrefix
+        RealtimeApiId: !GetAtt ApiStack.Outputs.RealtimeApiId
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: observability
+
+# -------------------------------------------------------------------
+# Outputs
+# -------------------------------------------------------------------
+Outputs:
+  AlertsTableName:
+    Description: DynamoDB table name for PULSE alerts
+    Value: !GetAtt DataStack.Outputs.AlertsTableName
+
+  AlertsStreamArn:
+    Description: DynamoDB Stream ARN for pulse-alerts
+    Value: !GetAtt DataStack.Outputs.AlertsStreamArn
+
+  ApiEndpoint:
+    Description: PULSE HTTP API invoke URL
+    Value: !GetAtt ApiStack.Outputs.ApiEndpoint
+
+  RealtimeHttpEndpoint:
+    Description: AppSync Events HTTP publish endpoint base
+    Value: !GetAtt ApiStack.Outputs.RealtimeHttpEndpoint
+
+  RealtimeApiArn:
+    Description: AppSync Events API ARN
+    Value: !GetAtt ApiStack.Outputs.RealtimeApiArn

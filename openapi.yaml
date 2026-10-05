@@ -1,0 +1,1643 @@
+openapi: "3.0.3"
+info:
+  title: StayOS API - Part of StayOS
+  version: "1.0.0"
+  description: |
+    StayOS is the operating system for hotel General Managers and associates.
+    This root specification currently documents the **PULSE** real-time alerts
+    API (StayOS Feature #2): tiered (CRITICAL / WARNING / INFO), AI-triaged
+    operational alerts with a closed-loop "human approves, agent executes"
+    resolution flow.
+
+    LUMI's (Feature #1) brief/settings REST API is documented separately in
+    `lumi/openapi.yaml` and is intentionally **not** duplicated here.
+
+    All endpoints require Amazon Cognito JWT Bearer authentication and are
+    protected by AWS WAF (US-only geographic restriction, reused from LUMI).
+    Every route is scoped server-side to the caller's associated properties;
+    no route trusts a client-supplied scope.
+
+    Note: the PULSE **foreground realtime** feed (live alert create /
+    status-change / resolve events) is delivered over a separate AWS AppSync
+    Events WebSocket channel, **not** over this REST API. Use
+    `GET /config/realtime` to obtain the WebSocket endpoint and namespace. This
+    REST API covers the request/response surface only.
+
+externalDocs:
+  description: PULSE README - architecture, build, and deploy guide
+  url: pulse/README.md
+
+servers:
+  - url: https://{api-id}.execute-api.us-east-1.amazonaws.com/v1
+    description: Production API (us-east-1, protected by WAF + Cognito JWT)
+    variables:
+      api-id:
+        default: "your-api-gateway-id"
+        description: API Gateway REST API ID (from CloudFormation output)
+
+security:
+  - CognitoAuth: []
+
+tags:
+  - name: Alerts
+    description: Alert feed, detail, lifecycle transitions, and the Article 14 approval gate
+  - name: History
+    description: Shift-handover log
+  - name: Rules
+    description: Admin rule-definition read/update
+  - name: Delivery
+    description: Web Push subscriptions and client delivery configuration
+  - name: Ops
+    description: VIPs and Ops read facade (live data via the shared AgentCore Gateway)
+  - name: Demo
+    description: Demo Scenario Simulator (demo-only, gated by EnableDemoSimulator)
+
+paths:
+  /alerts:
+    get:
+      operationId: listAlerts
+      summary: List alerts (feed + optional tier/status filters)
+      description: |
+        Returns the alert feed for the caller, scoped to their associated
+        properties and ordered newest-first per property. Optional `tier` and
+        `status` filters narrow the result. When `propertyId` is supplied the
+        caller must be associated with it, otherwise an empty result is returned
+        without leaking existence.
+      tags:
+        - Alerts
+      parameters:
+        - name: propertyId
+          in: query
+          required: false
+          description: Restrict the feed to a single property the caller owns
+          schema:
+            type: string
+            example: ALOHA-CHI-001
+        - name: tier
+          in: query
+          required: false
+          description: Filter by alert tier (case-insensitive)
+          schema:
+            $ref: "#/components/schemas/AlertTier"
+        - name: status
+          in: query
+          required: false
+          description: Filter by alert status (case-insensitive)
+          schema:
+            $ref: "#/components/schemas/AlertStatus"
+      responses:
+        "200":
+          description: Alert feed retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AlertListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /alerts/{alertId}:
+    get:
+      operationId: getAlert
+      summary: Get a single alert (detail including triage brief)
+      description: |
+        Returns the full alert item, including the agent-generated `triageBrief`
+        when present. Returns 404 when the alert does not exist or belongs to a
+        property the caller is not associated with (existence is not leaked).
+      tags:
+        - Alerts
+      parameters:
+        - $ref: "#/components/parameters/AlertId"
+      responses:
+        "200":
+          description: Alert retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AlertDetailResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Alert not found or out of scope
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  message: Alert not found
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /alerts/{alertId}/acknowledgements:
+    post:
+      operationId: acknowledgeAlert
+      summary: Acknowledge an alert
+      description: |
+        Transitions an open alert (UNACKNOWLEDGED or ESCALATED) to ACKNOWLEDGED,
+        recording the acknowledging user and a UTC timestamp, and halting any
+        in-flight escalation. A resolved alert cannot be acknowledged.
+      tags:
+        - Alerts
+      parameters:
+        - $ref: "#/components/parameters/AlertId"
+      responses:
+        "200":
+          description: Alert acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusTransitionResponse"
+              example:
+                alertId: alert-8f2c
+                status: ACKNOWLEDGED
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Alert not found or out of scope
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  message: Alert not found
+        "409":
+          description: Alert cannot be acknowledged (invalid or terminal transition)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  message: Alert cannot be acknowledged
+                  reason: already-resolved
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /alerts/{alertId}/resolutions:
+    post:
+      operationId: resolveAlert
+      summary: Resolve an alert
+      description: |
+        Transitions an open alert (UNACKNOWLEDGED, ACKNOWLEDGED, or ESCALATED) to
+        RESOLVED, recording the resolving user and a UTC timestamp. RESOLVED is
+        terminal; resolving an already-resolved alert is rejected with state
+        unchanged.
+      tags:
+        - Alerts
+      parameters:
+        - $ref: "#/components/parameters/AlertId"
+      responses:
+        "200":
+          description: Alert resolved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusTransitionResponse"
+              example:
+                alertId: alert-8f2c
+                status: RESOLVED
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Alert not found or out of scope
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  message: Alert not found
+        "409":
+          description: Alert cannot be resolved (already terminal)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  message: Alert cannot be resolved
+                  reason: already-resolved
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /alerts/{alertId}/approvals:
+    post:
+      operationId: decideApproval
+      summary: Approve or reject a triage ranked option (Article 14 gate)
+      description: |
+        Records a GM decision on a CRITICAL alert's ranked option. This is the EU
+        AI Act Article 14 human-approval gate: the Action Executor performs the
+        resolving write-back (and transactionally sets the alert RESOLVED) **only**
+        when a decision of `approve` is accepted. A decision of `reject` records
+        the rejection and never executes. An approval must name a `selectedOption`
+        that exists on the alert's triage brief when the brief carries options.
+      tags:
+        - Alerts
+      parameters:
+        - $ref: "#/components/parameters/AlertId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApprovalRequest"
+            example:
+              decision: approve
+              selectedOption: A
+      responses:
+        "200":
+          description: Approval decision accepted (executor may have run on approve)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApprovalResponse"
+              example:
+                accepted: true
+                approvalState: APPROVED
+                selectedOption: A
+                executed: true
+                execution:
+                  executed: true
+                  resolvedAlertId: alert-8f2c
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Alert not found or out of scope
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  message: Alert not found
+        "409":
+          description: Approval decision rejected (already decided, invalid option, or resolved)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  message: Approval decision rejected
+                  reason: invalid-option
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /shift-handover:
+    get:
+      operationId: getShiftHandover
+      summary: Get the shift-handover log for a property window
+      description: |
+        Returns every alert for a property whose creation time falls within the
+        `[from, to]` window (inclusive), ordered newest-first. `propertyId`,
+        `from`, and `to` are all required. A window for a property the caller is
+        not associated with returns an empty result rather than leaking existence.
+      tags:
+        - History
+      parameters:
+        - name: propertyId
+          in: query
+          required: true
+          description: Property identifier
+          schema:
+            type: string
+            example: ALOHA-CHI-001
+        - name: from
+          in: query
+          required: true
+          description: Window start (ISO 8601), inclusive
+          schema:
+            type: string
+            format: date-time
+            example: "2026-08-17T06:00:00Z"
+        - name: to
+          in: query
+          required: true
+          description: Window end (ISO 8601), inclusive
+          schema:
+            type: string
+            format: date-time
+            example: "2026-08-17T14:00:00Z"
+      responses:
+        "200":
+          description: Shift-handover log retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AlertListResponse"
+        "400":
+          description: Missing required query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  message: propertyId, from, and to are required
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /rules:
+    get:
+      operationId: listRules
+      summary: List rule definitions for a property
+      description: |
+        Returns the alert rule definitions for the requested property. Returns an
+        empty list when `propertyId` is missing or the caller is not associated
+        with it.
+      tags:
+        - Rules
+      parameters:
+        - name: propertyId
+          in: query
+          required: true
+          description: Property identifier
+          schema:
+            type: string
+            example: ALOHA-CHI-001
+      responses:
+        "200":
+          description: Rule definitions retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RulesListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /rules/{ruleId}:
+    put:
+      operationId: updateRule
+      summary: Update a rule definition (admin)
+      description: |
+        Validates and persists a rule-definition update. The `{ruleId}` path
+        parameter is the composite `"{propertyId}#{ruleType}"`; its components are
+        merged into the body so the URL identity is authoritative. On rejection
+        nothing is written (the prior definition is retained) and the offending
+        attribute is reported. The update is denied when the caller is not
+        associated with the target property.
+      tags:
+        - Rules
+      parameters:
+        - name: ruleId
+          in: path
+          required: true
+          description: Composite rule id "{propertyId}#{ruleType}"
+          schema:
+            type: string
+            example: ALOHA-CHI-001#WALK_RISK
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RuleUpdate"
+            example:
+              tier: CRITICAL
+              triggerCondition:
+                operator: gt
+                left: reservations.confirmed
+                right: rooms.available
+              parameters:
+                loyaltyProtectionTier: Gold
+              agentTriageEnabled: true
+              escalationTimeoutSec: 300
+              enabled: true
+      responses:
+        "200":
+          description: Rule updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RuleUpdateResponse"
+        "400":
+          description: Validation error; prior definition retained
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  message: Rule update rejected; prior definition retained
+                  invalidAttribute: escalationTimeoutSec
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Caller not associated with the target property
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  message: Not authorized for this property
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /push-subscriptions:
+    post:
+      operationId: registerPushSubscription
+      summary: Register a Web Push (VAPID) subscription
+      description: |
+        Registers the browser's Web Push subscription so the delivery layer can
+        wake a closed or backgrounded PWA for CRITICAL/WARNING alerts. The
+        subscription is always stored under the authenticated caller's identity.
+      tags:
+        - Delivery
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PushSubscriptionRequest"
+            example:
+              endpoint: https://web.push.apple.com/Qf...
+              p256dh: BPx...
+              auth: k9d...
+      responses:
+        "201":
+          description: Subscription registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PushSubscriptionResponse"
+              example:
+                registered: true
+                endpointHash: 3b1f9a...c7
+        "400":
+          description: Subscription missing a required field
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  message: Invalid subscription
+                  missing: endpoint
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /config/vapid-public-key:
+    get:
+      operationId: getVapidPublicKey
+      summary: Get the VAPID public key for Web Push subscription
+      description: |
+        Returns the VAPID public key the PWA service worker uses to create its
+        Web Push subscription.
+      tags:
+        - Delivery
+      responses:
+        "200":
+          description: VAPID public key retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VapidPublicKeyResponse"
+              example:
+                publicKey: BPx...
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /config/realtime:
+    get:
+      operationId: getRealtimeConfig
+      summary: Get the AppSync Events realtime endpoint configuration
+      description: |
+        Returns the AWS AppSync Events endpoints and channel namespace the PWA
+        uses to subscribe to the foreground realtime alert feed over WebSocket.
+        The realtime feed itself is delivered over that WebSocket channel, not
+        over this REST API.
+      tags:
+        - Delivery
+      responses:
+        "200":
+          description: Realtime configuration retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RealtimeConfigResponse"
+              example:
+                httpEndpoint: https://abc123.appsync-api.us-east-1.amazonaws.com/event
+                wssEndpoint: wss://abc123.appsync-realtime-api.us-east-1.amazonaws.com/event
+                namespace: pulse
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /vips:
+    get:
+      operationId: getVips
+      summary: Get VIP arrivals grouped by loyalty tier
+      description: |
+        Returns live VIP arrivals for a property, grouped by loyalty tier and
+        ordered by eliteness, for the PWA VIPs tab. Backed by the shared StayOS
+        AgentCore Gateway (`get_vip_guests`), scoped server-side to the property.
+        Sensitive guest notes are never returned.
+      tags:
+        - Ops
+      parameters:
+        - $ref: "#/components/parameters/RequiredPropertyId"
+      responses:
+        "200":
+          description: VIP arrivals retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VipsResponse"
+        "400":
+          $ref: "#/components/responses/PropertyIdRequired"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/PropertyForbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          $ref: "#/components/responses/OpsDataUnavailable"
+
+  /ops:
+    get:
+      operationId: getOps
+      summary: Get the operations snapshot (facility, OOO rooms, group checkout)
+      description: |
+        Returns the Ops tab snapshot for a property: a facility summary,
+        out-of-order (OOO) room cards each annotated with their joined work-order
+        status, and a group-checkout summary. Backed by the shared Gateway
+        (`get_occupancy`, `get_room_status`, `get_work_orders`), scoped
+        server-side to the property.
+      tags:
+        - Ops
+      parameters:
+        - $ref: "#/components/parameters/RequiredPropertyId"
+      responses:
+        "200":
+          description: Operations snapshot retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpsResponse"
+        "400":
+          $ref: "#/components/responses/PropertyIdRequired"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/PropertyForbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          $ref: "#/components/responses/OpsDataUnavailable"
+
+  /demo/scenarios/{scenarioId}:
+    post:
+      operationId: runDemoScenario
+      summary: Run a demo scenario (demo-only)
+      description: |
+        **Demo-only.** Drives the Demo Scenario Simulator in-process to apply a
+        deterministic operational-data mutation that raises the scenario's
+        triggering condition. Exposed only when `EnableDemoSimulator` is truthy
+        (default); a real deployment sets it false and this route returns 404 as
+        if absent.
+      tags:
+        - Demo
+      parameters:
+        - $ref: "#/components/parameters/ScenarioId"
+      responses:
+        "200":
+          description: Scenario mutation applied
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DemoScenarioResponse"
+              example:
+                scenarioId: walk-risk
+                action: run
+                operation: MODIFY
+                tableKind: reservations
+                expectedAlertType: WALK_RISK
+        "400":
+          description: Invalid demo scenario action
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  message: Invalid demo scenario action
+                  detail: unsupported action
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Unknown scenario (or demo surface disabled)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  message: Unknown demo scenario
+                  scenarioId: not-a-scenario
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /demo/scenarios/{scenarioId}/reset:
+    post:
+      operationId: resetDemoScenario
+      summary: Reset a demo scenario (demo-only)
+      description: |
+        **Demo-only.** Drives the Demo Scenario Simulator in-process to apply the
+        deterministic mutation that clears the scenario's triggering condition
+        (the reset counterpart to running the scenario). Exposed only when
+        `EnableDemoSimulator` is truthy; otherwise returns 404 as if absent.
+      tags:
+        - Demo
+      parameters:
+        - $ref: "#/components/parameters/ScenarioId"
+      responses:
+        "200":
+          description: Scenario reset mutation applied
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DemoScenarioResponse"
+              example:
+                scenarioId: walk-risk
+                action: reset
+                operation: MODIFY
+                tableKind: reservations
+                expectedAlertType: WALK_RISK
+        "400":
+          description: Invalid demo scenario action
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  message: Invalid demo scenario action
+                  detail: unsupported action
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Unknown scenario (or demo surface disabled)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  message: Unknown demo scenario
+                  scenarioId: not-a-scenario
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  securitySchemes:
+    CognitoAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Amazon Cognito JWT (access token or ID token)
+
+  parameters:
+    AlertId:
+      name: alertId
+      in: path
+      required: true
+      description: Unique alert identifier
+      schema:
+        type: string
+        example: alert-8f2c
+    RequiredPropertyId:
+      name: propertyId
+      in: query
+      required: true
+      description: Property identifier (server-side scoped to the caller)
+      schema:
+        type: string
+        example: ALOHA-CHI-001
+    ScenarioId:
+      name: scenarioId
+      in: path
+      required: true
+      description: Demo scenario identifier
+      schema:
+        type: string
+        example: walk-risk
+
+  responses:
+    Unauthorized:
+      description: Unauthorized - invalid, expired, or missing token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              message: Unauthorized
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              message: Internal server error
+    PropertyIdRequired:
+      description: The propertyId query parameter is required
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              message: propertyId is required
+    PropertyForbidden:
+      description: Caller not associated with the requested property
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              message: Not authorized for this property
+    OpsDataUnavailable:
+      description: Live operations data temporarily unavailable (Gateway degraded)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              message: Live operations data is temporarily unavailable
+              reason: gateway-timeout
+
+  schemas:
+    # -----------------------------------------------------------------------
+    # Enumerations (values match pulse.common.models exactly)
+    # -----------------------------------------------------------------------
+    AlertTier:
+      type: string
+      description: Severity classification of an alert
+      enum: [CRITICAL, WARNING, INFO]
+      example: CRITICAL
+
+    AlertStatus:
+      type: string
+      description: Lifecycle state of an alert (RESOLVED is terminal)
+      enum:
+        - UNACKNOWLEDGED
+        - ACKNOWLEDGED
+        - RESOLVED
+        - ESCALATED
+        - ESCALATION_EXHAUSTED
+      example: UNACKNOWLEDGED
+
+    AlertType:
+      type: string
+      description: The MVP alert types (UC-01 through UC-06)
+      enum:
+        - WALK_RISK
+        - VIP_ROOM_NOT_READY
+        - COMPLAINT_ESCALATION
+        - OOO_CLUSTER
+        - PREMIUM_CANCELLATION
+        - VIP_CHECKIN
+      example: WALK_RISK
+
+    EscalationStatus:
+      type: string
+      description: Whether an alert has been surfaced for mandatory GM review
+      enum: [NONE, MANDATORY_GM_REVIEW]
+      example: NONE
+
+    EscalationReason:
+      type: string
+      description: A reason an alert was flagged for mandatory GM review
+      enum:
+        - legal-safety
+        - vip-ambassador
+        - dollar-threshold
+        - low-confidence
+        - repeat-issue
+        - sla-or-eta
+        - manager-requested
+        - threshold-unavailable
+      example: dollar-threshold
+
+    ReviewRisk:
+      type: string
+      description: Discrete review-risk level on a complaint ranked option
+      enum: [Low, Medium, High]
+      example: Medium
+
+    ApprovalState:
+      type: string
+      description: State of the human-approval gate for a CRITICAL alert
+      enum: [PENDING, APPROVED, REJECTED]
+      example: PENDING
+
+    # -----------------------------------------------------------------------
+    # Error envelope (matches pulse.api.http.error_response)
+    # -----------------------------------------------------------------------
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - message
+          description: |
+            Error object. Always carries a human-readable `message`; individual
+            routes may add context fields such as `reason`, `missing`,
+            `invalidAttribute`, `scenarioId`, or `detail`.
+          properties:
+            message:
+              type: string
+              description: Human-readable error description
+              example: Alert not found
+            reason:
+              type: string
+              description: Machine-friendly reason (lifecycle/approval rejections, Gateway failures)
+              example: already-resolved
+            missing:
+              type: string
+              description: First missing required field (subscription validation)
+              example: endpoint
+            invalidAttribute:
+              type: string
+              description: Offending attribute name (rule-update validation)
+              example: escalationTimeoutSec
+            scenarioId:
+              type: string
+              description: Scenario id (unknown demo scenario)
+              example: not-a-scenario
+            detail:
+              type: string
+              description: Additional detail (invalid demo scenario action)
+              example: unsupported action
+          additionalProperties: true
+
+    # -----------------------------------------------------------------------
+    # Alert and nested triage/approval shapes
+    # -----------------------------------------------------------------------
+    SourceEntityRef:
+      type: object
+      description: Correlation pointer from an alert back to the operational record
+      properties:
+        table:
+          type: string
+          example: stayos-reservations
+        propertyId:
+          type: string
+          example: ALOHA-CHI-001
+        entityKey:
+          type: string
+          example: ALOHA-CHI-001#2026-08-17
+        ruleType:
+          $ref: "#/components/schemas/AlertType"
+
+    WalkableGuest:
+      type: object
+      description: A confirmed guest identified as walkable in a Walk Strategy
+      properties:
+        guestId:
+          type: string
+          example: ALH-MBR-00238471
+        loyaltyTier:
+          type: string
+          example: MEMBER
+        reservationId:
+          type: string
+          example: RES-CHI-99213
+
+    CompensationPackage:
+      type: object
+      description: A drafted compensation package for a single walkable guest
+      properties:
+        guestId:
+          type: string
+          example: ALH-MBR-00238471
+        description:
+          type: string
+          example: Sister-property night + transport + $150 F&B credit
+        estimatedCost:
+          type: number
+          format: float
+          description: Estimated cost in the property currency
+          example: 320.0
+
+    WalkStrategy:
+      type: object
+      description: A GM-approvable plan to relocate guests when a property is oversold
+      properties:
+        sisterPropertyId:
+          type: string
+          nullable: true
+          example: ALOHA-CHI-002
+        sisterPropertyAvailable:
+          type: boolean
+          example: true
+        walkableGuests:
+          type: array
+          items:
+            $ref: "#/components/schemas/WalkableGuest"
+        compensation:
+          type: array
+          items:
+            $ref: "#/components/schemas/CompensationPackage"
+
+    RankedOption:
+      type: object
+      description: A single GM-selectable action produced by the Triage Agent
+      required:
+        - label
+        - rank
+        - title
+        - detail
+      properties:
+        label:
+          type: string
+          description: Unique option label (A, B, C, ...)
+          example: A
+        rank:
+          type: integer
+          description: Unique 1-based rank position (1 = highest)
+          example: 1
+        title:
+          type: string
+          example: Walk 6 lowest-loyalty guests to ALOHA-CHI-002
+        detail:
+          type: string
+          example: Relocate 6 confirmed guests at or below the protection tier with full compensation.
+        recommended:
+          type: boolean
+          description: Whether this is the single recommended option
+          example: true
+        estimatedCost:
+          type: number
+          format: float
+          nullable: true
+          description: Numeric cost in the property currency (complaint options)
+          example: 1920.0
+        reviewRisk:
+          allOf:
+            - $ref: "#/components/schemas/ReviewRisk"
+          nullable: true
+          description: Discrete review-risk level (complaint options)
+
+    TriageBrief:
+      type: object
+      description: Agent-generated decision package for a CRITICAL or WARNING alert
+      required:
+        - summary
+        - confidence
+      properties:
+        summary:
+          type: string
+          description: Situation summary (1-500 chars)
+          example: Property oversold by 6 rooms for tonight; walk the 6 lowest-loyalty confirmed guests.
+        confidence:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Integer confidence percentage
+          example: 88
+        options:
+          type: array
+          description: Ranked options, ordered highest to lowest rank (2-5)
+          items:
+            $ref: "#/components/schemas/RankedOption"
+        walkStrategy:
+          allOf:
+            - $ref: "#/components/schemas/WalkStrategy"
+          nullable: true
+          description: Present for Walk Risk alerts
+        executeLabel:
+          type: string
+          nullable: true
+          description: Optional label for the approval action control
+          example: Approve walk strategy
+
+    ApprovalRecord:
+      type: object
+      description: The human-approval gate state recorded on an alert
+      properties:
+        state:
+          $ref: "#/components/schemas/ApprovalState"
+        selectedOption:
+          type: string
+          nullable: true
+          example: A
+        decidedBy:
+          type: string
+          nullable: true
+          example: jsmith
+        decidedAt:
+          type: string
+          format: date-time
+          nullable: true
+          example: "2026-08-17T07:12:04Z"
+
+    Alert:
+      type: object
+      description: A persisted PULSE alert (the pulse-alerts item)
+      required:
+        - alertId
+        - propertyId
+        - tier
+        - type
+        - title
+        - detail
+        - status
+        - createdAt
+      properties:
+        alertId:
+          type: string
+          example: alert-8f2c
+        propertyId:
+          type: string
+          example: ALOHA-CHI-001
+        tier:
+          $ref: "#/components/schemas/AlertTier"
+        type:
+          $ref: "#/components/schemas/AlertType"
+        title:
+          type: string
+          description: 1-200 characters
+          example: "Walk Risk - oversold by 6 rooms"
+        detail:
+          type: string
+          description: 1-2000 characters
+          example: "374 confirmed vs 368 available for 2026-08-17. Shortfall of 6."
+        status:
+          $ref: "#/components/schemas/AlertStatus"
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-08-17T06:58:11Z"
+        dedupeKey:
+          type: string
+          example: WALK_RISK#ALOHA-CHI-001#2026-08-17
+        sourceEntityRef:
+          $ref: "#/components/schemas/SourceEntityRef"
+        gmAlias:
+          type: string
+          nullable: true
+          example: jsmith
+        triageBrief:
+          allOf:
+            - $ref: "#/components/schemas/TriageBrief"
+          nullable: true
+        escalationStatus:
+          $ref: "#/components/schemas/EscalationStatus"
+        escalationReasons:
+          type: array
+          items:
+            $ref: "#/components/schemas/EscalationReason"
+        escalationChain:
+          type: array
+          description: Ordered recipient aliases [GM, AGM, MOD]
+          items:
+            type: string
+          example: [jsmith, agm-chi, mod-chi]
+        escalationPosition:
+          type: integer
+          description: 0-based index of the current recipient
+          example: 0
+        escalationTimeoutMin:
+          type: integer
+          nullable: true
+          example: 5
+        escalationNextCheckAt:
+          type: string
+          format: date-time
+          nullable: true
+          example: "2026-08-17T07:03:11Z"
+        incompleteInputData:
+          type: boolean
+          example: false
+        acknowledgedBy:
+          type: string
+          nullable: true
+        acknowledgedAt:
+          type: string
+          format: date-time
+          nullable: true
+        resolvedBy:
+          type: string
+          nullable: true
+        resolvedAt:
+          type: string
+          format: date-time
+          nullable: true
+        approval:
+          $ref: "#/components/schemas/ApprovalRecord"
+        lastStatusChangeAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    # -----------------------------------------------------------------------
+    # Response / request envelopes
+    # -----------------------------------------------------------------------
+    AlertListResponse:
+      type: object
+      required:
+        - alerts
+        - count
+      properties:
+        alerts:
+          type: array
+          items:
+            $ref: "#/components/schemas/Alert"
+        count:
+          type: integer
+          example: 3
+
+    AlertDetailResponse:
+      type: object
+      required:
+        - alert
+      properties:
+        alert:
+          $ref: "#/components/schemas/Alert"
+
+    StatusTransitionResponse:
+      type: object
+      required:
+        - alertId
+        - status
+      properties:
+        alertId:
+          type: string
+          example: alert-8f2c
+        status:
+          $ref: "#/components/schemas/AlertStatus"
+
+    ApprovalRequest:
+      type: object
+      required:
+        - decision
+      properties:
+        decision:
+          type: string
+          enum: [approve, reject]
+          description: The approval decision (case-insensitive)
+          example: approve
+        selectedOption:
+          type: string
+          nullable: true
+          description: Approved ranked-option label (required to approve when the brief has options)
+          example: A
+
+    ApprovalResponse:
+      type: object
+      required:
+        - accepted
+        - approvalState
+        - executed
+      properties:
+        accepted:
+          type: boolean
+          example: true
+        approvalState:
+          $ref: "#/components/schemas/ApprovalState"
+        selectedOption:
+          type: string
+          nullable: true
+          example: A
+        executed:
+          type: boolean
+          description: Whether the Action Executor ran the write-back (true only on accepted approval)
+          example: true
+        execution:
+          type: object
+          description: Action Executor summary (present when a decision executes)
+          additionalProperties: true
+          example:
+            executed: true
+            resolvedAlertId: alert-8f2c
+
+    RuleDefinition:
+      type: object
+      description: A persisted pulse-rules item
+      required:
+        - propertyId
+        - ruleType
+        - tier
+        - triggerCondition
+        - agentTriageEnabled
+        - escalationTimeoutSec
+        - enabled
+      properties:
+        propertyId:
+          type: string
+          example: ALOHA-CHI-001
+        ruleType:
+          $ref: "#/components/schemas/AlertType"
+        tier:
+          $ref: "#/components/schemas/AlertTier"
+        triggerCondition:
+          $ref: "#/components/schemas/TriggerCondition"
+        parameters:
+          type: object
+          description: Rule-type-specific thresholds
+          additionalProperties: true
+          example:
+            loyaltyProtectionTier: Gold
+        agentTriageEnabled:
+          type: boolean
+          example: true
+        escalationTimeoutSec:
+          type: integer
+          minimum: 60
+          maximum: 86400
+          description: Stored escalation timeout in seconds (inclusive range)
+          example: 300
+        enabled:
+          type: boolean
+          example: true
+        updatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        updatedBy:
+          type: string
+          nullable: true
+
+    TriggerCondition:
+      type: object
+      description: Declarative, non-eval trigger-condition model
+      properties:
+        operator:
+          type: string
+          description: Comparison operator (e.g. gt, gte, eq, lte, overlaps)
+          example: gt
+        left:
+          type: string
+          example: reservations.confirmed
+        right:
+          description: Operand (string reference or literal value)
+          example: rooms.available
+      additionalProperties: true
+
+    RulesListResponse:
+      type: object
+      required:
+        - rules
+        - count
+      properties:
+        rules:
+          type: array
+          items:
+            $ref: "#/components/schemas/RuleDefinition"
+        count:
+          type: integer
+          example: 6
+
+    RuleUpdate:
+      type: object
+      description: |
+        Rule-definition update body. `propertyId` and `ruleType` are taken from
+        the composite `{ruleId}` path and need not be repeated in the body.
+      required:
+        - tier
+        - triggerCondition
+        - agentTriageEnabled
+        - escalationTimeoutSec
+        - enabled
+      properties:
+        tier:
+          $ref: "#/components/schemas/AlertTier"
+        triggerCondition:
+          $ref: "#/components/schemas/TriggerCondition"
+        parameters:
+          type: object
+          additionalProperties: true
+        agentTriageEnabled:
+          type: boolean
+        escalationTimeoutSec:
+          type: integer
+          minimum: 60
+          maximum: 86400
+        enabled:
+          type: boolean
+
+    RuleUpdateResponse:
+      type: object
+      required:
+        - accepted
+        - rule
+      properties:
+        accepted:
+          type: boolean
+          example: true
+        rule:
+          $ref: "#/components/schemas/RuleDefinition"
+
+    PushSubscriptionRequest:
+      type: object
+      required:
+        - endpoint
+        - p256dh
+        - auth
+      properties:
+        endpoint:
+          type: string
+          format: uri
+          description: The push service endpoint URL
+          example: https://web.push.apple.com/Qf...
+        p256dh:
+          type: string
+          description: Client public key (base64url)
+          example: BPx...
+        auth:
+          type: string
+          description: Client auth secret (base64url)
+          example: k9d...
+
+    PushSubscriptionResponse:
+      type: object
+      required:
+        - registered
+        - endpointHash
+      properties:
+        registered:
+          type: boolean
+          example: true
+        endpointHash:
+          type: string
+          description: SHA-256 hash of the endpoint (stable sort key)
+          example: 3b1f9a...c7
+
+    VapidPublicKeyResponse:
+      type: object
+      required:
+        - publicKey
+      properties:
+        publicKey:
+          type: string
+          description: VAPID application server public key
+          example: BPx...
+
+    RealtimeConfigResponse:
+      type: object
+      required:
+        - httpEndpoint
+        - wssEndpoint
+        - namespace
+      properties:
+        httpEndpoint:
+          type: string
+          description: AppSync Events HTTP publish endpoint
+          example: https://abc123.appsync-api.us-east-1.amazonaws.com/event
+        wssEndpoint:
+          type: string
+          description: AppSync Events WebSocket subscribe endpoint
+          example: wss://abc123.appsync-realtime-api.us-east-1.amazonaws.com/event
+        namespace:
+          type: string
+          description: The PULSE channel namespace
+          example: pulse
+
+    VipGuest:
+      type: object
+      description: A VIP guest profile (sensitive notes stripped)
+      properties:
+        guestId:
+          type: string
+          example: ALH-MBR-00238471
+        guestName:
+          type: string
+          example: David Chen
+        initials:
+          type: string
+          example: DC
+        loyaltyTier:
+          type: string
+          example: AMBASSADOR
+        totalStays:
+          type: integer
+          example: 47
+        roomNumber:
+          type: string
+          example: "2401"
+        roomType:
+          type: string
+          example: SUITE
+        specialOccasion:
+          type: string
+          nullable: true
+          example: ANNIVERSARY
+        preferences:
+          type: array
+          items:
+            type: string
+          example: [HIGH_FLOOR, FEATHER_FREE_BEDDING]
+        accountType:
+          type: string
+          example: PERSONAL
+      additionalProperties: true
+
+    TierGroup:
+      type: object
+      description: VIP guests grouped under one loyalty tier
+      required:
+        - tier
+        - count
+        - guests
+      properties:
+        tier:
+          type: string
+          example: AMBASSADOR
+        count:
+          type: integer
+          example: 3
+        guests:
+          type: array
+          items:
+            $ref: "#/components/schemas/VipGuest"
+
+    VipsResponse:
+      type: object
+      required:
+        - propertyId
+        - vipCount
+        - tiers
+      properties:
+        propertyId:
+          type: string
+          example: ALOHA-CHI-001
+        date:
+          type: string
+          format: date
+          nullable: true
+          example: "2026-08-17"
+        vipCount:
+          type: integer
+          example: 7
+        tiers:
+          type: array
+          items:
+            $ref: "#/components/schemas/TierGroup"
+
+    WorkOrderCard:
+      type: object
+      description: The work-order status joined onto an OOO room card
+      nullable: true
+      properties:
+        workOrderId:
+          type: string
+          example: WO-CHI-0146
+        status:
+          type: string
+          example: IN_PROGRESS
+        priority:
+          type: string
+          example: HIGH
+        issueType:
+          type: string
+          example: IT_NETWORK
+        assignedTo:
+          type: string
+          example: eng-team-2
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-08-17T05:14:00Z"
+        estimatedResolutionHours:
+          type: integer
+          example: 3
+
+    OooRoomCard:
+      type: object
+      description: An out-of-order room card annotated with its work-order status
+      properties:
+        roomNumber:
+          type: string
+          example: "2102"
+        roomType:
+          type: string
+          example: KING_DELUXE
+        status:
+          type: string
+          example: OUT_OF_ORDER
+        floor:
+          type: integer
+          example: 21
+        view:
+          type: string
+          example: LAKE
+        isPremiumRoom:
+          type: boolean
+          example: true
+        workOrder:
+          $ref: "#/components/schemas/WorkOrderCard"
+
+    Facility:
+      type: object
+      description: Facility summary for the Ops tab
+      properties:
+        occupancyPct:
+          type: integer
+          example: 87
+        arrivalsTotal:
+          type: integer
+          example: 142
+        departuresTotal:
+          type: integer
+          example: 118
+        confirmedReservations:
+          type: integer
+          example: 374
+        availableRooms:
+          type: integer
+          example: 368
+        oooCount:
+          type: integer
+          example: 4
+        openWorkOrders:
+          type: integer
+          example: 6
+
+    GroupCheckout:
+      type: object
+      description: Group-checkout summary for the Ops tab
+      properties:
+        departuresTotal:
+          type: integer
+          example: 118
+        availableRooms:
+          type: integer
+          example: 368
+        confirmedReservations:
+          type: integer
+          example: 374
+
+    OpsResponse:
+      type: object
+      required:
+        - propertyId
+        - facility
+        - oooRooms
+        - groupCheckout
+      properties:
+        propertyId:
+          type: string
+          example: ALOHA-CHI-001
+        date:
+          type: string
+          format: date
+          nullable: true
+          example: "2026-08-17"
+        facility:
+          $ref: "#/components/schemas/Facility"
+        oooRooms:
+          type: array
+          items:
+            $ref: "#/components/schemas/OooRoomCard"
+        groupCheckout:
+          $ref: "#/components/schemas/GroupCheckout"
+
+    DemoScenarioResponse:
+      type: object
+      description: Summary of a demo scenario mutation (demo-only)
+      required:
+        - scenarioId
+        - action
+        - operation
+        - tableKind
+        - expectedAlertType
+      properties:
+        scenarioId:
+          type: string
+          example: walk-risk
+        action:
+          type: string
+          enum: [run, reset]
+          example: run
+        operation:
+          type: string
+          description: The DynamoDB operation applied (INSERT / MODIFY / REMOVE)
+          example: MODIFY
+        tableKind:
+          type: string
+          description: The operational table kind mutated
+          example: reservations
+        expectedAlertType:
+          $ref: "#/components/schemas/AlertType"

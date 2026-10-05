@@ -1,0 +1,278 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  StayOS LUMI feature - GM Daily Intelligence Brief. Root stack orchestrating
+  5 nested stacks (data, auth, compute, voice, chat).
+
+Parameters:
+  StackPrefix:
+    Type: String
+    Default: stayos
+    Description: Prefix for all resource names
+
+  AccountId:
+    Type: String
+    Description: AWS account ID for globally unique resource names (S3 buckets)
+
+  SpogApiEndpoint:
+    Type: String
+    Default: "https://spog-api.aloha.example.com"
+    Description: SPOG API base URL
+
+  MdpApiEndpoint:
+    Type: String
+    Default: "https://mdp-api.aloha.example.com"
+    Description: MDP API base URL
+
+  BedrockModelId:
+    Type: String
+    Default: "us.anthropic.claude-sonnet-4-6"
+    Description: Bedrock foundation model ID for brief generation
+
+  AppPassword:
+    Type: String
+    Description: Password for seed GM accounts (required - pass via parameter-overrides)
+    NoEcho: true
+
+  DependenciesLayerS3Key:
+    Type: String
+    Description: Build-input-fingerprinted S3 key for the Python 3.12 x86_64 dependency layer
+
+Resources:
+  # -----------------------------------------------------------------
+  # Data: S3 buckets, CloudFront distributions, DynamoDB tables,
+  # Secrets Manager secrets. Consolidates storage, dataset, WAF, and
+  # AI stacks into a single data layer with no dependencies.
+  # -----------------------------------------------------------------
+  DataStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: nested-stacks/data.yaml
+      Parameters:
+        StackPrefix: !Ref StackPrefix
+        AccountId: !Ref AccountId
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: data
+
+  # -----------------------------------------------------------------
+  # Auth: Cognito User Pool and App Client.
+  # No dependencies - can be created in parallel with DataStack.
+  # -----------------------------------------------------------------
+  AuthStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: nested-stacks/auth.yaml
+      Parameters:
+        StackPrefix: !Ref StackPrefix
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: auth
+
+  # -----------------------------------------------------------------
+  # Compute: Lambda functions, IAM roles, API Gateway, EventBridge rule.
+  # Depends on DataStack (table ARNs, bucket names, secret ARNs) and
+  # AuthStack (User Pool ARN, Client ID) for parameter inputs.
+  # -----------------------------------------------------------------
+  ComputeStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: nested-stacks/compute.yaml
+      Parameters:
+        StackPrefix: !Ref StackPrefix
+        AccountId: !Ref AccountId
+        BriefsTableName: !GetAtt DataStack.Outputs.BriefsTableName
+        BriefsTableArn: !GetAtt DataStack.Outputs.BriefsTableArn
+        SettingsTableName: !GetAtt DataStack.Outputs.SettingsTableName
+        SettingsTableArn: !GetAtt DataStack.Outputs.SettingsTableArn
+        AudioBucketName: !GetAtt DataStack.Outputs.AudioBucketName
+        AudioDistributionDomain: !GetAtt DataStack.Outputs.AudioDistributionDomain
+        FrontendDistributionDomain: !GetAtt DataStack.Outputs.FrontendDistributionDomain
+        UserPoolId: !GetAtt AuthStack.Outputs.UserPoolId
+        UserPoolArn: !GetAtt AuthStack.Outputs.UserPoolArn
+        UserPoolClientId: !GetAtt AuthStack.Outputs.UserPoolClientId
+        ReservationsTableName: !GetAtt DataStack.Outputs.ReservationsTableName
+        ReservationsTableArn: !GetAtt DataStack.Outputs.ReservationsTableArn
+        RoomsTableName: !GetAtt DataStack.Outputs.RoomsTableName
+        RoomsTableArn: !GetAtt DataStack.Outputs.RoomsTableArn
+        GuestsTableName: !GetAtt DataStack.Outputs.GuestsTableName
+        GuestsTableArn: !GetAtt DataStack.Outputs.GuestsTableArn
+        RevenuesTableName: !GetAtt DataStack.Outputs.RevenuesTableName
+        RevenuesTableArn: !GetAtt DataStack.Outputs.RevenuesTableArn
+        WorkOrdersTableName: !GetAtt DataStack.Outputs.WorkOrdersTableName
+        WorkOrdersTableArn: !GetAtt DataStack.Outputs.WorkOrdersTableArn
+        DeployBucket: !Sub "${StackPrefix}-deploy-${AccountId}"
+        DependenciesLayerS3Key: !Ref DependenciesLayerS3Key
+        BedrockModelId: !Ref BedrockModelId
+        SpogApiEndpoint: !Ref SpogApiEndpoint
+        MdpApiEndpoint: !Ref MdpApiEndpoint
+        SpogSecretArn: !GetAtt DataStack.Outputs.SpogSecretArn
+        MdpSecretArn: !GetAtt DataStack.Outputs.MdpSecretArn
+        AppPassword: !Ref AppPassword
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: compute
+
+  # -----------------------------------------------------------------
+  # Voice: Amazon Bedrock AgentCore Runtime for the LUMI voice agent.
+  # Includes Cognito Identity Pool (for frontend SigV4 auth),
+  # IAM execution role, ECR repository, and CodeBuild project.
+  # Depends on DataStack (table names/ARNs) and AuthStack (UserPoolId,
+  # ClientId) for parameter inputs.
+  # -----------------------------------------------------------------
+  VoiceStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: nested-stacks/voice.yaml
+      Parameters:
+        StackPrefix: !Ref StackPrefix
+        AccountId: !Ref AccountId
+        ReservationsTableName: !GetAtt DataStack.Outputs.ReservationsTableName
+        ReservationsTableArn: !GetAtt DataStack.Outputs.ReservationsTableArn
+        RoomsTableName: !GetAtt DataStack.Outputs.RoomsTableName
+        RoomsTableArn: !GetAtt DataStack.Outputs.RoomsTableArn
+        GuestsTableName: !GetAtt DataStack.Outputs.GuestsTableName
+        GuestsTableArn: !GetAtt DataStack.Outputs.GuestsTableArn
+        RevenuesTableName: !GetAtt DataStack.Outputs.RevenuesTableName
+        RevenuesTableArn: !GetAtt DataStack.Outputs.RevenuesTableArn
+        WorkOrdersTableName: !GetAtt DataStack.Outputs.WorkOrdersTableName
+        WorkOrdersTableArn: !GetAtt DataStack.Outputs.WorkOrdersTableArn
+        SettingsTableName: !GetAtt DataStack.Outputs.SettingsTableName
+        SettingsTableArn: !GetAtt DataStack.Outputs.SettingsTableArn
+        BriefsTableName: !GetAtt DataStack.Outputs.BriefsTableName
+        BriefsTableArn: !GetAtt DataStack.Outputs.BriefsTableArn
+        UserPoolId: !GetAtt AuthStack.Outputs.UserPoolId
+        CognitoClientId: !GetAtt AuthStack.Outputs.UserPoolClientId
+        DeployBucket: !Sub "${StackPrefix}-deploy-${AccountId}"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: voice
+
+  # -----------------------------------------------------------------
+  # Chat: AgentCore Gateway tools (Tool Lambda) and chat agent
+  # infrastructure for the LUMI text chat agent. Includes Tool Lambda
+  # for the 5 read-only hotel operations tools, chat agent ECR
+  # repository, CodeBuild project, AgentCore execution role, and
+  # regional WAFv2 WebACL for Gateway protection.
+  # Depends on DataStack (table names/ARNs) and AuthStack (UserPoolId,
+  # ClientId) for parameter inputs.
+  # -----------------------------------------------------------------
+  ChatStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: nested-stacks/chat.yaml
+      Parameters:
+        StackPrefix: !Ref StackPrefix
+        AccountId: !Ref AccountId
+        DependenciesLayerArn: !GetAtt ComputeStack.Outputs.DependenciesLayerArn
+        ReservationsTableName: !GetAtt DataStack.Outputs.ReservationsTableName
+        ReservationsTableArn: !GetAtt DataStack.Outputs.ReservationsTableArn
+        RoomsTableName: !GetAtt DataStack.Outputs.RoomsTableName
+        RoomsTableArn: !GetAtt DataStack.Outputs.RoomsTableArn
+        GuestsTableName: !GetAtt DataStack.Outputs.GuestsTableName
+        GuestsTableArn: !GetAtt DataStack.Outputs.GuestsTableArn
+        RevenuesTableName: !GetAtt DataStack.Outputs.RevenuesTableName
+        RevenuesTableArn: !GetAtt DataStack.Outputs.RevenuesTableArn
+        WorkOrdersTableName: !GetAtt DataStack.Outputs.WorkOrdersTableName
+        WorkOrdersTableArn: !GetAtt DataStack.Outputs.WorkOrdersTableArn
+        BriefsTableName: !GetAtt DataStack.Outputs.BriefsTableName
+        BriefsTableArn: !GetAtt DataStack.Outputs.BriefsTableArn
+        UserPoolId: !GetAtt AuthStack.Outputs.UserPoolId
+        CognitoClientId: !GetAtt AuthStack.Outputs.UserPoolClientId
+        DeployBucket: !Sub "${StackPrefix}-deploy-${AccountId}"
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: resilience-tier
+          Value: standard
+        - Key: Component
+          Value: chat
+
+# -------------------------------------------------------------------
+# Outputs
+# Key values needed for deployment scripts, frontend configuration,
+# and Makefile variables.
+# -------------------------------------------------------------------
+Outputs:
+  FrontendBucketName:
+    Description: S3 bucket for frontend static assets (used by make deploy-frontend)
+    Value: !GetAtt DataStack.Outputs.FrontendBucketName
+
+  FrontendDistributionId:
+    Description: CloudFront distribution ID (for cache invalidation in Makefile)
+    Value: !GetAtt DataStack.Outputs.FrontendDistributionId
+
+  FrontendUrl:
+    Description: Frontend CloudFront URL
+    Value: !Sub "https://${DataStack.Outputs.FrontendDistributionDomain}"
+
+  ApiGatewayUrl:
+    Description: API Gateway base URL (used by frontend NEXT_PUBLIC_API_URL)
+    Value: !GetAtt ComputeStack.Outputs.ApiGatewayUrl
+
+  AudioDistributionDomain:
+    Description: Audio CloudFront domain for MP3 streaming
+    Value: !GetAtt DataStack.Outputs.AudioDistributionDomain
+
+  UserPoolId:
+    Description: Cognito User Pool ID (for frontend auth config)
+    Value: !GetAtt AuthStack.Outputs.UserPoolId
+
+  UserPoolClientId:
+    Description: Cognito App Client ID (for frontend auth config)
+    Value: !GetAtt AuthStack.Outputs.UserPoolClientId
+
+  VoiceIdentityPoolId:
+    Description: Cognito Identity Pool ID for frontend SigV4 WebSocket auth
+    Value: !GetAtt VoiceStack.Outputs.VoiceIdentityPoolId
+
+  VoiceAgentCoreRoleArn:
+    Description: IAM role ARN for AgentCore agent container
+    Value: !GetAtt VoiceStack.Outputs.VoiceAgentCoreRoleArn
+
+  VoiceAgentEcrRepoUri:
+    Description: ECR repository URI for voice agent container images
+    Value: !GetAtt VoiceStack.Outputs.VoiceAgentEcrRepoUri
+
+  VoiceAgentBuildProjectName:
+    Description: CodeBuild project name for voice agent container builds
+    Value: !GetAtt VoiceStack.Outputs.VoiceAgentBuildProjectName
+
+  ChatAgentCoreRoleArn:
+    Description: IAM role ARN for chat agent AgentCore container execution
+    Value: !GetAtt ChatStack.Outputs.ChatAgentCoreRoleArn
+
+  ChatAgentEcrRepoUri:
+    Description: ECR repository URI for chat agent container images
+    Value: !GetAtt ChatStack.Outputs.ChatAgentEcrRepoUri
+
+  ChatAgentBuildProjectName:
+    Description: CodeBuild project name for chat agent container builds
+    Value: !GetAtt ChatStack.Outputs.ChatAgentBuildProjectName
+
+  ToolLambdaName:
+    Description: Name of the Tool Lambda function for code deployment
+    Value: !GetAtt ChatStack.Outputs.ToolLambdaName
+
+  ToolLambdaArn:
+    Description: ARN of the Tool Lambda function for Gateway target registration
+    Value: !GetAtt ChatStack.Outputs.ToolLambdaArn
+
+  GatewayWafWebAclArn:
+    Description: WAFv2 WebACL ARN for association with AgentCore Gateway
+    Value: !GetAtt ChatStack.Outputs.GatewayWafWebAclArn
