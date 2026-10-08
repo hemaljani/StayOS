@@ -48,6 +48,12 @@ self.addEventListener('fetch', (event) => {
   const { request } = event;
   const url = new URL(request.url);
 
+  // Browser extensions can inject requests that the Cache API cannot store.
+  // Leave unsupported schemes and non-GET operations to the browser network.
+  if (!['http:', 'https:'].includes(url.protocol) || request.method !== 'GET') {
+    return;
+  }
+
   // HTML documents (navigations): always network-first with no cached-HTML
   // fallback, so a new deploy / auth change is served immediately and the SW
   // never pins a stale app shell.

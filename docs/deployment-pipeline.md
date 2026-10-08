@@ -26,6 +26,7 @@ and write, see [`data-model.md`](data-model.md).
 - [Parameters and configuration](#parameters-and-configuration)
 - [Deployment output and logs](#deployment-output-and-logs)
 - [How the root Makefile is structured](#how-the-root-makefile-is-structured)
+- [Focused voice upgrade](#focused-voice-upgrade)
 - [Failure recovery](#failure-recovery)
 - [Teardown](#teardown)
   - [Why the order reverses](#why-the-order-reverses)
@@ -403,6 +404,99 @@ Run `make help` from the repo root for the full target list. Each feature's own
 <div align="right"><a href="#contents">↑ Back to top</a></div>
 
 ---
+
+## Focused voice upgrade
+
+Use this target to upgrade an existing LUMI voice deployment to Nova Sonic 2.5
+(`amazon.nova-2-5-sonic`) without deploying the rest of the platform:
+
+```bash
+make lumi-voice-upgrade \
+  PROFILE=my-profile CLOUDFORMATION_PROFILE=my-cfn-profile \
+  REGION=us-east-1 EXPECTED_ACCOUNT_ID=<target-account-id>
+```
+
+Both profiles must resolve to the expected account. The target runs root
+`make plan`, checks the model's active status and availability/authorization,
+and requires the parent stack, voice nested stack, runtime, and DEFAULT
+endpoint to exist and be stable. It uses Python with PyYAML, also used by the
+local CloudFormation validation tooling.
+
+Before building, it saves the deployed templates, runtime version, runtime
+configuration, and previous image digest under `logs/voice-upgrade-<timestamp>/`.
+No CloudFormation parameter values are saved. If the runtime uses a mutable
+image tag that changed after its last update, it stops because a reliable
+rollback digest cannot be established.
+
+The existing voice CodeBuild project builds first. The runner changes only the
+Sonic model ARNs in the deployed voice template, preserving the IAM actions
+and region scope. It previews the nested IAM role modification, then changes
+only the parent `VoiceStack` template URL. Other nested template references
+stay unchanged. Both previews use `aws cloudformation deploy
+--no-execute-changeset`; additions, deletions, replacements, unrelated resource
+changes, and parameter overrides are rejected before execution. All existing
+parameters, including `AppPassword`, use their previous values. Temporary
+packaging files stay under the ignored logs directory; no new source template,
+stack, or resource is created.
+
+CloudFormation may list unchanged nested stack wrappers with `Automatic`
+changes in the parent preview. An additional `create-change-set` preview with
+`IncludeNestedStacks` verifies that the only underlying resource change is
+`VoiceAgentCoreRole`; any change inside another nested stack stops the run.
+This hierarchy preview is deleted without execution. The actual deployment
+executes the reviewed change set created by `aws cloudformation deploy`.
+
+The runner updates the existing runtime with the new digest-pinned container,
+preserves its configuration, and waits for both the runtime and DEFAULT
+endpoint to be READY at the new version. It does not rebuild chat/PULSE agents,
+publish frontends, reset passwords, or seed data. A short voice interruption
+is possible while the policy and runtime updates are applied.
+
+The voice image uses the GA Strands BidiAgent provider with explicitly pinned
+Nova Sonic 2.5 and compatible transport dependencies. This focused target still
+does not publish browser changes. When a voice change needs browser updates,
+validate and publish only LUMI through its existing frontend targets, with a
+separate review of that publication scope.
+
+For a standalone frontend update, run `lumi-write-frontend-env` before
+`lumi-build-frontend`, then `lumi-deploy-frontend` and `lumi-invalidate-cdn`
+with the same explicit deployment profiles and region. The publish target
+uploads the existing build; it does not regenerate configuration. Stale
+settings can reject the shared login and cause a redirect loop. A full LUMI
+deploy already regenerates these settings before building.
+
+Use `make lumi-voice-description` with the same explicit profiles, region, and
+expected account to apply the voice-stack description independently. It previews
+only role metadata changes, preserves resource properties and parameters, and
+does not build images or update the runtime.
+
+Existing stack tags are explicitly preserved. If a preview stops after a
+successful build, rerun the upgrade with `VOICE_BASELINE` pointing to that
+run's directory. The saved digest is reused only when the voice source
+fingerprint still matches; this avoids another build and keeps the original
+rollback image available after the `latest` tag has moved.
+
+Readiness is only the deployment check. Sign in and test connection, spoken
+responses and transcripts, property-scoped occupancy/VIP tools, follow-up
+context, interruption, shutdown, and reconnection using a live microphone.
+Correlate the sessions with runtime logs showing `amazon.nova-2-5-sonic` and
+check for model-access, validation, and streaming errors. Also smoke-test the
+shell and PULSE.
+
+If a stack/runtime update fails, the runner attempts to restore the saved
+voice policy and image digest. For a failed functional test, use the saved
+baseline directory explicitly:
+
+```bash
+make lumi-voice-rollback VOICE_BASELINE=/absolute/path/to/logs/voice-upgrade-<timestamp> \
+  PROFILE=my-profile CLOUDFORMATION_PROFILE=my-cfn-profile \
+  REGION=us-east-1 EXPECTED_ACCOUNT_ID=<target-account-id>
+```
+
+Rollback updates the existing parent stack through the same guarded
+CloudFormation deploy preview and restores the old image as a new runtime
+version. Verify the previous voice functionality with the microphone before
+calling rollback complete.
 
 ## Failure recovery
 

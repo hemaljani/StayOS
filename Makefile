@@ -58,6 +58,10 @@ help:
 	@echo "  make shell-<target>   run <target> in stayos-shell/ (test, lint, build-frontend, deploy, ...)"
 	@echo "  make data-<target>    run <target> in shared/data-orchestrator/ (deploy, test, validate, destroy, ...)"
 	@echo "  make plan             inspect config, account, stacks, and stages without changing AWS"
+	@echo "  make lumi-voice-upgrade"
+	@echo "                        upgrade only the existing voice policy and runtime; explicit profiles required"
+	@echo "  make lumi-voice-rollback VOICE_BASELINE=..."
+	@echo "                        restore the saved voice template and pinned image"
 	@echo "  make deploy-all       deploy LUMI, then deploy PULSE with LUMI's outputs threaded in"
 	@echo "                        requires APP_PASSWORD=...; honors PROFILE, REGION, ENVIRONMENT,"
 	@echo "                        EXPECTED_ACCOUNT_ID, CLOUDFORMATION_PROFILE, and stack prefixes"
@@ -536,6 +540,7 @@ destroy-all: deployment-preflight
 
 tools-test:
 	@python3 -m unittest discover -s tools/tests -v
+	@PYTHONPATH=tools python3 -m pytest tools/tests/test_voice_upgrade.py -q
 
 auth-check:
 	@echo "Testing and type-checking shared/auth..."

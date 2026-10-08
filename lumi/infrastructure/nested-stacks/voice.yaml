@@ -1,10 +1,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: >
-  StayOS Voice Stack - Amazon Bedrock AgentCore Runtime infrastructure for the
-  voice agent. Provides Cognito Identity Pool for SigV4 browser authentication,
-  IAM execution role for the AgentCore container, and CloudWatch log group.
-  Replaces the previous ECS Fargate stack (VPC, ALB, CloudFront, ECS, ECR).
-  Supports REQ-2.1, REQ-2.2, REQ-3.1 through REQ-3.6, REQ-4.1 through REQ-4.7.
+Description: >-
+  StayOS LUMI voice - browser authentication, AgentCore permissions, and logging.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
 
 # -------------------------------------------------------------------
 # Parameters
@@ -171,6 +171,10 @@ Resources:
   # -----------------------------------------------------------------
   VoiceAgentCoreRole:
     Type: AWS::IAM::Role
+    # Resource metadata lets CloudFormation apply description-only updates.
+    Metadata:
+      StayOSDescription: >-
+        StayOS LUMI voice - browser authentication, AgentCore permissions, and logging.
     Properties:
       RoleName: !Sub "${StackPrefix}-voice-agentcore-role-${AWS::Region}"
       AssumeRolePolicyDocument:
@@ -181,7 +185,8 @@ Resources:
               Service: bedrock-agentcore.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        # Bedrock model invocation for Nova Sonic bidirectional streaming
+        # Nova Sonic 2.5 uses the existing streaming actions and regional scope.
+        # Model upgrades must preserve the other execution-role permissions.
         - PolicyName: BedrockNovaSonicStreaming
           PolicyDocument:
             Version: "2012-10-17"
@@ -191,8 +196,8 @@ Resources:
                   - bedrock:InvokeModel
                   - bedrock:InvokeModelWithResponseStream
                 Resource:
-                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.nova-2-sonic-v1:0"
-                  - "arn:aws:bedrock:*::foundation-model/amazon.nova-2-sonic-v1:0"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.nova-2-5-sonic"
+                  - "arn:aws:bedrock:*::foundation-model/amazon.nova-2-5-sonic"
         # Read-only access to the five dataset tables and their GSIs
         - PolicyName: DynamoDBDatasetRead
           PolicyDocument:

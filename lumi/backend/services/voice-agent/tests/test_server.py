@@ -69,37 +69,6 @@ sys.modules.setdefault(
     "bedrock_agentcore.runtime.models", _mock_agentcore_runtime_models_module
 )
 
-# Mock the Smithy-based Bedrock runtime SDK modules
-_mock_bedrock_client_module = ModuleType("aws_sdk_bedrock_runtime.client")
-_mock_bedrock_client_module.BedrockRuntimeClient = MagicMock
-_mock_bedrock_client_module.InvokeModelWithBidirectionalStreamOperationInput = (
-    MagicMock
-)
-
-_mock_bedrock_config_module = ModuleType("aws_sdk_bedrock_runtime.config")
-_mock_bedrock_config_module.Config = MagicMock
-
-_mock_bedrock_models_module = ModuleType("aws_sdk_bedrock_runtime.models")
-_mock_bedrock_models_module.BidirectionalInputPayloadPart = MagicMock
-_mock_bedrock_models_module.InvokeModelWithBidirectionalStreamInputChunk = MagicMock
-
-_mock_smithy_module = ModuleType("smithy_aws_core")
-_mock_smithy_identity_module = ModuleType("smithy_aws_core.identity")
-_mock_smithy_env_module = ModuleType("smithy_aws_core.identity.environment")
-_mock_smithy_env_module.EnvironmentCredentialsResolver = MagicMock
-
-sys.modules.setdefault(
-    "aws_sdk_bedrock_runtime", ModuleType("aws_sdk_bedrock_runtime")
-)
-sys.modules.setdefault("aws_sdk_bedrock_runtime.client", _mock_bedrock_client_module)
-sys.modules.setdefault("aws_sdk_bedrock_runtime.config", _mock_bedrock_config_module)
-sys.modules.setdefault("aws_sdk_bedrock_runtime.models", _mock_bedrock_models_module)
-sys.modules.setdefault("smithy_aws_core", _mock_smithy_module)
-sys.modules.setdefault("smithy_aws_core.identity", _mock_smithy_identity_module)
-sys.modules.setdefault(
-    "smithy_aws_core.identity.environment", _mock_smithy_env_module
-)
-
 # Mock starlette.websockets for type reference in server.py
 _mock_starlette_module = ModuleType("starlette")
 _mock_starlette_ws_module = ModuleType("starlette.websockets")

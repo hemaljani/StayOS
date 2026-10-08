@@ -6,9 +6,9 @@
 
 - Prototype/demo monorepo (not production).
 - Each feature is a self-contained top-level directory with its own backend,
-  frontend, infrastructure, docs, `README.md`, and `AGENTS.md`. This single
-  repo-root `llms.txt` is the one index for the whole repo — features do not
-  carry their own.
+  frontend, infrastructure, docs, and `README.md`. Follow the root
+  [AGENTS.md](AGENTS.md) for repository guidance. This single repo-root
+  `llms.txt` is the one index for the whole repo — features do not carry their own.
 - Features share one PWA origin, one Cognito user pool, one AWS WAF web ACL, and
   one DynamoDB operational data layer. Three static-export Next.js apps are
   served from ONE shared CloudFront distribution: the StayOS shell at `/`
@@ -21,12 +21,11 @@
 
 - [StayOS shell](stayos-shell/README.md): unified login + feature launcher at
   `/`. Login when unauthenticated, feature grid (LUMI, PULSE) when authenticated.
-  Static-export Next.js; consumes the shared `@stayos/auth` module. Agent guide:
-  [stayos-shell/AGENTS.md](stayos-shell/AGENTS.md).
+  Static-export Next.js; consumes the shared `@stayos/auth` module.
 - [LUMI](lumi/README.md): Feature 1, built and deployed. Served at `/lumi`. Daily
   AI-generated GM brief (KPIs, VIP arrivals, overbooking risk, OOO rooms) as a
-  dashboard + audio brief, plus voice/chat Q&A agents. Agent guide:
-  [lumi/AGENTS.md](lumi/AGENTS.md).
+  dashboard + audio brief, plus voice/chat Q&A agents. Voice uses the GA Strands
+  `BidiAgent` with Nova Sonic 2.5 (`amazon.nova-2-5-sonic`).
 - [PULSE](pulse/README.md): Feature 2, built and tested. Served at `/pulse`.
   Real-time tiered (CRITICAL/WARNING/INFO) AI-triaged alerts with closed-loop
   resolution: a DynamoDB Streams rule engine, agentic triage on Amazon Bedrock
@@ -36,13 +35,43 @@
   oversell (advisory `FORECAST_OVERSELL` alerts; human-in-the-loop, never
   auto-executed). Deploys with the whole platform via `make deploy-all`.
 
+## LUMI voice
+
+- [nova_sonic_session.py](lumi/backend/services/voice-agent/nova_sonic_session.py):
+  adapts GA Strands `BidiAgent` and `BedrockNovaSonicModel` to the existing
+  browser WebSocket protocol. Strands manages streaming, tool execution,
+  transcript assembly, and conversation history across connection renewals.
+  Preserves `tiffany`, 16 kHz input PCM, and 24 kHz output PCM.
+- [server.py](lumi/backend/services/voice-agent/server.py):
+  AgentCore WebSocket entrypoint. The browser connects with SigV4 credentials
+  from a Cognito Identity Pool; the backend verifies the access token with
+  Cognito and binds tools to the authenticated GM's property.
+- [useVoiceAgent.ts](lumi/frontend/src/hooks/useVoiceAgent.ts):
+  browser capture and playback. Waits for `sessionStarted` before sending
+  microphone audio and clears queued playback on interruption.
+- [requirements.txt](lumi/backend/services/voice-agent/requirements.txt):
+  authoritative GA Strands and transport SDK pins for the voice container.
+- [Voice upgrade procedure](docs/deployment-pipeline.md#focused-voice-upgrade):
+  `make lumi-voice-upgrade` builds only the existing voice image, reviews scoped
+  CloudFormation changes, and updates the runtime with a pinned image digest.
+  `make lumi-voice-rollback` restores the saved policy and image;
+  `make lumi-voice-description` applies only description metadata.
+  Use explicit `PROFILE`, `CLOUDFORMATION_PROFILE`, `REGION`, and
+  `EXPECTED_ACCOUNT_ID`. Frontend publication is separate: regenerate live
+  configuration before building and publishing. Runtime readiness alone does
+  not prove voice recognition, conversation context, or interruption works.
+
 ## Shared
 
 - [shared/README.md](shared/README.md): the cross-feature shared layer.
 - [shared/auth/src/index.ts](shared/auth/src/index.ts): `@stayos/auth` — the
   single client-side auth module shared by the shell, LUMI, and PULSE (Cognito
-  sign-in/refresh, JWT decode, and the `localStorage` `stayos.*` session that
-  powers SSO). Consumed via a build-time TypeScript path alias.
+  sign-in/refresh and JWT decode). Consumed via a build-time TypeScript path alias.
+- [shared/auth/src/storage.ts](shared/auth/src/storage.ts): shared `stayos.*`
+  token storage. Fresh installs use `localStorage`; an existing legacy
+  `sessionStorage` login remains authoritative for the current document so a
+  feature can be upgraded independently of the shell. Tokens from different
+  stores are never combined, and explicit sign-out clears both stores.
 - [shared/data-orchestrator/infrastructure/data-orchestrator.yaml](shared/data-orchestrator/infrastructure/data-orchestrator.yaml):
   the Unified Data Orchestrator nested stack (`StackPrefix` `stayos-data`) — the
   `stayos-data-orchestrator` Step Functions state machine
@@ -104,9 +133,8 @@
   real-time alerts API (LUMI's REST spec is in [lumi/openapi.yaml](lumi/openapi.yaml)).
 - [AGENTS.md](AGENTS.md): root contributor/agent guide — repo-wide safety,
   conventions, and per-feature workflow.
-- [stayos-shell/AGENTS.md](stayos-shell/AGENTS.md): StayOS shell agent guide.
-- [lumi/AGENTS.md](lumi/AGENTS.md): LUMI-specific agent guide.
-- [pulse/AGENTS.md](pulse/AGENTS.md): PULSE-specific agent guide.
+- [docs/deployment-pipeline.md](docs/deployment-pipeline.md): account-aware
+  deployment, frontend configuration, focused voice upgrades, and recovery.
 
 ## Optional
 
@@ -114,6 +142,6 @@
   populated `shared/auth/` module and why the infrastructure carve-out is still
   deferred.
 - [CONTRIBUTING.md](CONTRIBUTING.md): how to scope a PR to one feature.
-- [CHANGELOG.md](CHANGELOG.md): notable changes per release; the latest entry is
-  `1.1.0` (the shared Data Orchestrator, the shell marketing landing page, plus
-  reliability and security fixes).
+- [CHANGELOG.md](CHANGELOG.md): notable changes per release. The latest
+  documented version is `1.2.1`, covering the GA Strands/Nova Sonic 2.5 upgrade
+  and focused deployment automation.

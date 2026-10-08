@@ -7,12 +7,11 @@
 // the shell writes them on login, LUMI and PULSE read the same session with no
 // re-prompt.
 //
-// Why localStorage (not sessionStorage): sessionStorage is scoped per tab AND
-// per browsing context, so a full-page navigation from `/` to `/pulse/` (which
-// is how the apps hand off) loses it and forces a re-login. localStorage is
-// shared across the origin and survives that navigation, which is exactly the
-// SSO behavior we need. The refresh token already has a 30-day lifetime, so the
-// session persists until explicit sign-out or refresh expiry.
+// Fresh installs use localStorage for a session shared across tabs. Older
+// deployed apps use sessionStorage, which survives same-tab navigation but
+// is isolated per tab. Reuse an existing legacy session for the lifetime of
+// the current document so a feature can be upgraded independently of the shell.
+// Keep each token triple in one store; never combine two users' sessions.
 //
 // Every accessor is SSR-safe (guards `typeof window`) because the apps are
 // static-exported and modules may be evaluated without a DOM.
@@ -26,13 +25,18 @@ export const ACCESS_TOKEN_KEY = `${KEY_PREFIX}accessToken`;
 export const ID_TOKEN_KEY = `${KEY_PREFIX}idToken`;
 export const REFRESH_TOKEN_KEY = `${KEY_PREFIX}refreshToken`;
 
-/**
- * Whether a browser storage context is available (guards SSR / static build).
- *
- * @returns True when running in a browser with localStorage.
- */
-function hasStorage(): boolean {
-  return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
+let selectedStorage: Storage | undefined;
+
+/** Keep the current document on the store selected by its existing login. */
+function tokenStorage(): Storage | null {
+  if (typeof window === 'undefined') return null;
+  if (!selectedStorage) {
+    // Select once so clearing a session cannot switch to another stored login.
+    selectedStorage = window.sessionStorage.getItem(ACCESS_TOKEN_KEY) !== null
+      ? window.sessionStorage
+      : window.localStorage;
+  }
+  return selectedStorage ?? null;
 }
 
 /**
@@ -42,8 +46,7 @@ function hasStorage(): boolean {
  * @returns The stored value, or null when absent or storage is unavailable.
  */
 function readToken(key: string): string | null {
-  if (!hasStorage()) return null;
-  return window.localStorage.getItem(key);
+  return tokenStorage()?.getItem(key) ?? null;
 }
 
 /**
@@ -52,10 +55,11 @@ function readToken(key: string): string | null {
  * @param tokens - The access, id, and refresh tokens to store.
  */
 export function setTokens(tokens: AuthTokens): void {
-  if (!hasStorage()) return;
-  window.localStorage.setItem(ACCESS_TOKEN_KEY, tokens.accessToken);
-  window.localStorage.setItem(ID_TOKEN_KEY, tokens.idToken);
-  window.localStorage.setItem(REFRESH_TOKEN_KEY, tokens.refreshToken);
+  const storage = tokenStorage();
+  if (!storage) return;
+  storage.setItem(ACCESS_TOKEN_KEY, tokens.accessToken);
+  storage.setItem(ID_TOKEN_KEY, tokens.idToken);
+  storage.setItem(REFRESH_TOKEN_KEY, tokens.refreshToken);
 }
 
 /**
@@ -66,9 +70,10 @@ export function setTokens(tokens: AuthTokens): void {
  * @param idToken - The freshly issued id token.
  */
 export function updateAccessTokens(accessToken: string, idToken: string): void {
-  if (!hasStorage()) return;
-  window.localStorage.setItem(ACCESS_TOKEN_KEY, accessToken);
-  window.localStorage.setItem(ID_TOKEN_KEY, idToken);
+  const storage = tokenStorage();
+  if (!storage) return;
+  storage.setItem(ACCESS_TOKEN_KEY, accessToken);
+  storage.setItem(ID_TOKEN_KEY, idToken);
 }
 
 /**
@@ -104,8 +109,11 @@ export function getStoredRefreshToken(): string | null {
  * watch for that key being emptied.
  */
 export function clearTokens(): void {
-  if (!hasStorage()) return;
-  window.localStorage.removeItem(ACCESS_TOKEN_KEY);
-  window.localStorage.removeItem(ID_TOKEN_KEY);
-  window.localStorage.removeItem(REFRESH_TOKEN_KEY);
+  if (typeof window === 'undefined') return;
+  // A deliberate sign-out invalidates both current and legacy browser state.
+  for (const storage of [window.localStorage, window.sessionStorage]) {
+    storage.removeItem(ACCESS_TOKEN_KEY);
+    storage.removeItem(ID_TOKEN_KEY);
+    storage.removeItem(REFRESH_TOKEN_KEY);
+  }
 }

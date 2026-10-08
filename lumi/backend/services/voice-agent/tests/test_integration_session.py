@@ -70,37 +70,6 @@ sys.modules.setdefault(
     "bedrock_agentcore.runtime.models", _mock_agentcore_runtime_models_module
 )
 
-# Mock the Smithy-based Bedrock runtime SDK modules
-_mock_bedrock_client_module = ModuleType("aws_sdk_bedrock_runtime.client")
-_mock_bedrock_client_module.BedrockRuntimeClient = MagicMock
-_mock_bedrock_client_module.InvokeModelWithBidirectionalStreamOperationInput = (
-    MagicMock
-)
-
-_mock_bedrock_config_module = ModuleType("aws_sdk_bedrock_runtime.config")
-_mock_bedrock_config_module.Config = MagicMock
-
-_mock_bedrock_models_module = ModuleType("aws_sdk_bedrock_runtime.models")
-_mock_bedrock_models_module.BidirectionalInputPayloadPart = MagicMock
-_mock_bedrock_models_module.InvokeModelWithBidirectionalStreamInputChunk = MagicMock
-
-_mock_smithy_module = ModuleType("smithy_aws_core")
-_mock_smithy_identity_module = ModuleType("smithy_aws_core.identity")
-_mock_smithy_env_module = ModuleType("smithy_aws_core.identity.environment")
-_mock_smithy_env_module.EnvironmentCredentialsResolver = MagicMock
-
-sys.modules.setdefault(
-    "aws_sdk_bedrock_runtime", ModuleType("aws_sdk_bedrock_runtime")
-)
-sys.modules.setdefault("aws_sdk_bedrock_runtime.client", _mock_bedrock_client_module)
-sys.modules.setdefault("aws_sdk_bedrock_runtime.config", _mock_bedrock_config_module)
-sys.modules.setdefault("aws_sdk_bedrock_runtime.models", _mock_bedrock_models_module)
-sys.modules.setdefault("smithy_aws_core", _mock_smithy_module)
-sys.modules.setdefault("smithy_aws_core.identity", _mock_smithy_identity_module)
-sys.modules.setdefault(
-    "smithy_aws_core.identity.environment", _mock_smithy_env_module
-)
-
 # Mock starlette.websockets for type reference
 _mock_starlette_module = ModuleType("starlette")
 _mock_starlette_ws_module = ModuleType("starlette.websockets")
@@ -156,31 +125,19 @@ def mock_websocket() -> AsyncMock:
 
 
 @pytest.fixture()
-def mock_nova_sonic_stream() -> AsyncMock:
-    """Create a mock Nova Sonic bidirectional stream response.
+def mock_bidi_agent() -> MagicMock:
+    """Mock the GA agent boundary, retaining real server/session integration."""
+    agent = MagicMock()
+    agent.start = AsyncMock()
+    agent.send = AsyncMock()
+    agent.stop = AsyncMock()
 
-    Simulates the response from invoke_model_with_bidirectional_stream.
-    The input_stream allows sending events, and the output stream provides
-    a channel that yields output events from the model.
+    async def receive():
+        await asyncio.Event().wait()
+        yield {}
 
-    Returns:
-        AsyncMock configured to behave like the Nova Sonic stream response.
-    """
-    stream_response = AsyncMock()
-    # Mock input stream for sending events to Nova Sonic
-    stream_response.input_stream = AsyncMock()
-    stream_response.input_stream.send = AsyncMock()
-    stream_response.input_stream.close = AsyncMock()
-
-    # Mock output stream - returns an async iterable that yields events
-    output_channel = AsyncMock()
-    # Simulate stream closing immediately (no output events for lifecycle test)
-    output_channel.receive = AsyncMock(side_effect=StopAsyncIteration())
-    stream_response.await_output = AsyncMock(
-        return_value=(None, output_channel)
-    )
-
-    return stream_response
+    agent.receive = receive
+    return agent
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +162,7 @@ class TestWebSocketSessionLifecycle:
     async def test_full_lifecycle_connect_identity_audio_close(
         self,
         mock_websocket: AsyncMock,
-        mock_nova_sonic_stream: AsyncMock,
+        mock_bidi_agent: AsyncMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Full lifecycle: connect → identity → audio → sessionEnd.
@@ -239,7 +196,7 @@ class TestWebSocketSessionLifecycle:
             }),
             json.dumps({
                 "type": "audioInput",
-                "audioData": "SGVsbG8gV29ybGQ=",
+                "audioData": "AAA=",
             }),
             json.dumps({
                 "type": "sessionEnd",
@@ -293,9 +250,8 @@ class TestWebSocketSessionLifecycle:
                 mock_dynamodb_resource,
             ),
             patch(
-                "nova_sonic_session._bedrock_client.invoke_model_with_bidirectional_stream",
-                new_callable=AsyncMock,
-                return_value=mock_nova_sonic_stream,
+                "nova_sonic_session.BidiAgent",
+                return_value=mock_bidi_agent,
             ),
             patch.object(
                 NovaSonicSession, "__init__", patched_init
@@ -336,7 +292,7 @@ class TestWebSocketSessionLifecycle:
     async def test_property_id_from_identity_not_model_params(
         self,
         mock_websocket: AsyncMock,
-        mock_nova_sonic_stream: AsyncMock,
+        mock_bidi_agent: AsyncMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Property-scoped access uses propertyId from identity, never model params.
@@ -402,9 +358,8 @@ class TestWebSocketSessionLifecycle:
             ),
             patch("server._dynamodb_resource", mock_dynamodb_resource),
             patch(
-                "nova_sonic_session._bedrock_client.invoke_model_with_bidirectional_stream",
-                new_callable=AsyncMock,
-                return_value=mock_nova_sonic_stream,
+                "nova_sonic_session.BidiAgent",
+                return_value=mock_bidi_agent,
             ),
             patch.object(NovaSonicSession, "__init__", tracking_init),
         ):
@@ -425,7 +380,7 @@ class TestWebSocketSessionLifecycle:
     async def test_audio_input_forwarded_to_nova_sonic_stream(
         self,
         mock_websocket: AsyncMock,
-        mock_nova_sonic_stream: AsyncMock,
+        mock_bidi_agent: AsyncMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """audioInput messages are forwarded through the session to Nova Sonic.
@@ -487,9 +442,8 @@ class TestWebSocketSessionLifecycle:
             ),
             patch("server._dynamodb_resource", mock_dynamodb_resource),
             patch(
-                "nova_sonic_session._bedrock_client.invoke_model_with_bidirectional_stream",
-                new_callable=AsyncMock,
-                return_value=mock_nova_sonic_stream,
+                "nova_sonic_session.BidiAgent",
+                return_value=mock_bidi_agent,
             ),
             patch.object(NovaSonicSession, "send_audio", tracking_send_audio),
         ):
@@ -502,7 +456,7 @@ class TestWebSocketSessionLifecycle:
     async def test_session_end_closes_stream_gracefully(
         self,
         mock_websocket: AsyncMock,
-        mock_nova_sonic_stream: AsyncMock,
+        mock_bidi_agent: AsyncMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """sessionEnd message triggers graceful Nova Sonic stream close.
@@ -545,7 +499,6 @@ class TestWebSocketSessionLifecycle:
             """Track that session close was invoked."""
             close_called.append(True)
             self_inner.context.is_stream_active = False
-            self_inner._audio_content_started = False
 
         with (
             patch(
@@ -558,9 +511,8 @@ class TestWebSocketSessionLifecycle:
             ),
             patch("server._dynamodb_resource", mock_dynamodb_resource),
             patch(
-                "nova_sonic_session._bedrock_client.invoke_model_with_bidirectional_stream",
-                new_callable=AsyncMock,
-                return_value=mock_nova_sonic_stream,
+                "nova_sonic_session.BidiAgent",
+                return_value=mock_bidi_agent,
             ),
             patch.object(NovaSonicSession, "close", tracking_close),
         ):
@@ -585,7 +537,7 @@ class TestWebSocketSessionLifecycle:
     async def test_session_removed_from_active_set_after_disconnect(
         self,
         mock_websocket: AsyncMock,
-        mock_nova_sonic_stream: AsyncMock,
+        mock_bidi_agent: AsyncMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Session is removed from _active_sessions after lifecycle completes.
@@ -631,9 +583,8 @@ class TestWebSocketSessionLifecycle:
             ),
             patch("server._dynamodb_resource", mock_dynamodb_resource),
             patch(
-                "nova_sonic_session._bedrock_client.invoke_model_with_bidirectional_stream",
-                new_callable=AsyncMock,
-                return_value=mock_nova_sonic_stream,
+                "nova_sonic_session.BidiAgent",
+                return_value=mock_bidi_agent,
             ),
             patch.object(
                 NovaSonicSession,
@@ -650,7 +601,7 @@ class TestWebSocketSessionLifecycle:
     async def test_language_preference_loaded_from_settings_table(
         self,
         mock_websocket: AsyncMock,
-        mock_nova_sonic_stream: AsyncMock,
+        mock_bidi_agent: AsyncMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """GM language preference is read from DynamoDB settings table.
@@ -715,9 +666,8 @@ class TestWebSocketSessionLifecycle:
             ),
             patch("server._dynamodb_resource", mock_dynamodb_resource),
             patch(
-                "nova_sonic_session._bedrock_client.invoke_model_with_bidirectional_stream",
-                new_callable=AsyncMock,
-                return_value=mock_nova_sonic_stream,
+                "nova_sonic_session.BidiAgent",
+                return_value=mock_bidi_agent,
             ),
             patch.object(NovaSonicSession, "__init__", tracking_init),
         ):
@@ -812,7 +762,7 @@ class TestWebSocketSessionLifecycle:
 class TestPropertyScopedToolDispatch:
     """Tests verifying property_id from identity flows through to tool execution.
 
-    The NovaSonicSession.execute_tool method receives the property_id from
+    Each session-bound Strands tool receives the property_id from
     session context (set during identity resolution), never from Nova Sonic
     model parameters. This defense-in-depth pattern ensures a compromised
     model cannot access data from other properties.
@@ -823,7 +773,7 @@ class TestPropertyScopedToolDispatch:
     @pytest.mark.asyncio
     async def test_execute_tool_uses_session_property_id(
         self,
-        mock_nova_sonic_stream: AsyncMock,
+        mock_bidi_agent: AsyncMock,
     ) -> None:
         """Tool execution receives property_id from session context, not model.
 
@@ -833,23 +783,12 @@ class TestPropertyScopedToolDispatch:
 
         Validates: Requirements 7.1, 7.2
         """
-        from nova_sonic_session import NovaSonicSession
+        from nova_sonic_session import PropertyScopedTool
+        from tools_config import TOOL_CONFIGURATION
 
-        # Create a session with a specific property_id from "identity"
+        # Create a tool with a specific property_id from "identity"
         session_property_id = "PROP-DEFENSE-IN-DEPTH"
-        mock_ws = AsyncMock()
-        mock_ws.closed = False
-
-        session = NovaSonicSession(
-            property_id=session_property_id,
-            gm_alias="gm-security-test",
-            language="en-US",
-            ws=mock_ws,
-        )
-
-        # Simulate the stream being active (set after start())
-        session.context.is_stream_active = True
-        session._stream_response = mock_nova_sonic_stream
+        tool = PropertyScopedTool(TOOL_CONFIGURATION[0]["toolSpec"], session_property_id)
 
         # Mock dispatch_tool to capture the property_id it receives
         dispatched_params: list = []
@@ -873,11 +812,11 @@ class TestPropertyScopedToolDispatch:
                 "date": "2024-01-15",
             }
 
-            await session.execute_tool(
-                tool_name="get_occupancy",
-                tool_params=model_provided_params,
-                tool_use_id="tool-use-001",
-            )
+            results = [result async for result in tool.stream(
+                {"name": "get_occupancy", "input": model_provided_params,
+                 "toolUseId": "tool-use-001"}, {}
+            )]
+            assert results[0]["status"] == "success"
 
         # dispatch_tool MUST receive the session's property_id, not the model's
         assert len(dispatched_params) == 1
@@ -885,5 +824,5 @@ class TestPropertyScopedToolDispatch:
         assert dispatched_params[0]["property_id"] != "PROP-ATTACKER-INJECTED"
         assert dispatched_params[0]["tool_name"] == "get_occupancy"
 
-        # The model's params are passed separately (handler can use or ignore them)
-        assert dispatched_params[0]["params"] == model_provided_params
+        # Undeclared scope parameters are removed before dispatch.
+        assert dispatched_params[0]["params"] == {"date": "2024-01-15"}

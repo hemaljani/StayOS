@@ -33,7 +33,7 @@ Hotel General Managers spend their first 30-45 minutes every morning logging int
 - **Rooms Out of Order** — Premium-flagged OOO rooms with work order status, hours open, and tap-to-view detail modal
 - **Upsell Opportunities** — Eligible arrivals, potential revenue, front desk briefing recommendations
 - **AI Audio Brief** — 60-90 second personalized summary in 4 languages (EN, ES, JA, ZH), playable during property walk
-- **Voice Agent** — Conversational Q&A over the shared dataset via push-to-talk WebSocket (Nova Sonic)
+- **Voice Agent** — Conversational Q&A over the shared dataset via push-to-talk WebSocket (Nova Sonic 2.5, `amazon.nova-2-5-sonic`)
 - **Chat Agent** — Text-based conversational Q&A over the same dataset for when voice isn't practical (noisy lobby, meetings), backed by Claude Sonnet via an AgentCore Gateway MCP endpoint
 - **Brief History** — Past 30 days of briefs accessible via carousel
 
@@ -131,6 +131,14 @@ The voice agent is deployed automatically as part of the platform deploy
 2. Pushes the image to ECR
 3. Creates/updates the AgentCore Runtime via AWS CLI
 
+To upgrade only an existing voice deployment, use `make lumi-voice-upgrade`
+from the repository root with explicit `PROFILE`, `CLOUDFORMATION_PROFILE`,
+`REGION`, and `EXPECTED_ACCOUNT_ID`. This preserves the existing password,
+all other nested template references, and the runtime configuration. It builds
+with the existing CodeBuild project and previews the voice IAM policy change
+before updating the parent stack and existing runtime. See the
+[focused upgrade and rollback procedure](../docs/deployment-pipeline.md#focused-voice-upgrade).
+
 #### Voice Agent Environment Variables
 
 The agent container reads these environment variables at runtime (configured in `agentcore.yaml`):
@@ -162,7 +170,20 @@ The voice agent uses SigV4 authentication via Cognito Identity Pool (replacing t
 1. **Credential exchange** - The browser exchanges the Cognito ID Token for temporary AWS credentials via the Identity Pool
 2. **SigV4 WebSocket** - Temporary credentials sign a presigned WebSocket URL for the AgentCore endpoint
 3. **Identity verification** - The Access Token is sent as the first message; the container calls `cognito-idp:GetUser` to extract the GM's `propertyId` and `gmAlias`
-4. **Voice session** - Standard bidirectional audio streaming via Nova Sonic (same protocol as before)
+4. **Voice session** - A GA Strands `BidiAgent` with `BedrockNovaSonicModel`
+   explicitly selects `amazon.nova-2-5-sonic`. The backend adapter retains
+   LUMI's WebSocket messages, `tiffany`, 16 kHz PCM input, and 24 kHz PCM output.
+   Existing read-only tools are bound to the authenticated property; the model
+   cannot supply or override that scope. Strands owns tool execution, transcript
+   assembly, and connection renewal with conversation history.
+
+The browser waits for `sessionStarted` before streaming live microphone frames
+and clears queued playback on interruption. Server logs record model IDs,
+transcript lengths, tool names/status, usage, and audio timing without recording
+transcripts or hotel data. The container redacts sensitive Strands span attributes.
+The voice service pins `strands-agents[bidi]` and its compatible transport SDK
+versions in `backend/services/voice-agent/requirements.txt`; run voice tests with
+those dependencies in a Python 3.12+ virtual environment.
 
 See [`docs/voice-agent-architecture.png`](docs/voice-agent-architecture.png) for the full component diagram.
 
