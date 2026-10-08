@@ -1,770 +1,505 @@
-"""Unit tests for NovaSonicSession (nova_sonic_session.py).
+"""Exercise the real GA SDK configuration and LUMI's voice protocol adapter.
 
-Tests validate audio forwarding, output event relaying, tool result sending,
-language resolution, and idle timeout detection for the Nova Sonic bidirectional
-stream session manager. Uses mocked Bedrock stream client and WebSocket.
-
-Validates: Requirements 1.3, 1.4, 3.3, 4.1, 4.4
+Only network operations are mocked. Tests cover PCM preservation, cumulative
+transcripts, response boundaries, property isolation, and lifecycle cleanup.
 """
 
+import asyncio
+import base64
 import json
-import sys
 import time
 from pathlib import Path
-from types import ModuleType
-from typing import Any, Dict
+import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import pytest_asyncio
 
-# Add the voice-agent service directory to the path so we can import modules
+from strands.bidi.types import (
+    BidiAudioStartEvent,
+    BidiResponseStartEvent,
+    BidiResponseStopEvent,
+    BidiTranscriptBlockEvent,
+    BidiTranscriptDeltaEvent,
+    BidiTranscriptStartEvent,
+    BidiUsageEvent,
+)
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# ---------------------------------------------------------------------------
-# Mock external SDK modules that are not installed in the test environment.
-# The aws_sdk_bedrock_runtime and smithy_aws_core packages are experimental
-# and only available in the container. We mock them so nova_sonic_session
-# can be imported without those dependencies.
-# ---------------------------------------------------------------------------
-
-_mock_bedrock_client_module = ModuleType("aws_sdk_bedrock_runtime.client")
-_mock_bedrock_client_module.BedrockRuntimeClient = MagicMock
-_mock_bedrock_client_module.InvokeModelWithBidirectionalStreamOperationInput = MagicMock
-
-_mock_bedrock_config_module = ModuleType("aws_sdk_bedrock_runtime.config")
-_mock_bedrock_config_module.Config = MagicMock
-
-_mock_bedrock_models_module = ModuleType("aws_sdk_bedrock_runtime.models")
-_mock_bedrock_models_module.BidirectionalInputPayloadPart = MagicMock
-_mock_bedrock_models_module.InvokeModelWithBidirectionalStreamInputChunk = MagicMock
-
-_mock_smithy_module = ModuleType("smithy_aws_core")
-_mock_smithy_identity_module = ModuleType("smithy_aws_core.identity")
-_mock_smithy_env_module = ModuleType("smithy_aws_core.identity.environment")
-_mock_smithy_env_module.EnvironmentCredentialsResolver = MagicMock
-
-sys.modules.setdefault("aws_sdk_bedrock_runtime", ModuleType("aws_sdk_bedrock_runtime"))
-sys.modules.setdefault("aws_sdk_bedrock_runtime.client", _mock_bedrock_client_module)
-sys.modules.setdefault("aws_sdk_bedrock_runtime.config", _mock_bedrock_config_module)
-sys.modules.setdefault("aws_sdk_bedrock_runtime.models", _mock_bedrock_models_module)
-sys.modules.setdefault("smithy_aws_core", _mock_smithy_module)
-sys.modules.setdefault("smithy_aws_core.identity", _mock_smithy_identity_module)
-sys.modules.setdefault("smithy_aws_core.identity.environment", _mock_smithy_env_module)
+from nova_sonic_session import (  # noqa: E402 - service directory is not a package
+    MODEL_ID,
+    NovaSonicSession,
+    PropertyScopedTool,
+)
+from system_prompt import SYSTEM_PROMPT  # noqa: E402
+from tools_config import TOOL_CONFIGURATION  # noqa: E402
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
+@pytest.fixture
+def agent():
+    mock = MagicMock()
+    mock.start = AsyncMock()
+    mock.stop = AsyncMock()
+    mock.send = AsyncMock()
+    return mock
 
 
-@pytest.fixture(autouse=True)
-def _patch_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Set environment variables expected by nova_sonic_session at import time.
-
-    Table names are needed by tool_handlers (imported by nova_sonic_session).
-    AWS_DEFAULT_REGION is used for Bedrock client configuration.
-    """
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-    monkeypatch.setenv("RESERVATIONS_TABLE_NAME", "stayos-reservations")
-    monkeypatch.setenv("ROOMS_TABLE_NAME", "stayos-rooms")
-    monkeypatch.setenv("GUESTS_TABLE_NAME", "stayos-guests")
-    monkeypatch.setenv("REVENUES_TABLE_NAME", "stayos-revenues")
-    monkeypatch.setenv("WORK_ORDERS_TABLE_NAME", "stayos-work-orders")
+@pytest.fixture
+def session(agent):
+    with patch("nova_sonic_session.BidiAgent", return_value=agent):
+        return NovaSonicSession("PROP-TEST", "gm-test", "en-US", AsyncMock())
 
 
-@pytest.fixture()
-def mock_ws() -> AsyncMock:
-    """Create a mock aiohttp WebSocketResponse for capturing sent messages.
-
-    The mock records all send_json calls so tests can inspect messages
-    that would have been sent to the browser.
-
-    Returns:
-        AsyncMock representing the WebSocket connection.
-    """
-    ws = AsyncMock()
-    ws.closed = False
-    ws.send_json = AsyncMock()
-    return ws
+def messages(session):
+    return [call.args[0] for call in session.context.ws.send_json.call_args_list]
 
 
-@pytest.fixture()
-def mock_stream_response() -> MagicMock:
-    """Create a mock Bedrock bidirectional stream response.
-
-    Provides input_stream.send as an AsyncMock so tests can capture
-    events that would have been sent to Nova Sonic.
-
-    Returns:
-        MagicMock representing the stream response object.
-    """
-    stream_response = MagicMock()
-    stream_response.input_stream = MagicMock()
-    stream_response.input_stream.send = AsyncMock()
-    stream_response.input_stream.close = AsyncMock()
-    return stream_response
+@pytest.mark.parametrize("language", ["en-US", "es-US", "ja-JP", "zh-CN"])
+def test_preserves_supported_language(language, agent):
+    with patch("nova_sonic_session.BidiAgent", return_value=agent):
+        session = NovaSonicSession("PROP", "gm", language, AsyncMock())
+    assert session.context.language == language
 
 
-@pytest.fixture()
-def mock_bedrock_client(
-    monkeypatch: pytest.MonkeyPatch,
-    mock_stream_response: MagicMock,
-) -> AsyncMock:
-    """Patch the module-level _bedrock_client to return a mock stream.
-
-    Monkeypatches the global Bedrock client so NovaSonicSession.start()
-    does not make real AWS API calls.
-
-    Args:
-        monkeypatch: pytest monkeypatch fixture.
-        mock_stream_response: The mock stream response returned by the client.
-
-    Returns:
-        The mock client with invoke_model_with_bidirectional_stream configured.
-    """
-    import nova_sonic_session
-
-    mock_client = AsyncMock()
-    mock_client.invoke_model_with_bidirectional_stream = AsyncMock(
-        return_value=mock_stream_response
-    )
-    monkeypatch.setattr(nova_sonic_session, "_bedrock_client", mock_client)
-    return mock_client
+@pytest.mark.parametrize("language", ["", None, "fr-FR"])
+def test_language_falls_back_to_english(language, agent):
+    with patch("nova_sonic_session.BidiAgent", return_value=agent):
+        session = NovaSonicSession("PROP", "gm", language, AsyncMock())
+    assert session.context.language == "en-US"
 
 
-@pytest.fixture()
-def session(
-    mock_ws: AsyncMock,
-    mock_bedrock_client: AsyncMock,
-    mock_stream_response: MagicMock,
-) -> "NovaSonicSession":
-    """Create a NovaSonicSession instance with mocked dependencies.
-
-    The session is pre-configured with a property_id, gm_alias, and English
-    language. The stream is not yet started (call session.start() in tests
-    that need an active stream).
-
-    Returns:
-        A NovaSonicSession ready for testing.
-    """
-    from nova_sonic_session import NovaSonicSession
-
-    return NovaSonicSession(
-        property_id="PROP-TEST-001",
-        gm_alias="gm-sarah",
-        language="en-US",
-        ws=mock_ws,
-    )
+def test_real_ga_model_preserves_configuration():
+    session = NovaSonicSession("PROP", "gm", "en-US", AsyncMock())
+    model = session._agent.model
+    assert model.get_config()["model_id"] == "amazon.nova-2-5-sonic"
+    assert model.get_audio_config() == {
+        "input": {"sample_rate": 16000, "channels": 1, "format": "pcm"},
+        "output": {"sample_rate": 24000, "channels": 1, "format": "pcm"},
+    }
+    assert model._voice == "tiffany"
+    assert model.get_config()["params"] == {
+        "inferenceConfiguration": {"maxTokens": 1024, "topP": 0.9, "temperature": 0.7},
+        "turnDetectionConfiguration": {"endpointingSensitivity": "MEDIUM"},
+    }
+    # Renewal remains within Nova's eight-minute connection cap.
+    assert model.get_config()["connection"]["restart_after_s"] == 420
 
 
-@pytest_asyncio.fixture()
-async def started_session(
-    session: "NovaSonicSession",
-    mock_stream_response: MagicMock,
-) -> "NovaSonicSession":
-    """Create a NovaSonicSession that has already called start().
+@pytest.mark.asyncio
+async def test_model_id_reaches_real_ga_streaming_request():
+    session = NovaSonicSession("PROP", "gm", "en-US", AsyncMock())
+    model = session._agent.model
+    credentials = MagicMock(access_key="testing", secret_key="testing", token=None)
+    model._session = MagicMock()
+    model._session.get_credentials.return_value = credentials
+    stream = MagicMock()
+    stream.input_stream.send = AsyncMock()
+    stream.close = AsyncMock()
+    client = MagicMock()
+    client.close = AsyncMock()
+    client.invoke_model_with_bidirectional_stream = AsyncMock(return_value=stream)
+    with patch(
+        "strands.bidi.models.bedrock.AsyncBedrockRuntimeClient", return_value=client
+    ):
+        await model.start(system_prompt=SYSTEM_PROMPT, tools=[])
+    request = client.invoke_model_with_bidirectional_stream.call_args.args[0]
+    assert request.model_id == MODEL_ID == "amazon.nova-2-5-sonic"
+    assert stream.input_stream.send.await_count > 0
+    await model.stop()
 
-    Resets the send mock after start() so tests only see events
-    from the method under test (not setup events).
 
-    Returns:
-        A NovaSonicSession with an active stream.
-    """
+def test_registers_exact_existing_tools_and_prompt(agent):
+    with patch("nova_sonic_session.BidiAgent", return_value=agent) as constructor:
+        NovaSonicSession("PROP", "gm", "en-US", AsyncMock())
+    config = constructor.call_args.kwargs
+    assert config["system_prompt"] == SYSTEM_PROMPT
+    assert [tool.tool_name for tool in config["tools"]] == [
+        item["toolSpec"]["name"] for item in TOOL_CONFIGURATION
+    ]
+    for tool, original in zip(config["tools"], TOOL_CONFIGURATION):
+        assert tool.tool_spec["description"] == original["toolSpec"]["description"]
+        assert tool.tool_spec["inputSchema"]["json"] == json.loads(
+            original["toolSpec"]["inputSchema"]["json"]
+        )
+    # Converting schemas for Strands must not mutate shared configuration.
+    assert isinstance(TOOL_CONFIGURATION[0]["toolSpec"]["inputSchema"]["json"], str)
+
+
+@pytest.mark.asyncio
+async def test_start_and_close_are_idempotent(session, agent):
     await session.start()
-    # Clear events sent during start() so tests only see new ones
-    mock_stream_response.input_stream.send.reset_mock()
-    return session
+    assert session.context.is_stream_active
+    await asyncio.gather(session.close(), session.close())
+    assert not session.context.is_stream_active
+    agent.start.assert_awaited_once()
+    agent.stop.assert_awaited_once()
 
 
-# ---------------------------------------------------------------------------
-# Property 8: Language Resolution
-# Verify supported languages pass through, invalid defaults to en-US.
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_failed_provider_close_does_not_prevent_server_cleanup(session, agent):
+    await session.start()
+    agent.stop.side_effect = RuntimeError("provider teardown failed")
+    await session.close()
+    await session.close()
+    assert not session.context.is_stream_active
+    agent.stop.assert_awaited_once()
 
 
-class TestLanguageResolution:
-    """Tests verifying language resolution at session construction time.
-
-    **Validates: Requirement 4.1, 4.4**
-    """
-
-    def test_language_resolution_supported_en_us(self, mock_ws: AsyncMock, mock_bedrock_client: AsyncMock) -> None:
-        """en-US passes through as a supported language.
-
-        Property 8: Supported languages pass through unchanged.
-        Validates: Requirement 4.1
-        """
-        from nova_sonic_session import NovaSonicSession
-
-        session = NovaSonicSession("PROP-001", "gm-test", "en-US", mock_ws)
-
-        assert session.context.language == "en-US"
-
-    def test_language_resolution_supported_es_us(self, mock_ws: AsyncMock, mock_bedrock_client: AsyncMock) -> None:
-        """es-US passes through as a supported language.
-
-        Property 8: Supported languages pass through unchanged.
-        Validates: Requirement 4.1
-        """
-        from nova_sonic_session import NovaSonicSession
-
-        session = NovaSonicSession("PROP-001", "gm-test", "es-US", mock_ws)
-
-        assert session.context.language == "es-US"
-
-    def test_language_resolution_supported_ja_jp(self, mock_ws: AsyncMock, mock_bedrock_client: AsyncMock) -> None:
-        """ja-JP passes through as a supported language.
-
-        Property 8: Supported languages pass through unchanged.
-        Validates: Requirement 4.1
-        """
-        from nova_sonic_session import NovaSonicSession
-
-        session = NovaSonicSession("PROP-001", "gm-test", "ja-JP", mock_ws)
-
-        assert session.context.language == "ja-JP"
-
-    def test_language_resolution_supported_zh_cn(self, mock_ws: AsyncMock, mock_bedrock_client: AsyncMock) -> None:
-        """zh-CN passes through as a supported language.
-
-        Property 8: Supported languages pass through unchanged.
-        Validates: Requirement 4.1
-        """
-        from nova_sonic_session import NovaSonicSession
-
-        session = NovaSonicSession("PROP-001", "gm-test", "zh-CN", mock_ws)
-
-        assert session.context.language == "zh-CN"
-
-    def test_language_resolution_unsupported_defaults_to_english_fr(
-        self, mock_ws: AsyncMock, mock_bedrock_client: AsyncMock
-    ) -> None:
-        """fr-FR (unsupported) defaults to en-US.
-
-        Property 8: Invalid languages default to en-US.
-        Validates: Requirement 4.4
-        """
-        from nova_sonic_session import NovaSonicSession
-
-        session = NovaSonicSession("PROP-001", "gm-test", "fr-FR", mock_ws)
-
-        assert session.context.language == "en-US"
-
-    def test_language_resolution_unsupported_defaults_to_english_empty(
-        self, mock_ws: AsyncMock, mock_bedrock_client: AsyncMock
-    ) -> None:
-        """Empty string defaults to en-US.
-
-        Property 8: Invalid languages default to en-US.
-        Validates: Requirement 4.4
-        """
-        from nova_sonic_session import NovaSonicSession
-
-        session = NovaSonicSession("PROP-001", "gm-test", "", mock_ws)
-
-        assert session.context.language == "en-US"
-
-    def test_language_resolution_unsupported_defaults_to_english_none(
-        self, mock_ws: AsyncMock, mock_bedrock_client: AsyncMock
-    ) -> None:
-        """None (cast scenario) defaults to en-US.
-
-        Property 8: Invalid languages default to en-US.
-        Validates: Requirement 4.4
-        """
-        from nova_sonic_session import NovaSonicSession
-
-        # None is not in SUPPORTED_LANGUAGES, so fallback triggers
-        session = NovaSonicSession("PROP-001", "gm-test", None, mock_ws)
-
-        assert session.context.language == "en-US"
+@pytest.mark.asyncio
+async def test_failed_start_cleans_up_without_marking_ready(session, agent):
+    agent.start.side_effect = RuntimeError("failed")
+    with pytest.raises(RuntimeError):
+        await session.start()
+    assert not session.context.is_stream_active
+    agent.stop.assert_awaited_once()
 
 
-# ---------------------------------------------------------------------------
-# Property 1: Audio Input Forwarding Preserves Content
-# Verify base64 audio received on WS produces identical audioInput event on stream.
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_cancelled_start_cleans_up(session, agent):
+    agent.start.side_effect = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await session.start()
+    agent.stop.assert_awaited_once()
 
 
-class TestAudioInputForwarding:
-    """Tests verifying audio chunks are forwarded to Nova Sonic without modification.
+@pytest.mark.asyncio
+async def test_pcm_samples_are_forwarded_unchanged(session, agent):
+    await session.start()
+    audio = bytes(range(256)) * 2
+    session.context.last_activity = time.time() - 59
+    await session.send_audio(base64.b64encode(audio).decode())
+    agent.send.assert_awaited_once_with(
+        {"audio_delta": {"format": "pcm", "source": {"bytes": audio}}}
+    )
+    assert not session.is_idle()
+    assert session._audio_bytes == len(audio)
 
-    **Validates: Requirement 1.3**
-    """
 
-    @pytest.mark.asyncio
-    async def test_send_audio_produces_audio_input_event(
-        self,
-        started_session: "NovaSonicSession",
-        mock_stream_response: MagicMock,
-    ) -> None:
-        """Sending audio produces an audioInput event on the stream.
+@pytest.mark.asyncio
+async def test_inactive_session_drops_audio(session, agent):
+    await session.send_audio("AAA=")
+    agent.send.assert_not_awaited()
 
-        Property 1: Base64 audio received on WS produces audioInput event.
-        Validates: Requirement 1.3
-        """
-        test_audio = "SGVsbG8gV29ybGQ="  # base64 "Hello World"
 
-        await started_session.send_audio(test_audio)
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audio", ["!!!", "AA==", ""])
+async def test_invalid_pcm_is_rejected(session, agent, audio):
+    await session.start()
+    with pytest.raises(ValueError):
+        await session.send_audio(audio)
+    agent.send.assert_not_awaited()
 
-        # Verify at least one send call was made
-        assert mock_stream_response.input_stream.send.called
 
-        # Find the audioInput event in the sent chunks
-        sent_events = _extract_sent_events(mock_stream_response)
-        audio_events = [e for e in sent_events if "audioInput" in e.get("event", {})]
-
-        assert len(audio_events) == 1, "Expected exactly one audioInput event"
-        assert audio_events[0]["event"]["audioInput"]["content"] == test_audio
-
-    @pytest.mark.asyncio
-    async def test_send_audio_content_preserved(
-        self,
-        started_session: "NovaSonicSession",
-        mock_stream_response: MagicMock,
-    ) -> None:
-        """The exact base64 content is forwarded without modification.
-
-        Property 1: Audio content is forwarded byte-for-byte.
-        Validates: Requirement 1.3
-        """
-        # Use a longer, realistic-looking base64 audio payload
-        test_audio = "AAAAAAAAAAAAAAAA/f39/f39/f0BAQEBAQEBAQE="
-
-        await started_session.send_audio(test_audio)
-
-        sent_events = _extract_sent_events(mock_stream_response)
-        audio_events = [e for e in sent_events if "audioInput" in e.get("event", {})]
-
-        assert len(audio_events) == 1
-        forwarded_content = audio_events[0]["event"]["audioInput"]["content"]
-        assert forwarded_content == test_audio, (
-            "Audio content must be forwarded exactly as received, no re-encoding"
+@pytest.mark.asyncio
+async def test_vip_transcript_fragments_accumulate_and_final_replaces(session):
+    await session._process_output_event(BidiTranscriptStartEvent("user", "u1"))
+    for text in ("Any", " VIP", " arrivals?"):
+        await session._process_output_event(
+            BidiTranscriptDeltaEvent(text, "user", "u1")
         )
-
-    @pytest.mark.asyncio
-    async def test_send_audio_on_inactive_stream_is_ignored(
-        self,
-        session: "NovaSonicSession",
-        mock_stream_response: MagicMock,
-    ) -> None:
-        """Audio sent when stream is inactive does not produce events.
-
-        The session has not called start(), so is_stream_active is False.
-        send_audio should return without sending.
-        Validates: Requirement 1.3 (boundary case)
-        """
-        await session.send_audio("dGVzdA==")
-
-        # No events should be sent since the stream is not active
-        mock_stream_response.input_stream.send.assert_not_called()
+    assert [m["text"] for m in messages(session)] == [
+        "Any",
+        "Any VIP",
+        "Any VIP arrivals?",
+    ]
+    assert all(not m["isFinal"] for m in messages(session))
+    await session._process_output_event(
+        BidiTranscriptBlockEvent("Any VIP arrivals?", "user", "u1")
+    )
+    assert messages(session)[-1] == {
+        "type": "userTranscript",
+        "text": "Any VIP arrivals?",
+        "isFinal": True,
+    }
+    assert not session._transcripts
 
 
-# ---------------------------------------------------------------------------
-# Property 2: Nova Sonic Output Events Are Relayed Correctly
-# Verify audioOutput/textOutput/toolUse events produce correct WS messages.
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_interleaved_transcripts_keep_roles_and_content_separate(session):
+    for role, cid in (("user", "u1"), ("assistant", "a1")):
+        await session._process_output_event(BidiTranscriptStartEvent(role, cid))
+    for text, role, cid in (
+        ("Any VIP", "user", "u1"),
+        ("Three", "assistant", "a1"),
+        (" arrivals?", "user", "u1"),
+        (" arrivals.", "assistant", "a1"),
+    ):
+        await session._process_output_event(BidiTranscriptDeltaEvent(text, role, cid))
+    assert messages(session)[-2]["text"] == "Any VIP arrivals?"
+    assert messages(session)[-1]["text"] == "Three arrivals."
+    assert messages(session)[-1]["type"] == "agentTranscript"
 
 
-class TestOutputEventRelaying:
-    """Tests verifying Nova Sonic output events are correctly relayed to the browser.
+@pytest.mark.asyncio
+async def test_next_user_turn_does_not_append_previous_question(session):
+    for cid, text in (("u1", "Any VIP arrivals?"), ("u2", "What time?")):
+        await session._process_output_event(BidiTranscriptStartEvent("user", cid))
+        await session._process_output_event(BidiTranscriptDeltaEvent(text, "user", cid))
+        await session._process_output_event(BidiTranscriptBlockEvent(text, "user", cid))
+    assert messages(session)[-1]["text"] == "What time?"
 
-    **Validates: Requirements 1.4, 4.1**
-    """
 
-    @pytest.mark.asyncio
-    async def test_handle_audio_output_relays_to_ws(
-        self,
-        started_session: "NovaSonicSession",
-        mock_ws: AsyncMock,
-    ) -> None:
-        """audioOutput event from Nova Sonic is sent to WS as audioOutput message.
+@pytest.mark.asyncio
+async def test_response_start_not_repeated_for_audio_and_transcript_blocks(session):
+    await session._process_output_event(BidiResponseStartEvent("r1"))
+    await session._process_output_event(BidiTranscriptStartEvent("user", "u1"))
+    assert not messages(session)
+    await session._process_output_event(BidiTranscriptStartEvent("assistant", "a1"))
+    await session._process_output_event(BidiAudioStartEvent("audio1"))
+    await session._process_output_event({"type": "bidi_audio_delta", "audio": "AAA="})
+    # Transcript/audio block stops must not prematurely switch to listening.
+    await session._process_output_event(
+        {"type": "bidi_audio_stop", "content_id": "audio1"}
+    )
+    assert messages(session) == [
+        {"type": "contentStart", "role": "ASSISTANT"},
+        {"type": "audioOutput", "audioData": "AAA="},
+    ]
+    await session._process_output_event(BidiResponseStopEvent("r1"))
+    assert messages(session)[-1] == {"type": "contentEnd"}
 
-        Property 2: audioOutput events produce correct WebSocket messages.
-        Validates: Requirement 1.4
-        """
-        audio_data = "base64EncodedAudioChunkData=="
 
-        # Simulate processing an audioOutput event from Nova Sonic
-        event_data = {
-            "event": {
-                "audioOutput": {
-                    "content": audio_data,
-                }
-            }
+@pytest.mark.asyncio
+async def test_barge_in_uses_existing_playback_reset_messages(session):
+    await session._process_output_event({"type": "bidi_barge_in"})
+    assert messages(session) == [
+        {"type": "contentStart", "role": "ASSISTANT"},
+        {"type": "contentEnd"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_restart_discards_partial_transcripts(session):
+    await session._process_output_event(BidiTranscriptStartEvent("user", "u1"))
+    await session._process_output_event(
+        BidiTranscriptDeltaEvent("partial", "user", "u1")
+    )
+    await session._process_output_event({"type": "bidi_connection_start"})
+    assert not session._transcripts
+
+
+@pytest.mark.asyncio
+async def test_tool_notification_keeps_browser_contract(session):
+    await session._process_output_event(
+        {
+            "type": "bidi_tool_use_blocks",
+            "tool_uses": [{"name": "get_vip_guests", "toolUseId": "t1", "input": {}}],
         }
-        await started_session._process_output_event(event_data)
-
-        # Verify the WebSocket received the correct message
-        mock_ws.send_json.assert_called_once_with({
-            "type": "audioOutput",
-            "audioData": audio_data,
-        })
-
-    @pytest.mark.asyncio
-    async def test_handle_text_output_user_relays_as_user_transcript(
-        self,
-        started_session: "NovaSonicSession",
-        mock_ws: AsyncMock,
-    ) -> None:
-        """textOutput with role USER relays as userTranscript on WebSocket.
-
-        Property 2: textOutput events with USER role produce userTranscript.
-        Validates: Requirement 1.4
-        """
-        event_data = {
-            "event": {
-                "textOutput": {
-                    "role": "USER",
-                    "content": "What is my occupancy today?",
-                }
-            }
-        }
-        await started_session._process_output_event(event_data)
-
-        mock_ws.send_json.assert_called_once_with({
-            "type": "userTranscript",
-            "text": "What is my occupancy today?",
-            "isFinal": True,
-        })
-
-    @pytest.mark.asyncio
-    async def test_handle_text_output_assistant_relays_as_agent_transcript(
-        self,
-        started_session: "NovaSonicSession",
-        mock_ws: AsyncMock,
-    ) -> None:
-        """textOutput with role ASSISTANT relays as agentTranscript on WebSocket.
-
-        Property 2: textOutput events with ASSISTANT role produce agentTranscript.
-        Validates: Requirement 1.4
-        """
-        event_data = {
-            "event": {
-                "textOutput": {
-                    "role": "ASSISTANT",
-                    "content": "Your occupancy is 92% today.",
-                }
-            }
-        }
-        await started_session._process_output_event(event_data)
-
-        mock_ws.send_json.assert_called_once_with({
-            "type": "agentTranscript",
-            "text": "Your occupancy is 92% today.",
-            "isFinal": True,
-        })
-
-    @pytest.mark.asyncio
-    async def test_handle_content_start_relays_to_ws(
-        self,
-        started_session: "NovaSonicSession",
-        mock_ws: AsyncMock,
-    ) -> None:
-        """contentStart with ASSISTANT role relays contentStart to WebSocket.
-
-        Property 2: contentStart events produce correct WS messages for UI state.
-        Validates: Requirement 1.4
-        """
-        event_data = {
-            "event": {
-                "contentStart": {
-                    "role": "ASSISTANT",
-                }
-            }
-        }
-        await started_session._process_output_event(event_data)
-
-        mock_ws.send_json.assert_called_once_with({
-            "type": "contentStart",
-            "role": "ASSISTANT",
-        })
-
-    @pytest.mark.asyncio
-    async def test_handle_content_start_non_assistant_not_relayed(
-        self,
-        started_session: "NovaSonicSession",
-        mock_ws: AsyncMock,
-    ) -> None:
-        """contentStart with non-ASSISTANT role does not relay to WebSocket.
-
-        Only ASSISTANT contentStart events are relevant for UI state transitions.
-        Validates: Requirement 1.4 (boundary case)
-        """
-        event_data = {
-            "event": {
-                "contentStart": {
-                    "role": "USER",
-                }
-            }
-        }
-        await started_session._process_output_event(event_data)
-
-        mock_ws.send_json.assert_not_called()
+    )
+    assert messages(session) == [{"type": "toolUse", "toolName": "get_vip_guests"}]
 
 
-# ---------------------------------------------------------------------------
-# Property 6: Tool Results Are Forwarded as Valid Events
-# Verify any tool handler return produces valid toolResult event.
-# ---------------------------------------------------------------------------
-
-
-class TestToolResultForwarding:
-    """Tests verifying tool execution results are sent as valid toolResult events.
-
-    **Validates: Requirement 3.3**
-    """
-
-    @pytest.mark.asyncio
-    async def test_execute_tool_sends_tool_result_to_stream(
-        self,
-        started_session: "NovaSonicSession",
-        mock_stream_response: MagicMock,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """execute_tool dispatches and sends toolResult event to the stream.
-
-        Property 6: Any tool handler return produces valid toolResult event.
-        Validates: Requirement 3.3
-        """
-        import nova_sonic_session
-
-        # Mock dispatch_tool to return a success result
-        mock_dispatch = AsyncMock(return_value={
+@pytest.mark.asyncio
+async def test_property_scope_cannot_be_overridden_by_model_or_invocation_state():
+    spec = TOOL_CONFIGURATION[2]["toolSpec"]
+    tool = PropertyScopedTool(spec, "PROP-AUTHENTICATED")
+    dispatch = AsyncMock(return_value={"status": "success", "data": []})
+    with patch("nova_sonic_session.dispatch_tool", dispatch):
+        results = [
+            result
+            async for result in tool.stream(
+                {
+                    "name": "get_vip_guests",
+                    "toolUseId": "t1",
+                    "input": {
+                        "propertyId": "OTHER",
+                        "property_id": "OTHER",
+                        "date": "2026-10-07",
+                    },
+                },
+                {"property_id": "OTHER"},
+            )
+        ]
+    dispatch.assert_awaited_once_with(
+        tool_name="get_vip_guests",
+        property_id="PROP-AUTHENTICATED",
+        params={"date": "2026-10-07"},
+    )
+    assert results == [
+        {
+            "toolUseId": "t1",
             "status": "success",
-            "data": {"occupancyPct": 85, "arrivalsTotal": 12},
-        })
-        monkeypatch.setattr(nova_sonic_session, "dispatch_tool", mock_dispatch)
+            "content": [{"json": {"status": "success", "data": []}}],
+        }
+    ]
 
-        await started_session.execute_tool(
-            tool_name="getOccupancyTool",
-            tool_params={"date": "2025-01-15"},
-            tool_use_id="tool-use-abc123",
+
+@pytest.mark.asyncio
+async def test_parallel_sessions_do_not_share_property_scope():
+    tools = [
+        PropertyScopedTool(TOOL_CONFIGURATION[0]["toolSpec"], pid)
+        for pid in ("PROP-A", "PROP-B")
+    ]
+    dispatch = AsyncMock(return_value={"status": "success", "data": {}})
+
+    async def run(tool):
+        return [r async for r in tool.stream({"toolUseId": "t", "input": {}}, {})]
+
+    with patch("nova_sonic_session.dispatch_tool", dispatch):
+        await asyncio.gather(*(run(tool) for tool in tools))
+    assert {call.kwargs["property_id"] for call in dispatch.call_args_list} == {
+        "PROP-A",
+        "PROP-B",
+    }
+
+
+@pytest.mark.asyncio
+async def test_tool_unavailability_is_preserved_for_model():
+    tool = PropertyScopedTool(TOOL_CONFIGURATION[2]["toolSpec"], "PROP")
+    unavailable = {
+        "status": "unavailable",
+        "message": "I don't have that data right now.",
+    }
+    with patch("nova_sonic_session.dispatch_tool", AsyncMock(return_value=unavailable)):
+        results = [r async for r in tool.stream({"toolUseId": "t1", "input": {}}, {})]
+    assert results[0]["content"] == [{"json": unavailable}]
+
+
+@pytest.mark.asyncio
+async def test_receive_failure_closes_socket_and_agent(session, agent):
+    async def receive():
+        raise RuntimeError("sensitive provider body")
+        yield {}
+
+    agent.receive = receive
+    await session.start()
+    await session.handle_output_events()
+    assert messages(session)[-1]["code"] == "STREAM_DISCONNECTED"
+    assert "sensitive" not in str(messages(session))
+    session.context.ws.close.assert_awaited_once_with(code=1011)
+    agent.stop.assert_awaited_once()
+    assert not session.context.is_stream_active
+
+
+@pytest.mark.asyncio
+async def test_usage_event_does_not_interrupt_transcription(session, agent):
+    """Real GA usage envelopes precede speech and use camel-case token keys."""
+
+    async def receive():
+        yield BidiUsageEvent(input_tokens=20, output_tokens=3, total_tokens=23)
+        yield BidiTranscriptBlockEvent("Any VIP arrivals?", "user", "u1")
+
+    agent.receive = receive
+    await session.start()
+    await session.handle_output_events()
+    assert messages(session) == [
+        {"type": "userTranscript", "text": "Any VIP arrivals?", "isFinal": True}
+    ]
+    session.context.ws.close.assert_not_awaited()
+    agent.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_receive_exhaustion_stops_agent(session, agent):
+    async def receive():
+        yield BidiTranscriptBlockEvent("Any VIP arrivals?", "user", "u1")
+
+    agent.receive = receive
+    await session.start()
+    await session.handle_output_events()
+    agent.stop.assert_awaited_once()
+    assert not session.context.is_stream_active
+
+
+def test_idle_boundary(session):
+    session.context.last_activity = time.time() - 61
+    assert session.is_idle()
+    session.reset_idle_timer()
+    assert not session.is_idle()
+
+
+@pytest.mark.asyncio
+async def test_real_ga_agent_assembles_history_and_executes_scoped_tool():
+    """Exercise the real agent loop, not a mocked agent, over two user turns."""
+    from strands.bidi.agent import BidiAgent
+    from strands.bidi.models import BidiModel
+    from strands.types.tools import ToolResultBlock
+    from strands.bidi.types import (
+        BidiConnectionStartEvent,
+        BidiToolUseBlocksEvent,
+        BidiTranscriptStopEvent,
+    )
+
+    model = MagicMock(spec=BidiModel)
+    model.get_config.return_value = {"model_id": MODEL_ID}
+    model.get_connection_config.return_value = {}
+    model.start = AsyncMock()
+    model.stop = AsyncMock()
+    model.send = AsyncMock()
+    queue = asyncio.Queue()
+    events = [BidiConnectionStartEvent("connection1", MODEL_ID)]
+    for number, phrase in enumerate(("Any VIP arrivals?", "What time?")):
+        cid = f"u{number}"
+        events.extend(
+            [
+                BidiTranscriptStartEvent("user", cid),
+                BidiTranscriptDeltaEvent(phrase, "user", cid),
+                BidiTranscriptStopEvent("user", cid),
+            ]
         )
-
-        # Extract all events sent to the stream after execute_tool
-        sent_events = _extract_sent_events(mock_stream_response)
-
-        # Should have: contentStart (TOOL_RESULT), toolResult, contentEnd
-        tool_result_events = [
-            e for e in sent_events
-            if "toolResult" in e.get("event", {})
+    events.extend(
+        [
+            BidiResponseStartEvent("r1"),
+            BidiToolUseBlocksEvent(
+                [{"name": "get_vip_guests", "toolUseId": "t1", "input": {}}]
+            ),
+            BidiResponseStopEvent("r1"),
         ]
-        assert len(tool_result_events) == 1, "Expected exactly one toolResult event"
+    )
+    for event in events:
+        queue.put_nowait(event)
 
-        # Verify toolResult structure
-        tool_result = tool_result_events[0]["event"]["toolResult"]
-        assert tool_result["promptName"] == started_session._prompt_name
-        result_content = json.loads(tool_result["content"])
-        assert result_content["status"] == "success"
-        assert result_content["data"]["occupancyPct"] == 85
+    async def receive():
+        while True:
+            yield await queue.get()
 
-    @pytest.mark.asyncio
-    async def test_execute_tool_sends_content_start_with_tool_use_id(
-        self,
-        started_session: "NovaSonicSession",
-        mock_stream_response: MagicMock,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """execute_tool sends contentStart with TOOL_RESULT type and toolUseId.
+    model.receive = receive
+    tool = PropertyScopedTool(TOOL_CONFIGURATION[2]["toolSpec"], "PROP-AUTHENTICATED")
+    agent = BidiAgent(model=model, tools=[tool], system_prompt=SYSTEM_PROMPT)
+    result = {"status": "success", "data": {"count": 3}}
 
-        Property 6: Tool result event includes the correlation toolUseId.
-        Validates: Requirement 3.3
-        """
-        import nova_sonic_session
+    async def send(content):
+        if any(
+            isinstance(block, ToolResultBlock) and block.content == [{"json": result}]
+            for block in content.content
+        ):
+            # A second response can follow only after the result reaches the model.
+            queue.put_nowait(BidiResponseStartEvent("r2"))
+            queue.put_nowait(BidiResponseStopEvent("r2"))
 
-        mock_dispatch = AsyncMock(return_value={
-            "status": "success",
-            "data": {"adr": 250.00},
-        })
-        monkeypatch.setattr(nova_sonic_session, "dispatch_tool", mock_dispatch)
-
-        await started_session.execute_tool(
-            tool_name="getRevenueTool",
-            tool_params={},
-            tool_use_id="tool-use-xyz789",
-        )
-
-        sent_events = _extract_sent_events(mock_stream_response)
-
-        # Find the contentStart for TOOL result
-        content_starts = [
-            e for e in sent_events
-            if "contentStart" in e.get("event", {})
-            and e["event"]["contentStart"].get("type") == "TOOL"
-        ]
-        assert len(content_starts) == 1
-
-        content_start = content_starts[0]["event"]["contentStart"]
-        assert content_start["role"] == "TOOL"
-        tool_config = content_start["toolResultInputConfiguration"]
-        assert tool_config["toolUseId"] == "tool-use-xyz789"
-
-    @pytest.mark.asyncio
-    async def test_execute_tool_uses_session_property_id(
-        self,
-        started_session: "NovaSonicSession",
-        mock_stream_response: MagicMock,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """execute_tool calls dispatch_tool with the session's property_id.
-
-        Property 6: Tool dispatch always uses session property_id for scope.
-        Validates: Requirement 3.3
-        """
-        import nova_sonic_session
-
-        mock_dispatch = AsyncMock(return_value={"status": "success", "data": {}})
-        monkeypatch.setattr(nova_sonic_session, "dispatch_tool", mock_dispatch)
-
-        await started_session.execute_tool(
-            tool_name="getRoomStatusTool",
-            tool_params={},
-            tool_use_id="tool-use-001",
-        )
-
-        # Verify dispatch_tool was called with the session's property_id
-        mock_dispatch.assert_called_once_with(
-            tool_name="getRoomStatusTool",
-            property_id="PROP-TEST-001",
-            params={},
-        )
-
-    @pytest.mark.asyncio
-    async def test_execute_tool_unavailable_result_forwarded(
-        self,
-        started_session: "NovaSonicSession",
-        mock_stream_response: MagicMock,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Unavailability result from tool handler is forwarded as toolResult.
-
-        Property 6: Any tool handler return (including unavailability) produces
-        a valid toolResult event so Nova Sonic can tell the GM about the gap.
-        Validates: Requirement 3.3
-        """
-        import nova_sonic_session
-
-        mock_dispatch = AsyncMock(return_value={
-            "status": "unavailable",
-            "message": "Revenue data is temporarily unavailable",
-        })
-        monkeypatch.setattr(nova_sonic_session, "dispatch_tool", mock_dispatch)
-
-        result = await started_session.execute_tool(
-            tool_name="getRevenueTool",
-            tool_params={"startDate": "2025-01-15"},
-            tool_use_id="tool-use-fail",
-        )
-
-        # Verify the result is returned to the caller
-        assert result["status"] == "unavailable"
-
-        # Verify it was also sent to the stream
-        sent_events = _extract_sent_events(mock_stream_response)
-        tool_result_events = [
-            e for e in sent_events
-            if "toolResult" in e.get("event", {})
-        ]
-        assert len(tool_result_events) == 1
-        content = json.loads(tool_result_events[0]["event"]["toolResult"]["content"])
-        assert content["status"] == "unavailable"
-
-
-# ---------------------------------------------------------------------------
-# Idle Timer and Timeout Detection
-# ---------------------------------------------------------------------------
-
-
-class TestIdleTimeout:
-    """Tests verifying idle timer reset and timeout detection.
-
-    **Validates: Requirement 1.3 (send_audio resets timer)**
-    """
-
-    def test_reset_idle_timer_updates_last_activity(
-        self,
-        session: "NovaSonicSession",
-    ) -> None:
-        """reset_idle_timer updates the last_activity timestamp.
-
-        Validates: Requirement 1.3 (idle timeout tracking)
-        """
-        old_activity = session.context.last_activity
-
-        # Slight delay to ensure time advances
-        time.sleep(0.01)
-        session.reset_idle_timer()
-
-        assert session.context.last_activity > old_activity
-
-    def test_is_idle_returns_true_after_timeout(
-        self,
-        session: "NovaSonicSession",
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """is_idle returns True when last_activity exceeds the timeout threshold.
-
-        Validates: Requirement 1.3 (60s idle timeout)
-        """
-        # Set last_activity to 61 seconds ago
-        session.context.last_activity = time.time() - 61
-
-        assert session.is_idle() is True
-
-    def test_is_idle_returns_false_before_timeout(
-        self,
-        session: "NovaSonicSession",
-    ) -> None:
-        """is_idle returns False when session is still within timeout window.
-
-        Validates: Requirement 1.3 (60s idle timeout)
-        """
-        # Fresh session — last_activity was just set
-        assert session.is_idle() is False
-
-    @pytest.mark.asyncio
-    async def test_send_audio_resets_idle_timer(
-        self,
-        started_session: "NovaSonicSession",
-    ) -> None:
-        """send_audio resets the idle timer on every call.
-
-        Property 1 + idle: Audio input prevents idle timeout.
-        Validates: Requirement 1.3
-        """
-        # Artificially set last_activity to a stale time
-        started_session.context.last_activity = time.time() - 55
-
-        await started_session.send_audio("dGVzdA==")
-
-        # After send_audio, should no longer be near timeout
-        assert started_session.is_idle() is False
-
-
-# ---------------------------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------------------------
-
-
-def _extract_sent_events(mock_stream_response: MagicMock) -> list:
-    """Extract all parsed event dicts from the mock stream send calls.
-
-    Iterates over all calls to input_stream.send(), decodes the byte payload
-    from each InvokeModelWithBidirectionalStreamInputChunk, and parses the JSON.
-
-    Args:
-        mock_stream_response: The mock stream response with recorded send calls.
-
-    Returns:
-        List of parsed event dicts sent to the stream.
-    """
-    events = []
-    for call in mock_stream_response.input_stream.send.call_args_list:
-        chunk = call[0][0]  # First positional argument
-        # The chunk has .value.bytes_ containing the JSON payload
-        payload_bytes = chunk.value.bytes_
-        event_dict = json.loads(payload_bytes.decode("utf-8"))
-        events.append(event_dict)
-    return events
+    model.send.side_effect = send
+    dispatch = AsyncMock(return_value=result)
+    completed = []
+    with patch("nova_sonic_session.dispatch_tool", dispatch):
+        await agent.start()
+        try:
+            async with asyncio.timeout(2):
+                async for event in agent.receive():
+                    completed.append(event)
+                    if (
+                        event.get("type") == "bidi_response_stop"
+                        and event["response_id"] == "r2"
+                    ):
+                        break
+        finally:
+            await agent.stop()
+    assert [
+        event["transcript"]
+        for event in completed
+        if event.get("type") == "bidi_transcript_block"
+    ] == ["Any VIP arrivals?", "What time?"]
+    dispatch.assert_awaited_once_with(
+        tool_name="get_vip_guests", property_id="PROP-AUTHENTICATED", params={}
+    )
+    history = [
+        block["text"]
+        for message in agent.messages
+        for block in message["content"]
+        if "text" in block
+    ]
+    assert "Any VIP arrivals?" in history and "What time?" in history
+    assert any(
+        isinstance(block, ToolResultBlock) and block.content == [{"json": result}]
+        for call in model.send.call_args_list
+        for block in call.args[0].content
+    )

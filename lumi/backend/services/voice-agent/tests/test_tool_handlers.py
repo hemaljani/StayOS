@@ -139,29 +139,22 @@ class TestDispatchRouting:
         """
         from tool_handlers import dispatch_tool
 
-        # Query for arrivals returns a VIP reservation
+        # The handler reads the same pre-generated VIP arrivals as the UI.
         mock_table = mock_dynamodb.Table.return_value
-        mock_table.query.return_value = {
-            "Items": [
-                {
-                    "propertyId": "PROP-001",
-                    "guestId": "G-100",
-                    "guestName": "Dr. Elena Martinez",
-                    "loyaltyTier": "AMBASSADOR",
-                    "roomNumber": "1201",
-                    "roomType": "Presidential Suite",
-                    "arrivalDate": "2025-01-15",
-                }
-            ],
-        }
-        # Guest profile lookup
         mock_table.get_item.return_value = {
             "Item": {
                 "propertyId": "PROP-001",
-                "guestId": "G-100",
-                "specialOccasion": "Anniversary",
-                "preferences": ["high floor", "ocean view"],
-                "totalStays": Decimal("15"),
+                "briefDate": "2025-01-15",
+                "vipArrivals": [
+                    {
+                        "guestId": "G-100",
+                        "guestName": "Dr. Elena Martinez",
+                        "loyaltyTier": "AMBASSADOR",
+                        "specialOccasion": "Anniversary",
+                        "preferences": ["high floor", "ocean view"],
+                        "totalStays": Decimal("15"),
+                    }
+                ],
             }
         }
 
@@ -169,6 +162,9 @@ class TestDispatchRouting:
 
         assert result["status"] == "success"
         assert result["data"]["vipCount"] == 1
+        mock_table.get_item.assert_called_once_with(
+            Key={"propertyId": "PROP-001", "briefDate": "2025-01-15"}
+        )
 
     @pytest.mark.asyncio
     async def test_dispatch_routes_to_room_status(
@@ -677,17 +673,12 @@ class TestHandlerResponseStructure:
         from tool_handlers import dispatch_tool
 
         mock_table = mock_dynamodb.Table.return_value
-        # Non-VIP tier arrivals only
-        mock_table.query.return_value = {
-            "Items": [
-                {
-                    "propertyId": "PROP-001",
-                    "guestId": "G-300",
-                    "guestName": "Regular Guest",
-                    "loyaltyTier": "SILVER",
-                    "arrivalDate": "2025-01-15",
-                }
-            ],
+        mock_table.get_item.return_value = {
+            "Item": {
+                "propertyId": "PROP-001",
+                "briefDate": "2025-01-15",
+                "vipArrivals": [],
+            },
         }
 
         result = await dispatch_tool("get_vip_guests", "PROP-001", {"date": "2025-01-15"})

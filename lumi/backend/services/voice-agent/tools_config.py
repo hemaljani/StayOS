@@ -13,8 +13,9 @@ Tool names use snake_case per Nova Sonic best practices.
 Property ID is intentionally excluded from tool parameters - it is injected
 from the authenticated session context to enforce property-scoped access.
 
-Role in project: This module is imported by nova_sonic_session.py when
-constructing the promptStart event sent to Nova Sonic at session initialization.
+Role in project: The Strands session adapter retains these tool names,
+descriptions, and schemas. PropertyScopedTool converts the JSON schema strings
+to objects; the GA Nova provider serializes them into its promptStart event.
 """
 
 import json

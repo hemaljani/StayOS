@@ -10,9 +10,9 @@ The dispatch_tool function routes Nova Sonic toolUse events to the correct
 handler and catches errors at the boundary, returning structured unavailability
 responses so Nova Sonic can communicate data gaps to the GM.
 
-Role in project: Imported by nova_sonic_session.py when processing toolUse
-events from the Nova Sonic bidirectional stream. Reuses the exact DynamoDB
-access patterns established in data_puller.py.
+Role in project: Called by session-bound Strands tools in nova_sonic_session.py.
+Strands schedules execution while the adapter supplies authenticated property
+scope. Reuses the DynamoDB access patterns established in data_puller.py.
 """
 
 import asyncio

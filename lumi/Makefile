@@ -49,8 +49,8 @@ step = $(if $(filter 1,$(ORCHESTRATED)),  - $(2),[$(1)] $(2))
         remove-legacy-layer-build-stack package-backend package-infra \
         deploy-infra update-lambda-code write-frontend-env build-frontend \
         deploy-frontend invalidate-cdn preflight clean test lint \
-        test-backend test-frontend \
-        voice-build voice-deploy voice-destroy reseed \
+        test-backend test-frontend test-voice-agent \
+        voice-build voice-deploy voice-upgrade voice-description voice-rollback voice-destroy reseed \
         gateway-deploy gateway-destroy \
         chat-build chat-deploy chat-destroy generate-briefs \
         destroy
@@ -155,12 +155,12 @@ preflight:
 		echo "" && \
 		exit 1)
 	@echo "    done"
-	@echo "$(call step,prerequisite,Verifying Bedrock model access (amazon.nova-2-sonic-v1:0)...)"
+	@echo "$(call step,prerequisite,Verifying Bedrock model availability (amazon.nova-2-5-sonic)...)"
 	@aws bedrock get-foundation-model \
-		--model-identifier amazon.nova-2-sonic-v1:0 \
+		--model-identifier amazon.nova-2-5-sonic \
 		--region $(REGION) > /dev/null 2>&1 \
 	|| (echo "" && \
-		echo "ERROR: Amazon Nova Sonic (amazon.nova-2-sonic-v1:0) is not accessible." && \
+		echo "ERROR: Amazon Nova Sonic 2.5 (amazon.nova-2-5-sonic) is not available." && \
 		echo "" && \
 		echo "To enable it, follow these steps:" && \
 		echo "" && \
@@ -374,12 +374,16 @@ invalidate-cdn:
 	@echo "    done"
 
 # ─── Testing ──────────────────────────────────────────────────
-test: test-backend test-frontend
+test: test-backend test-frontend test-voice-agent
 	@echo "All tests passed"
 
 test-backend:
 	@echo "Running backend tests..."
 	@cd backend && python3 -m pytest tests/ -v
+
+test-voice-agent:
+	@echo "Running voice-agent tests..."
+	@cd backend/services/voice-agent && python3 -m pytest tests/ -q
 
 test-frontend:
 	@echo "Running frontend tests..."
@@ -680,6 +684,26 @@ gateway-destroy:
 
 VOICE_BUILD_PROJECT := $(STACK_PREFIX)-voice-agent-build
 VOICE_ECR_URI := $(ACCOUNT_ID).dkr.ecr.$(REGION).amazonaws.com/$(STACK_PREFIX)-voice-agent
+
+# Focused upgrades require existing resources and preserve deployed parameters.
+voice-upgrade:
+	@PYTHONPATH=../tools python3 -m stayos_deploy.voice upgrade \
+		--profile '$(PROFILE)' --cloudformation-profile '$(CLOUDFORMATION_PROFILE)' \
+		--region '$(REGION)' --expected-account-id '$(EXPECTED_ACCOUNT_ID)' \
+		--stack-prefix '$(STACK_PREFIX)' \
+		$(if $(VOICE_BASELINE),--baseline '$(VOICE_BASELINE)',)
+
+voice-rollback:
+	@PYTHONPATH=../tools python3 -m stayos_deploy.voice rollback \
+		--profile '$(PROFILE)' --cloudformation-profile '$(CLOUDFORMATION_PROFILE)' \
+		--region '$(REGION)' --expected-account-id '$(EXPECTED_ACCOUNT_ID)' \
+		--stack-prefix '$(STACK_PREFIX)' --baseline '$(VOICE_BASELINE)'
+
+voice-description:
+	@PYTHONPATH=../tools python3 -m stayos_deploy.voice description \
+		--profile '$(PROFILE)' --cloudformation-profile '$(CLOUDFORMATION_PROFILE)' \
+		--region '$(REGION)' --expected-account-id '$(EXPECTED_ACCOUNT_ID)' \
+		--stack-prefix '$(STACK_PREFIX)'
 
 voice-build:
 	@echo "  [voice] Packaging voice agent source..."

@@ -5,9 +5,18 @@ All notable changes to **StayOS** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.2.1] - 2026-10-08
 
 ### Changed
+- LUMI voice uses Amazon Nova Sonic 2.5 (`amazon.nova-2-5-sonic`) with the
+  GA Strands BidiAgent, preserving its voice, property-scoped tools, prompts,
+  and browser message contract. The GA provider replaces custom Nova event
+  handling and renews connections with conversation history.
+- Added a focused `make lumi-voice-upgrade` path with account checks,
+  change-set scope validation, digest-pinned runtime updates, and rollback.
+- Shortened the voice-stack description and added `make lumi-voice-description`
+  for reviewed metadata-only updates that preserve parameters, permissions,
+  and the deployed runtime.
 - Deployment output is concise by default, with timed progress, per-run logs,
   `VERBOSE=1` diagnostics, `NO_COLOR=1`, and stable line-oriented CI output.
 - LUMI builds its Python 3.12 `x86_64` dependency layer in AWS CodeBuild,
@@ -15,10 +24,6 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   requiring Docker.
 - PULSE runtime wiring now uses a CloudFormation-only update, avoiding a second
   backend package build, Lambda refresh, and seed run.
-
-### Fixed
-- LUMI teardown now waits for all AgentCore Gateway targets to be removed before
-  deleting the Gateway.
 
 ## [1.2.0] - 2026-09-09
 
@@ -165,7 +170,8 @@ on AWS (`us-east-1`).
   30-minute alert auto-resolve sweeper, and 4 CloudFormation nested stacks.
   Served at `/pulse`.
 
-[Unreleased]: https://github.com/hejani/StayOS/compare/v1.2.0...HEAD
-[1.2.0]: https://github.com/hejani/StayOS/compare/v1.1.0...v1.2.0
-[1.1.0]: https://github.com/hejani/StayOS/releases/tag/v1.1.0
-[1.0.0]: https://github.com/hejani/StayOS/releases/tag/v1.0.0
+[Unreleased]: https://github.com/hemaljani/StayOS/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/hemaljani/StayOS/compare/v1.2.0...v1.2.1
+[1.2.0]: https://github.com/hemaljani/StayOS/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/hemaljani/StayOS/releases/tag/v1.1.0
+[1.0.0]: https://github.com/hemaljani/StayOS/releases/tag/v1.0.0

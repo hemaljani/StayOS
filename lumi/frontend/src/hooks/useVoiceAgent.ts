@@ -185,6 +185,7 @@ export function useVoiceAgent(): UseVoiceAgentReturn {
 
   // Track whether a session is actively connected
   const isConnectedRef = useRef<boolean>(false);
+  const sessionReadyRef = useRef<boolean>(false);
 
   /**
    * Stops all queued and playing AudioBufferSourceNodes.
@@ -250,18 +251,15 @@ export function useVoiceAgent(): UseVoiceAgentReturn {
       switch (event.type) {
         case 'sessionStarted':
           // Connection confirmed — transition to listening
+          sessionReadyRef.current = true;
           setState((s) => ({ ...s, status: 'listening', error: null }));
           break;
 
         case 'contentStart':
-          // Agent is about to speak — if currently speaking (barge-in scenario),
-          // stop playback before processing new response
-          setState((s) => {
-            if (s.status === 'speaking') {
-              stopPlayback();
-            }
-            return { ...s, status: 'processing', agentTranscript: '' };
-          });
+          // Generation can finish before queued audio finishes playing.
+          // Clear playback independently of the rendered status on barge-in.
+          stopPlayback();
+          setState((s) => ({ ...s, status: 'processing', agentTranscript: '' }));
           break;
 
         case 'audioOutput':
@@ -297,6 +295,7 @@ export function useVoiceAgent(): UseVoiceAgentReturn {
           break;
 
         case 'error':
+          sessionReadyRef.current = false;
           setState((s) => ({
             ...s,
             status: 'error',
@@ -308,6 +307,7 @@ export function useVoiceAgent(): UseVoiceAgentReturn {
           // Server closed the session (idle timeout, stream error, explicit close)
           stopPlayback();
           isConnectedRef.current = false;
+          sessionReadyRef.current = false;
           setState((s) => ({ ...s, status: 'idle', error: null }));
           break;
       }
@@ -357,7 +357,8 @@ export function useVoiceAgent(): UseVoiceAgentReturn {
     // Listen for 320-sample Int16 PCM frames from the worklet
     workletNode.port.onmessage = (event: MessageEvent<ArrayBuffer>) => {
       const ws = wsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN) {
+      if (sessionReadyRef.current && ws && ws.readyState === WebSocket.OPEN) {
+        // Drop startup audio rather than queue it during identity/cold-start work.
         // Convert Int16 PCM buffer to base64 and send as audioInput event
         const audioData = int16ArrayToBase64(event.data);
         ws.send(JSON.stringify({ type: 'audioInput', audioData }));
@@ -377,6 +378,7 @@ export function useVoiceAgent(): UseVoiceAgentReturn {
    * disconnects the worklet, and closes the AudioContext.
    */
   const cleanupAudioCapture = useCallback(() => {
+    sessionReadyRef.current = false;
     // Stop all media stream tracks (releases the microphone)
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach((track) => track.stop());

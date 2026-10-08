@@ -120,6 +120,7 @@ const mockWorkletNodeDisconnect = vi.fn();
 const mockAudioContextClose = vi.fn().mockResolvedValue(undefined);
 const mockPlaybackContextClose = vi.fn().mockResolvedValue(undefined);
 const mockMediaTrackStop = vi.fn();
+const mockAudioSourceStop = vi.fn();
 
 let workletNodePortOnmessage: ((event: MessageEvent) => void) | null = null;
 
@@ -142,7 +143,7 @@ class MockAudioContext {
     buffer: null,
     connect: vi.fn(),
     start: vi.fn(),
-    stop: vi.fn(),
+    stop: mockAudioSourceStop,
     onended: null as (() => void) | null,
   }));
 
@@ -172,6 +173,7 @@ const mockGetUserMedia = vi.fn();
 beforeEach(() => {
   mockWebSocketInstances = [];
   workletNodePortOnmessage = null;
+  mockAudioSourceStop.mockClear();
 
   // Mock global WebSocket constructor
   vi.stubGlobal('WebSocket', MockWebSocket);
@@ -189,6 +191,57 @@ beforeEach(() => {
   Object.defineProperty(navigator, 'mediaDevices', {
     value: { getUserMedia: mockGetUserMedia },
     configurable: true,
+  });
+});
+
+describe('voice readiness and interruption', () => {
+  it('does not send PCM until the server confirms sessionStarted', async () => {
+    const { result } = renderHook(() => useVoiceAgent());
+    await act(async () => { await result.current.startSession(); });
+    const ws = mockWebSocketInstances[0];
+    await act(async () => { ws.simulateOpen(); });
+    const frame = () => workletNodePortOnmessage?.(
+      new MessageEvent('message', { data: new Int16Array(320).buffer })
+    );
+
+    await act(async () => { frame(); });
+    expect(ws.sentMessages.map((message) => JSON.parse(message).type))
+      .toEqual(['identity', 'sessionStart']);
+
+    await act(async () => {
+      ws.simulateMessage({ type: 'sessionStarted' });
+      frame();
+    });
+    expect(JSON.parse(ws.sentMessages.at(-1)!).type).toBe('audioInput');
+
+    await act(async () => { ws.simulateMessage({ type: 'sessionEnded' }); });
+    const sentCount = ws.sentMessages.length;
+    await act(async () => { frame(); });
+    expect(ws.sentMessages).toHaveLength(sentCount);
+  });
+
+  it('clears queued playback on contentStart even after response completion', async () => {
+    const { result } = renderHook(() => useVoiceAgent());
+    await act(async () => { await result.current.startSession(); });
+    const ws = mockWebSocketInstances[0];
+    await act(async () => {
+      ws.simulateOpen();
+      ws.simulateMessage({ type: 'sessionStarted' });
+      ws.simulateMessage({ type: 'contentStart', role: 'ASSISTANT' });
+    });
+    await act(async () => {
+      ws.simulateMessage({ type: 'audioOutput', audioData: 'AAA=' });
+      ws.simulateMessage({ type: 'contentEnd' });
+    });
+    expect(result.current.state.status).toBe('listening');
+    mockAudioSourceStop.mockClear();
+
+    // Nova can finish generating while the browser still has queued audio.
+    await act(async () => {
+      ws.simulateMessage({ type: 'contentStart', role: 'ASSISTANT' });
+      ws.simulateMessage({ type: 'contentEnd' });
+    });
+    expect(mockAudioSourceStop).toHaveBeenCalledOnce();
   });
 });
 

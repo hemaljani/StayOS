@@ -21,11 +21,9 @@ import asyncio
 import json
 import os
 import signal
-from datetime import datetime
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Set
 
 import boto3
-import requests
 from aws_lambda_powertools import Logger
 from bedrock_agentcore import BedrockAgentCoreApp
 from bedrock_agentcore.runtime.models import PingStatus
@@ -42,9 +40,6 @@ logger: Logger = Logger(service="stayos-voice-agent")
 # Server configuration constants
 IDLE_CHECK_INTERVAL_SECONDS: int = 5
 SHUTDOWN_TIMEOUT_SECONDS: int = 10
-
-# Background task for IMDS credential refresh
-_credential_refresh_task: Optional[asyncio.Task] = None
 
 # Active sessions registry for graceful shutdown tracking.
 # On AgentCore, each microVM hosts exactly one session, but we keep the set
@@ -71,126 +66,8 @@ SETTINGS_TABLE_NAME: str = os.environ.get("SETTINGS_TABLE_NAME", "")
 app: BedrockAgentCoreApp = BedrockAgentCoreApp()
 
 
-# --- IMDS Credential Management ---
-# AgentCore microVMs provide IAM role credentials via IMDS (Instance Metadata Service).
-# The Smithy SDK's EnvironmentCredentialsResolver reads from env vars, so we fetch
-# IMDS credentials and set them as environment variables, then refresh before expiry.
-# This pattern is from the official agentcore-samples (01-bedrock-sonic-ws).
-
-
-def _get_imdsv2_token() -> Optional[str]:
-    """Fetch an IMDSv2 session token (6-hour TTL)."""
-    try:
-        resp = requests.put(
-            "http://169.254.169.254/latest/api/token",
-            headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
-            timeout=2,
-        )
-        if resp.status_code == 200:
-            return resp.text
-    except Exception:
-        pass
-    return None
-
-
-def _fetch_imds_credentials() -> Optional[Dict[str, str]]:
-    """Fetch IAM role credentials from IMDS (IMDSv2 preferred, fallback to v1)."""
-    try:
-        token = _get_imdsv2_token()
-        headers = {"X-aws-ec2-metadata-token": token} if token else {}
-
-        # Get the IAM role name
-        role_resp = requests.get(
-            "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
-            headers=headers,
-            timeout=2,
-        )
-        if role_resp.status_code != 200:
-            logger.error(f"IMDS role lookup failed: HTTP {role_resp.status_code}")
-            return None
-
-        role_name = role_resp.text.strip()
-
-        # Get credentials for the role
-        creds_resp = requests.get(
-            f"http://169.254.169.254/latest/meta-data/iam/security-credentials/{role_name}",
-            headers=headers,
-            timeout=2,
-        )
-        if creds_resp.status_code != 200:
-            logger.error(f"IMDS credential fetch failed: HTTP {creds_resp.status_code}")
-            return None
-
-        creds = creds_resp.json()
-        return {
-            "AccessKeyId": creds["AccessKeyId"],
-            "SecretAccessKey": creds["SecretAccessKey"],
-            "Token": creds["Token"],
-            "Expiration": creds["Expiration"],
-        }
-    except Exception as e:
-        logger.error(f"IMDS credential fetch error: {e}")
-        return None
-
-
-def _set_credentials_env(creds: Dict[str, str]) -> None:
-    """Write IMDS credentials to environment variables for EnvironmentCredentialsResolver."""
-    os.environ["AWS_ACCESS_KEY_ID"] = creds["AccessKeyId"]
-    os.environ["AWS_SECRET_ACCESS_KEY"] = creds["SecretAccessKey"]
-    os.environ["AWS_SESSION_TOKEN"] = creds["Token"]
-
-
-async def _credential_refresh_loop() -> None:
-    """Background task: refresh IMDS credentials before expiry."""
-    while True:
-        try:
-            creds = _fetch_imds_credentials()
-            if creds:
-                _set_credentials_env(creds)
-                logger.info("IMDS credentials refreshed")
-                # Calculate next refresh (5 min before expiry, max 1 hour)
-                try:
-                    expiration = datetime.fromisoformat(
-                        creds["Expiration"].replace("Z", "+00:00")
-                    )
-                    now = datetime.now(expiration.tzinfo)
-                    seconds_until_expiry = (expiration - now).total_seconds()
-                    refresh_in = min(max(seconds_until_expiry - 300, 60), 3600)
-                except Exception:
-                    refresh_in = 3600
-                await asyncio.sleep(refresh_in)
-            else:
-                logger.warning("IMDS credential fetch failed, retrying in 60s")
-                await asyncio.sleep(60)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"Credential refresh loop error: {e}")
-            await asyncio.sleep(60)
-
-
-def _load_initial_credentials() -> None:
-    """Load IMDS credentials at module init (synchronous, before app.run).
-
-    The background refresh task is started lazily on first WebSocket connection
-    since asyncio.create_task requires a running event loop.
-    """
-    # If credentials already set (local dev), skip IMDS
-    if os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY"):
-        logger.info("Credentials already in environment (local mode), skipping IMDS")
-        return
-
-    # Fetch initial credentials from IMDS
-    creds = _fetch_imds_credentials()
-    if creds:
-        _set_credentials_env(creds)
-        logger.info("Initial IMDS credentials loaded successfully")
-    else:
-        logger.error("Failed to load initial IMDS credentials - Bedrock calls will fail")
-
-
-# Load credentials synchronously at module init (before app.run())
-_load_initial_credentials()
+# Strands resolves runtime IAM credentials through Boto3's refreshable chain.
+# No application-managed IMDS credential copying is needed.
 
 
 @app.ping
@@ -498,6 +375,10 @@ async def _message_loop(session: NovaSonicSession, websocket: WebSocket) -> None
             audio_data = message.get("audioData", "")
             if audio_data:
                 await session.send_audio(audio_data)
+
+        elif msg_type == "sessionStart":
+            # Identity verification already opened the session; keep the browser contract.
+            continue
 
         elif msg_type == "sessionEnd":
             # Client requested session end - close gracefully

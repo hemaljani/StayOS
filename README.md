@@ -67,7 +67,7 @@ Amazon Bedrock model access enabled in the target account/region (Claude Sonnet,
 Nova Sonic, Polly). Region defaults to `us-east-1`.
 
 ```bash
-git clone https://github.com/hejani/StayOS.git
+git clone https://github.com/hemaljani/StayOS.git
 cd StayOS
 make deploy-all APP_PASSWORD=YourSecurePassword123!
 ```
