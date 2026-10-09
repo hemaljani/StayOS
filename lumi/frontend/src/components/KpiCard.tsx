@@ -14,7 +14,7 @@ export default function KpiCard({ label, value, unit, delta, deltaLabel, sublabe
   return (
     <div className="bg-surface rounded-xl p-3">
       <p className="text-xs text-gray-400 mb-1 truncate">{label}</p>
-      <p className="text-2xl font-bold">
+      <p className="text-2xl font-bold tabular-nums whitespace-nowrap">
         {unit === '$' && '$'}{value}{unit === '%' && '%'}
       </p>
       {delta !== undefined && (

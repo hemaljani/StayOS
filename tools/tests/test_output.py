@@ -152,6 +152,35 @@ class OutputTest(unittest.TestCase):
             self.assertEqual(17, raised.exception.returncode)
             self.assertEqual("ERROR: stage broke", raised.exception.summary)
 
+    def test_password_is_redacted_from_verbose_output_logs_and_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            password = 'fixture "$value=quoted" password'
+            stream = io.StringIO()
+            runner = CommandRunner(
+                Console(OutputSettings.load({"VERBOSE": "1"}, stream), stream),
+                Path(directory) / "deploy.log",
+                {"APP_PASSWORD": password},
+            )
+            with self.assertRaises(CommandFailed) as raised:
+                runner.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import os,json; p=os.environ['APP_PASSWORD']; "
+                        "print(p); print('ERROR: '+json.dumps(p)); "
+                        "raise SystemExit(17)",
+                    ],
+                    cwd=Path(directory),
+                )
+            for output in (
+                stream.getvalue(),
+                runner.log_path.read_text(),
+                raised.exception.summary,
+            ):
+                self.assertNotIn(password, output)
+                self.assertNotIn("$value", output)
+                self.assertIn("<redacted>", output)
+
 
 if __name__ == "__main__":
     unittest.main()

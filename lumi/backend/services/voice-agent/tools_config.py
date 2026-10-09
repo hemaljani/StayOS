@@ -29,8 +29,9 @@ TOOL_CONFIGURATION: List[Dict[str, Any]] = [
             "name": "get_occupancy",
             "description": (
                 "Get today's occupancy metrics including occupancy percentage, "
-                "total arrivals, total departures, and available rooms for the "
-                "property. Optionally accepts a date to query a specific day."
+                "total arrivals, total departures, and total room inventory "
+                "(totalRooms). Vacant or remaining sellable rooms are not "
+                "provided. Optionally accepts a date to query a specific day."
             ),
             "inputSchema": {
                 "json": json.dumps({

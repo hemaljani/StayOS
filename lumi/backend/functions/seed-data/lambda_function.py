@@ -45,7 +45,7 @@ _dynamodb = boto3.resource(
 SUCCESS = "SUCCESS"
 FAILED = "FAILED"
 
-# Dataset table environment variable names (used in Step 5)
+# Dataset table environment variable names (used in Step 4)
 DATASET_TABLE_ENV_VARS: List[str] = [
     "ROOMS_TABLE_NAME",
     "GUESTS_TABLE_NAME",
@@ -351,9 +351,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
         1. Provision Cognito users for 5 GMs
         2. Seed default settings in DynamoDB
         3. Create per-GM EventBridge Scheduler schedules
-        4. Seed historical brief data
-        5. Seed hotel operations dataset (rooms -> guests -> revenue ->
+        4. Seed hotel operations dataset (rooms -> guests -> revenue ->
            reservations -> work-orders -> status reconciliation)
+        5. Seed historical briefs from the stored operational revenues
 
     Args:
         event: CloudFormation custom resource event with RequestType,
@@ -405,30 +405,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
             # Step 3: Create per-GM EventBridge Scheduler schedules (REQ-SCHED-5)
             schedules_created = provision_schedules(gm_list=GM_SEED_DATA)
 
-            # Step 4: Seed historical brief data (REQ-HIST-4)
-            # Wrapped in its own try/except to ensure failure does not block
-            # the CloudFormation deployment - graceful degradation
-            briefs_seeded = 0
-            try:
-                briefs_table_name = os.environ.get("BRIEFS_TABLE_NAME", "")
-                if briefs_table_name:
-                    briefs_seeded = seed_historical_briefs(
-                        table_name=briefs_table_name,
-                        gm_list=GM_SEED_DATA,
-                        days=7,
-                    )
-                else:
-                    logger.warning(
-                        "BRIEFS_TABLE_NAME not configured, skipping historical brief seeding"
-                    )
-            except Exception as exc:
-                logger.error(
-                    "Historical brief seeding failed - continuing",
-                    extra={"error": str(exc), "error_type": type(exc).__name__},
-                    exc_info=True,
-                )
-
-            # Step 5: Seed hotel operations dataset (REQ-DS-8)
+            # Step 4: Seed hotel operations dataset (REQ-DS-8)
             # Wrapped in try/except for graceful degradation - dataset failure
             # should not block the CloudFormation deployment
             dataset_counts: Dict[str, int] = {}
@@ -550,6 +527,29 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
             except Exception as exc:
                 logger.error(
                     "Hotel operations dataset generation failed - continuing",
+                    extra={"error": str(exc), "error_type": type(exc).__name__},
+                    exc_info=True,
+                )
+
+            # Step 5: Revenue must exist before historical KPI mapping on a
+            # fresh install. Keep independent failure handling and idempotency.
+            briefs_seeded = 0
+            try:
+                briefs_table_name = os.environ.get("BRIEFS_TABLE_NAME", "")
+                if briefs_table_name:
+                    briefs_seeded = seed_historical_briefs(
+                        table_name=briefs_table_name,
+                        gm_list=GM_SEED_DATA,
+                        days=7,
+                        revenues_table_name=os.environ["REVENUES_TABLE_NAME"],
+                    )
+                else:
+                    logger.warning(
+                        "BRIEFS_TABLE_NAME not configured, skipping historical brief seeding"
+                    )
+            except Exception as exc:
+                logger.error(
+                    "Historical brief seeding failed - continuing",
                     extra={"error": str(exc), "error_type": type(exc).__name__},
                     exc_info=True,
                 )

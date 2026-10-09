@@ -30,17 +30,6 @@ coverage.xml
 # Build logs emitted by the per-feature Makefiles (build-frontend, etc.).
 *build-frontend.log
 build.log
-
-# Kiro local tooling + specs/config for every feature directory (root, lumi,
-# pulse, and any future feature). Local IDE/agent state and specs, not app
-# source. Unanchored so it matches .kiro/ at any depth.
-.kiro/
-
-
-# Agent guide files (AGENTS.md) at any depth — local agent instructions,
-# not app source. Unanchored so it matches the repo root and every feature
-# directory (lumi/, pulse/, shared/, stayos-shell/, and any future one).
-# NOTE: files already committed stay tracked until explicitly `git rm --cached`.
 AGENTS.md
 
 # Data-orchestrator local build artifacts (packaged Lambda zip staging).
@@ -48,8 +37,6 @@ shared/data-orchestrator/build/
 
 # Local-only deployment bug journal (working notes, not tracked).
 docs/bugs.md
-# Local UI design mockups (scratch, not part of the app).
-.design-mockups/
 
 # Logs
 logs
@@ -76,4 +63,3 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
-

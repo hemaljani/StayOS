@@ -21,10 +21,13 @@ NUMERIC_TOLERANCE = 1.0
 # Regex pattern to extract integers and decimals from narrative text
 # Matches patterns like: 87, 4.2, 248, 103, 7.1
 _NUMBER_PATTERN = re.compile(r"\b\d+(?:\.\d+)?\b")
+# Spanish narratives use decimal commas; interpret the complete value before
+# checking it, rather than falsely treating its fractional digits as a KPI.
+_SPANISH_DECIMAL_PATTERN = re.compile(r"(?<![\d.,])\d+(?:\.\d{3})*,\d+(?!\d|[.,]\d)")
 
 
 def validate_narrative(
-    narrative: str, source_data: Dict[str, Any]
+    narrative: str, source_data: Dict[str, Any], *, language: str = "en-US"
 ) -> Tuple[bool, List[str]]:
     """Validate that all numbers in the narrative match source KPI data.
 
@@ -36,6 +39,8 @@ def validate_narrative(
         narrative: The AI-generated narrative text to validate.
         source_data: Combined property data dict containing dailyKPIs,
             actionItems, and vipArrivals with the authoritative values.
+        language: Narrative locale; Spanish decimal commas are parsed as
+            decimals. The original narrative and numeric tolerance are preserved.
 
     Returns:
         A tuple of (is_valid, discrepancies) where:
@@ -48,7 +53,7 @@ def validate_narrative(
         return (True, [])
 
     # Extract all numbers from the narrative
-    extracted_numbers = _extract_numbers(narrative)
+    extracted_numbers = _extract_numbers(narrative, language)
 
     if not extracted_numbers:
         logger.info("No numbers found in narrative - validation passes")
@@ -82,7 +87,7 @@ def validate_narrative(
     return (True, [])
 
 
-def _extract_numbers(text: str) -> List[float]:
+def _extract_numbers(text: str, language: str = "en-US") -> List[float]:
     """Extract all numeric values from narrative text.
 
     Finds integers and decimal numbers using regex. Returns them as
@@ -94,6 +99,10 @@ def _extract_numbers(text: str) -> List[float]:
     Returns:
         List of float values found in the text.
     """
+    if language == "es-ES":
+        text = _SPANISH_DECIMAL_PATTERN.sub(
+            lambda match: match.group().replace(".", "").replace(",", "."), text
+        )
     matches = _NUMBER_PATTERN.findall(text)
     return [float(match) for match in matches]
 

@@ -32,6 +32,9 @@ const config: Config = {
         'tier-critical': withAlpha('--c-tier-critical'),
         'tier-warning': withAlpha('--c-tier-warning'),
         'tier-info': withAlpha('--c-tier-info'),
+        'tier-ambassador': withAlpha('--c-warning'),
+        'tier-titanium': withAlpha('--c-ink-soft'),
+        'tier-platinum': withAlpha('--c-accent'),
         white: withAlpha('--c-white'),
         gray: {
           200: withAlpha('--c-gray-200'),

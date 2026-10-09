@@ -17,7 +17,7 @@ import ErrorBoundary from '@/components/ErrorBoundary';
 export const metadata: Metadata = {
   title: 'PULSE | StayOS',
   description: 'Real-time tiered alerts for hotel General Managers - Part of StayOS',
-  manifest: '/manifest.json',
+  manifest: '/pulse/manifest.json',
   appleWebApp: {
     capable: true,
     statusBarStyle: 'black-translucent',

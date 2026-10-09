@@ -141,6 +141,16 @@ def test_shape_ops_composes_group_checkout_summary() -> None:
     assert group_checkout["confirmedReservations"] == 40
 
 
+def test_shape_ops_preserves_capacity_with_new_gateway_inventory_name() -> None:
+    """The new tool field wins, including zero, while the REST shape is stable."""
+    for inventory in [0, 368]:
+        results = _ops_results()
+        results["get_occupancy"]["data"]["totalRooms"] = inventory
+        result = shape_ops(_PID, RecordingToolCaller(results))
+        assert result["facility"]["availableRooms"] == inventory
+        assert result["groupCheckout"]["availableRooms"] == inventory
+
+
 def test_shape_ops_scopes_every_tool_call_by_property_id() -> None:
     """All three Ops tool calls are scoped with the correct propertyId."""
     caller = RecordingToolCaller(_ops_results())

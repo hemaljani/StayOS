@@ -21,18 +21,20 @@ import {
   VIP_TIER_FALLBACK_PILL,
   vipTierLabel,
 } from '@/lib/constants';
-import { initialsFor } from '@/lib/format';
+import { formatVipArrival, initialsFor } from '@/lib/format';
 
 interface VipProfileModalProps {
   guest: VipGuest;
+  propertyId?: string;
   onClose: () => void;
 }
 
-export default function VipProfileModal({ guest, onClose }: VipProfileModalProps) {
+export default function VipProfileModal({ guest, propertyId, onClose }: VipProfileModalProps) {
   const tier = String(guest.loyaltyTier ?? 'UNKNOWN');
   const avatarClass = VIP_TIER_AVATAR_COLORS[tier] ?? VIP_TIER_FALLBACK_AVATAR;
   const pillClass = VIP_TIER_PILL_COLORS[tier] ?? VIP_TIER_FALLBACK_PILL;
   const initials = initialsFor(guest.guestName, guest.initials);
+  const arrival = formatVipArrival(guest.estimatedArrival, propertyId);
 
   // Close on Escape for keyboard accessibility.
   useEffect(() => {
@@ -81,7 +83,7 @@ export default function VipProfileModal({ guest, onClose }: VipProfileModalProps
         <div className="text-center">
           <span
             aria-hidden
-            className={`inline-flex items-center justify-center w-14 h-14 rounded-full text-lg font-black text-white mb-2 ${avatarClass}`}
+            className={`inline-flex items-center justify-center w-14 h-14 rounded-full text-lg font-black mb-2 ${avatarClass}`}
           >
             {initials}
           </span>
@@ -97,7 +99,7 @@ export default function VipProfileModal({ guest, onClose }: VipProfileModalProps
         <div className="grid grid-cols-3 gap-2 mt-4 mb-4">
           <ProfileStat label="Stays" value={typeof guest.totalStays === 'number' ? String(guest.totalStays) : '--'} />
           <ProfileStat label="Room" value={guest.roomNumber ?? '--'} />
-          <ProfileStat label="Arrival" value={guest.estimatedArrival ?? '--'} />
+          <ProfileStat label="Arrival" value={arrival.time} title={arrival.detail} />
         </div>
 
         {/* Preferences (Requirement 15.10) */}
@@ -139,10 +141,10 @@ export default function VipProfileModal({ guest, onClose }: VipProfileModalProps
 }
 
 // A single stat tile in the profile header row.
-function ProfileStat({ label, value }: { label: string; value: string }) {
+function ProfileStat({ label, value, title }: { label: string; value: string; title?: string }) {
   return (
     <div className="bg-surface-2 rounded-lg p-2 text-center">
-      <p className="text-sm font-bold text-ink tabular-nums truncate">{value}</p>
+      <p title={title} className="text-sm font-bold text-ink tabular-nums truncate">{value}</p>
       <p className="text-[9px] uppercase tracking-wide text-gray-500 mt-0.5">{label}</p>
     </div>
   );

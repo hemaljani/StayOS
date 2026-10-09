@@ -13,11 +13,13 @@ Supports REQ-HIST-1 through REQ-HIST-6.
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import boto3
 from aws_lambda_powertools import Logger
+from boto3.dynamodb.conditions import Attr
 from botocore.exceptions import ClientError
+from revenue_kpis import format_revenue_kpis
 
 # Module-level logger matching existing seed-data service name
 logger = Logger(service="stayos-seed-data")
@@ -889,6 +891,7 @@ def _build_historical_brief_record(
     profile: Dict[str, Any],
     brief_date: str,
     day_index: int,
+    revenue: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Assemble a complete DynamoDB brief record for one property on one day.
 
@@ -901,6 +904,8 @@ def _build_historical_brief_record(
         profile: Property profile dict from PROPERTY_PROFILES.
         brief_date: Date string in YYYY-MM-DD format (sort key).
         day_index: Day position (0-6) in the seed window.
+        revenue: Matching stored revenue record. When supplied, it replaces
+            the illustrative KPI series before narrative generation.
 
     Returns:
         Complete DynamoDB item dict ready for PutItem.
@@ -911,6 +916,11 @@ def _build_historical_brief_record(
 
     # Generate day-specific KPIs
     kpis = _generate_daily_kpis(profile, day_index, brief_date)
+    if revenue is not None:
+        vip_counts = {
+            key: value for key, value in kpis["arrivals"].items() if key != "total"
+        }
+        kpis = format_revenue_kpis(revenue, brief_date, generated_at, vip_counts)
 
     # Get VIP count from generated KPIs for action item selection
     vip_count = kpis["arrivals"]["vipCount"]
@@ -993,7 +1003,9 @@ def _build_historical_brief_record(
             "voiceId": "Matthew",
             "engine": "neural",
         },
-        "dataSourceStatus": {"MOCK_SEED": "SUCCESS"},
+        "dataSourceStatus": {
+            "DATASET_REVENUES" if revenue is not None else "MOCK_SEED": "SUCCESS"
+        },
         "gmAlias": gm_alias,
         "language": gm["language"],
         "status": status,
@@ -1011,6 +1023,7 @@ def seed_historical_briefs(
     table_name: str,
     gm_list: List[Dict[str, Any]],
     days: int = DEFAULT_DAYS,
+    revenues_table_name: Optional[str] = None,
 ) -> int:
     """Seed historical brief records for all GMs into DynamoDB.
 
@@ -1022,6 +1035,9 @@ def seed_historical_briefs(
         table_name: Name of the DynamoDB briefs table (stayos-briefs).
         gm_list: List of GM dictionaries from GM_SEED_DATA.
         days: Number of days to seed (default 7, today-6 through today).
+        revenues_table_name: Authoritative operational revenue table. Production
+            passes this explicitly; missing property/date records are skipped.
+            Omit only for standalone illustrative data or legacy offline tests.
 
     Returns:
         Number of records successfully written (excludes skipped duplicates).
@@ -1031,7 +1047,24 @@ def seed_historical_briefs(
             to trigger graceful degradation in the caller).
     """
     table = _dynamodb_resource.Table(table_name)
-    today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+    now = datetime.now(tz=timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+    revenue_history = {}
+    if revenues_table_name:
+        # Reuse existing Scan permission, retaining the pilot/date window from
+        # every page. DynamoDB applies these filters after reading the table.
+        start_date = (now - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+        paginator = _dynamodb_resource.meta.client.get_paginator("scan")
+        for page in paginator.paginate(
+            TableName=revenues_table_name,
+            ConsistentRead=True,
+            FilterExpression=(
+                Attr("propertyId").is_in([gm["propertyId"] for gm in gm_list])
+                & Attr("date").between(start_date, today)
+            ),
+        ):
+            for item in page.get("Items", []):
+                revenue_history[(item["propertyId"], item["date"])] = item
 
     records_written = 0
     records_skipped = 0
@@ -1064,9 +1097,14 @@ def seed_historical_briefs(
         for day_index in range(days):
             # day_index 0 = today - (days-1), day_index (days-1) = today
             day_offset = day_index - (days - 1)
-            brief_date = (
-                datetime.now(tz=timezone.utc) + timedelta(days=day_offset)
-            ).strftime("%Y-%m-%d")
+            brief_date = (now + timedelta(days=day_offset)).strftime("%Y-%m-%d")
+            revenue = revenue_history.get((property_id, brief_date))
+            if revenues_table_name and revenue is None:
+                logger.warning(
+                    "Skipping historical brief without matching revenue",
+                    extra={"property_id": property_id, "brief_date": brief_date},
+                )
+                continue
 
             # Build the complete record
             record = _build_historical_brief_record(
@@ -1074,6 +1112,7 @@ def seed_historical_briefs(
                 profile=profile,
                 brief_date=brief_date,
                 day_index=day_index,
+                revenue=revenue,
             )
 
             try:

@@ -84,6 +84,24 @@ def test_get_kitchen_missing_returns_none() -> None:
     assert missing is None
 
 
+def test_get_kitchen_corrects_legacy_count_without_writing_snapshot() -> None:
+    """The existing snapshot is corrected on read without a reseed or DB write."""
+    with mock_aws():
+        table = create_kitchen_table()
+        item = make_kitchen_item("ALOHA-CHI-001")
+        item["fbStats"][0]["delta"] = "In-flight: 12"
+        table.put_item(Item=item)
+        result = repo.get_kitchen(
+            identity("jsmith", {"ALOHA-CHI-001"}),
+            "ALOHA-CHI-001",
+            kitchen_table_name=KITCHEN_TABLE_NAME,
+            table_getter=table_getter,
+        )
+        assert result["fbStats"][0]["delta"] == "In-flight: 1"
+        stored = table.get_item(Key={"propertyId": "ALOHA-CHI-001"})["Item"]
+        assert stored["fbStats"][0]["delta"] == "In-flight: 12"
+
+
 def test_get_kitchen_overlays_live_banquet_countdown() -> None:
     """The returned snapshot's banquet countdown is recomputed live at read time.
 

@@ -24,8 +24,8 @@ AWS_DEFAULT_REGION := $(REGION)
 export AWS_REGION AWS_DEFAULT_REGION
 AWS_PROFILE_FLAG := $(if $(PROFILE),--profile $(PROFILE),)
 CFN_PROFILE_FLAG := $(if $(CLOUDFORMATION_PROFILE),--profile $(CLOUDFORMATION_PROFILE),)
-CFN_AWS := aws $(CFN_PROFILE_FLAG) --region $(REGION)
-ACCOUNT_ID ?= $(shell aws $(AWS_PROFILE_FLAG) --region $(REGION) sts get-caller-identity --query Account --output text 2>/dev/null)
+CFN_AWS := env -u APP_PASSWORD -u MAKEFLAGS -u MFLAGS -u MAKEOVERRIDES aws $(CFN_PROFILE_FLAG) --region $(REGION)
+ACCOUNT_ID ?= $(shell env -u APP_PASSWORD -u MAKEFLAGS -u MFLAGS -u MAKEOVERRIDES aws $(AWS_PROFILE_FLAG) --region $(REGION) sts get-caller-identity --query Account --output text 2>/dev/null)
 CFN_ACCOUNT_ID ?= $(shell $(CFN_AWS) sts get-caller-identity --query Account --output text 2>/dev/null)
 STACK_NAME := $(STACK_PREFIX)-$(REGION)
 DEPLOY_BUCKET := $(STACK_PREFIX)-deploy-$(ACCOUNT_ID)
@@ -39,6 +39,16 @@ DEPENDENCY_LAYER_S3_KEY := layers/stayos-dependencies-$(DEPENDENCY_BUILD_HASH).z
 AUDIO_BUCKET := $(STACK_PREFIX)-audio-$(ACCOUNT_ID)
 BEDROCK_MODEL_ID ?= us.anthropic.claude-sonnet-4-6
 APP_PASSWORD ?=
+override APP_PASSWORD := $(value APP_PASSWORD)
+CHANGE_APP_PASSWORD ?= 0
+export APP_PASSWORD CHANGE_APP_PASSWORD
+# Deploy's prerequisites are an ordered workflow, including with make -j.
+.NOTPARALLEL:
+PASSWORD_TOOL = PYTHONPATH=../tools python3 -m stayos_deploy.password
+PASSWORD_CONTEXT = --profile '$(PROFILE)' \
+	--cloudformation-profile '$(CLOUDFORMATION_PROFILE)' --region '$(REGION)' \
+	--expected-account-id '$(if $(EXPECTED_ACCOUNT_ID),$(EXPECTED_ACCOUNT_ID),$(ACCOUNT_ID))' \
+	--stack-prefix '$(STACK_PREFIX)'
 ORCHESTRATED ?= 0
 GATEWAY_DELETE_MAX_ATTEMPTS ?= 60
 GATEWAY_DELETE_POLL_SECONDS ?= 5
@@ -48,7 +58,7 @@ step = $(if $(filter 1,$(ORCHESTRATED)),  - $(2),[$(1)] $(2))
 .PHONY: all assert-account deploy ensure-buckets package-layer-source \
         remove-legacy-layer-build-stack package-backend package-infra \
         deploy-infra update-lambda-code write-frontend-env build-frontend \
-        deploy-frontend invalidate-cdn preflight clean test lint \
+        deploy-frontend invalidate-cdn preflight password-preflight clean test lint \
         test-backend test-frontend test-voice-agent \
         voice-build voice-deploy voice-upgrade voice-description voice-rollback voice-destroy reseed \
         gateway-deploy gateway-destroy \
@@ -83,23 +93,10 @@ deploy: assert-account preflight ensure-buckets package-backend deploy-infra upd
 	fi
 
 # ─── Pre-flight: Verify Bedrock model access ─────────────────
-preflight:
-	@if [ -z "$(APP_PASSWORD)" ]; then \
-		echo ""; \
-		echo "ERROR: APP_PASSWORD is not set."; \
-		echo ""; \
-		echo "This password protects the LUMI application login."; \
-		echo "Set it in your environment or pass it to make:"; \
-		echo ""; \
-		echo "  export APP_PASSWORD=your-secure-password"; \
-		echo "  make deploy"; \
-		echo ""; \
-		echo "  — or —"; \
-		echo ""; \
-		echo "  make deploy APP_PASSWORD=your-secure-password"; \
-		echo ""; \
-		exit 1; \
-	fi
+password-preflight: assert-account
+	@$(PASSWORD_TOOL) check $(PASSWORD_CONTEXT)
+
+preflight: password-preflight
 	@echo "$(call step,prerequisite,Verifying AgentCore CLI support...)"
 	@ERR=$$(aws bedrock-agentcore-control list-gateways --region $(REGION) 2>&1 >/dev/null); \
 	if [ $$? -ne 0 ]; then \
@@ -184,7 +181,7 @@ preflight:
 	@echo "    done"
 
 # ─── Step 1: Ensure S3 buckets exist ──────────────────────────
-ensure-buckets:
+ensure-buckets: password-preflight
 	@echo "$(call step,1/8,Creating S3 buckets (if needed)...)"
 	@aws s3api head-bucket --bucket $(DEPLOY_BUCKET) 2>/dev/null || \
 		aws s3 mb s3://$(DEPLOY_BUCKET) --region $(REGION) > /dev/null
@@ -223,6 +220,7 @@ package-backend: package-layer-source
 	@cd backend/functions/api && zip -r ../../../build/stayos-api.zip . -x "*.pyc" "__pycache__/*" > /dev/null
 	@cd backend/functions/orchestrator && zip -r ../../../build/stayos-orchestrator.zip . -x "*.pyc" "__pycache__/*" > /dev/null
 	@cd backend/functions/seed-data && zip -r ../../../build/stayos-seed-data.zip . -x "*.pyc" "__pycache__/*" > /dev/null
+	@zip -j build/stayos-seed-data.zip backend/functions/orchestrator/revenue_kpis.py > /dev/null
 	@cd backend/functions/tools && zip -r ../../../build/stayos-tools.zip . -x "*.pyc" "__pycache__/*" > /dev/null
 	@aws s3 cp build/stayos-api.zip s3://$(DEPLOY_BUCKET)/functions/ --quiet
 	@aws s3 cp build/stayos-orchestrator.zip s3://$(DEPLOY_BUCKET)/functions/ --quiet
@@ -231,27 +229,22 @@ package-backend: package-layer-source
 	@echo "    done"
 
 # ─── Step 3: Deploy infrastructure ────────────────────────────
-package-infra: package-layer-source remove-legacy-layer-build-stack
+package-infra: password-preflight package-layer-source remove-legacy-layer-build-stack
 	@$(CFN_AWS) cloudformation package \
 		--template-file infrastructure/root-stack.yaml \
 		--s3-bucket $(DEPLOY_BUCKET) \
 		--s3-prefix cfn-templates \
 		--output-template-file build/packaged-root-stack.yaml > /dev/null
 
-deploy-infra: package-infra
+deploy-infra: password-preflight package-infra
 	@echo "  [layer] ComputeStack will build or reuse the Python 3.12 x86_64 layer..."
 	@echo "$(call step,3/8,Deploying infrastructure (this may take several minutes)...)"
-	@$(CFN_AWS) cloudformation deploy \
-		--stack-name $(STACK_NAME) \
+	@$(PASSWORD_TOOL) deploy $(PASSWORD_CONTEXT) \
 		--template-file build/packaged-root-stack.yaml \
-		--parameter-overrides \
-			StackPrefix=$(STACK_PREFIX) \
-			AccountId=$(ACCOUNT_ID) \
-			BedrockModelId=$(BEDROCK_MODEL_ID) \
-			DependenciesLayerS3Key=$(DEPENDENCY_LAYER_S3_KEY) \
-			AppPassword=$(APP_PASSWORD) \
-		--capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
-		--no-fail-on-empty-changeset
+		--parameter StackPrefix=$(STACK_PREFIX) \
+		--parameter AccountId=$(ACCOUNT_ID) \
+		--parameter BedrockModelId=$(BEDROCK_MODEL_ID) \
+		--parameter DependenciesLayerS3Key=$(DEPENDENCY_LAYER_S3_KEY)
 	@echo "    done"
 
 # ─── Step 4: Update Lambda code ───────────────────────────────

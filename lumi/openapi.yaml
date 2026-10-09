@@ -397,13 +397,14 @@ components:
           example: 374
         availableRooms:
           type: integer
+          description: Legacy field for total room inventory capacity; not vacant or remaining sellable rooms.
           example: 368
 
     Occupancy:
       type: object
       properties:
         current:
-          type: integer
+          type: number
           description: Current occupancy percentage
           example: 87
         unit:
@@ -421,15 +422,15 @@ components:
           description: Delta vs budget
           example: 2.1
         forecast3pm:
-          type: integer
-          description: Forecasted occupancy at 3 PM
+          type: number
+          description: Prototype baseline using current occupancy; no separate intraday forecast exists in the dataset.
           example: 91
 
     Adr:
       type: object
       properties:
         current:
-          type: integer
+          type: number
           description: Current ADR in currency units
           example: 248
         currency:
@@ -452,7 +453,7 @@ components:
       type: object
       properties:
         current:
-          type: integer
+          type: number
           description: Current RevPAR in currency units
           example: 216
         currency:
@@ -464,8 +465,8 @@ components:
           description: Year-over-year percentage change
           example: 7.1
         budget:
-          type: integer
-          description: Budget target
+          type: number
+          description: Estimated budget at constant ADR, derived from the occupancy budget delta.
           example: 202
 
     Arrivals:

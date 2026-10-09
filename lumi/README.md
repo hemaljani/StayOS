@@ -79,7 +79,8 @@ Deployed in a single AWS region (us-east-1) using a serverless & managed archite
 ## Deployment
 
 > **Deployment is driven from the repo root.** Deploy the whole platform with a
-> single `make deploy-all APP_PASSWORD=...` — see the
+> single `make deploy-all` — existing deployments skip the password step;
+> new deployments require `APP_PASSWORD` in the environment. See the
 > [root README → Deployment](../README.md#deployment) for prerequisites,
 > parameters, and the full target list (`make help`).
 >

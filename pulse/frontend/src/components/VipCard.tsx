@@ -13,18 +13,20 @@ import {
   VIP_TIER_FALLBACK_PILL,
   vipTierLabel,
 } from '@/lib/constants';
-import { initialsFor } from '@/lib/format';
+import { formatVipArrival, initialsFor } from '@/lib/format';
 
 interface VipCardProps {
   guest: VipGuest;
+  propertyId?: string;
   onSelect: (guest: VipGuest) => void;
 }
 
-export default function VipCard({ guest, onSelect }: VipCardProps) {
+export default function VipCard({ guest, propertyId, onSelect }: VipCardProps) {
   const tier = String(guest.loyaltyTier ?? 'UNKNOWN');
   const avatarClass = VIP_TIER_AVATAR_COLORS[tier] ?? VIP_TIER_FALLBACK_AVATAR;
   const pillClass = VIP_TIER_PILL_COLORS[tier] ?? VIP_TIER_FALLBACK_PILL;
   const initials = initialsFor(guest.guestName, guest.initials);
+  const arrival = formatVipArrival(guest.estimatedArrival, propertyId);
 
   // Compose a compact subline from the fields that are present.
   const sublineParts = [
@@ -43,15 +45,15 @@ export default function VipCard({ guest, onSelect }: VipCardProps) {
       {/* Tier-colored avatar with initials */}
       <span
         aria-hidden
-        className={`flex items-center justify-center w-9 h-9 rounded-full text-xs font-extrabold text-white shrink-0 ${avatarClass}`}
+        className={`flex items-center justify-center w-9 h-9 rounded-full text-xs font-extrabold shrink-0 ${avatarClass}`}
       >
         {initials}
       </span>
 
       {/* Name + subline */}
       <span className="flex-1 min-w-0">
-        <span className="flex items-center gap-1.5">
-          <span className="text-sm font-semibold text-ink truncate">
+        <span className="flex flex-wrap items-center gap-1.5">
+          <span className="text-sm font-semibold text-ink break-words">
             {guest.guestName ?? 'VIP Guest'}
           </span>
           <span className={`text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full ${pillClass}`}>
@@ -67,9 +69,14 @@ export default function VipCard({ guest, onSelect }: VipCardProps) {
 
       {/* Estimated arrival */}
       {guest.estimatedArrival && (
-        <span className="text-xs font-semibold text-accent whitespace-nowrap">
-          {guest.estimatedArrival}
-        </span>
+        <time
+          dateTime={guest.estimatedArrival}
+          title={arrival.detail}
+          aria-label={`Estimated arrival: ${arrival.detail}`}
+          className="text-xs font-semibold text-accent whitespace-nowrap shrink-0 tabular-nums"
+        >
+          {arrival.time}
+        </time>
       )}
     </button>
   );

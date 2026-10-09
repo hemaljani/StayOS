@@ -172,7 +172,9 @@ def _get_revenue_item(
         Revenue item dict or None if no record exists.
     """
     table = _dynamodb_resource.Table(REVENUES_TABLE_NAME)
-    response = table.get_item(Key={"propertyId": property_id, "date": date_str})
+    response = table.get_item(
+        Key={"propertyId": property_id, "date": date_str}, ConsistentRead=True
+    )
     return response.get("Item")
 
 
@@ -499,7 +501,7 @@ def get_occupancy(property_id: str, tool_input: Dict[str, Any]) -> Dict[str, Any
     """Query occupancy metrics from the revenues table for a given date.
 
     Retrieves occupancy percentage, total arrivals, total departures,
-    confirmed reservations, and available rooms from the daily revenue
+    confirmed reservations, and total room inventory from the daily revenue
     snapshot record.
 
     Args:
@@ -527,7 +529,7 @@ def get_occupancy(property_id: str, tool_input: Dict[str, Any]) -> Dict[str, Any
                 "arrivalsTotal": 0,
                 "departuresTotal": 0,
                 "confirmedReservations": 0,
-                "availableRooms": 0,
+                "totalRooms": 0,
                 "message": f"No occupancy data available for {date_str}",
             },
         }
@@ -540,7 +542,9 @@ def get_occupancy(property_id: str, tool_input: Dict[str, Any]) -> Dict[str, Any
             "arrivalsTotal": item.get("arrivals", 0),
             "departuresTotal": item.get("departures", 0),
             "confirmedReservations": item.get("confirmedReservations", 0),
-            "availableRooms": item.get("availableRooms", 0),
+            # The dataset's legacy availableRooms field is inventory capacity,
+            # used for oversell checks. It is not a count of vacant rooms.
+            "totalRooms": item.get("totalRooms", item.get("availableRooms", 0)),
         }),
     }
 

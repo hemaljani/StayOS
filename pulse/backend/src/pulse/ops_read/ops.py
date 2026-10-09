@@ -187,19 +187,22 @@ def shape_ops(property_id: str, tool_caller: ToolCaller) -> dict[str, Any]:
     ooo_rooms = room_status.get("rooms") or []
     work_orders = work_orders_data.get("workOrders") or []
     ooo_cards = _shape_ooo_rooms(ooo_rooms, work_orders)
+    total_rooms = occupancy.get("totalRooms", occupancy.get("availableRooms", 0))
 
     facility = {
         "occupancyPct": occupancy.get("occupancyPct", 0),
         "arrivalsTotal": occupancy.get("arrivalsTotal", 0),
         "departuresTotal": occupancy.get("departuresTotal", 0),
         "confirmedReservations": occupancy.get("confirmedReservations", 0),
-        "availableRooms": occupancy.get("availableRooms", 0),
+        # Keep the public legacy field while accepting both Gateway versions
+        # during independent feature publication. Both mean inventory capacity.
+        "availableRooms": total_rooms,
         "oooCount": room_status.get("oooCount", len(ooo_rooms)),
         "openWorkOrders": work_orders_data.get("totalCount", len(work_orders)),
     }
     group_checkout = {
         "departuresTotal": occupancy.get("departuresTotal", 0),
-        "availableRooms": occupancy.get("availableRooms", 0),
+        "availableRooms": total_rooms,
         "confirmedReservations": occupancy.get("confirmedReservations", 0),
     }
 

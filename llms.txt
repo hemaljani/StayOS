@@ -61,6 +61,24 @@
   configuration before building and publishing. Runtime readiness alone does
   not prove voice recognition, conversation context, or interruption works.
 
+## Operational data semantics
+
+- Brief generation runs with `MOCK_MODE=false` and reads the same
+  property/day revenue records as chat and voice tools. The pure
+  [revenue_kpis.py](lumi/backend/functions/orchestrator/revenue_kpis.py)
+  formatter is packaged with the orchestrator and historical seeder so
+  fractional occupancy, ADR, and RevPAR are preserved in both.
+- Historical seeding reads stored revenues and skips dates without a source.
+  Existing briefs are not overwritten by seeding; deployed cached briefs and
+  audio require regeneration when publishing this correction.
+- Occupancy tool `totalRooms` is total inventory capacity. The dataset and
+  PULSE REST responses retain legacy `availableRooms` capacity fields.
+  Neither represents vacant or remaining sellable rooms; agents must not
+  infer that availability from occupancy or maintenance counts.
+- Kitchen daily Orders includes completed orders. The In-flight summary
+  matches the active `kitchenOrders` array, normalized when snapshots are
+  built and read; no reseed is needed for legacy counts.
+
 ## Shared
 
 - [shared/README.md](shared/README.md): the cross-feature shared layer.

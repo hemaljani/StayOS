@@ -350,7 +350,7 @@ def build_kitchen_snapshot(property_id: str) -> dict[str, Any]:
     rng = _rng(property_id)
     banquet_event = _BANQUET_EVENTS.get(property_id, "Corporate Breakfast")
     channel_mix, channel_mix_note = _channel_mix(property_id, rng)
-    return {
+    snapshot = {
         "propertyId": property_id,
         "banquetCountdown": _banquet_countdown(property_id, rng),
         "fbStats": _fb_stats(property_id, rng),
@@ -359,6 +359,30 @@ def build_kitchen_snapshot(property_id: str) -> dict[str, Any]:
         "channelMix": channel_mix,
         "channelMixNote": channel_mix_note,
     }
+    return normalize_inflight_count(snapshot)
 
 
-__all__ = ["DEMO_PROPERTY_ID", "build_kitchen_snapshot"]
+def normalize_inflight_count(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Make the in-flight summary count match the snapshot's active order feed.
+
+    Today's total Orders value includes completed orders and remains unchanged.
+    Normalizing on reads also corrects existing snapshots without reseeding or
+    writing to DynamoDB. Copy nested stats so callers retain their input.
+    """
+    count = len(snapshot.get("kitchenOrders") or [])
+    stats = [
+        (
+            {**stat, "delta": f"In-flight: {count}"}
+            if stat.get("label") == "Orders"
+            else dict(stat)
+        )
+        for stat in snapshot.get("fbStats") or []
+    ]
+    return {**snapshot, "fbStats": stats}
+
+
+__all__ = [
+    "DEMO_PROPERTY_ID",
+    "build_kitchen_snapshot",
+    "normalize_inflight_count",
+]

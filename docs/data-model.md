@@ -59,6 +59,22 @@ The 5 dataset tables are seeded once and are read-only at runtime
 PULSE evaluates. The only runtime writes back to them come from PULSE's
 GM-approved closed-loop Action Executor.
 
+Brief generation and conversational occupancy/revenue tools use the same
+property/date record in `stayos-revenues`. Fractional occupancy, ADR, and RevPAR
+are preserved. The historical brief seeder reads the corresponding stored
+revenue records; it skips dates without a source record instead of inventing
+another KPI series.
+On fresh installations the seed handler populates the operational dataset
+before seeding historical briefs. Existing briefs retain conditional-write
+protection and require explicit regeneration to replace older content.
+
+The revenue record's legacy `availableRooms` means total room inventory
+capacity, used in oversell calculations. It does not mean vacant, clean,
+sellable, or remaining rooms. Occupancy tools expose this as `totalRooms`;
+PULSE's existing REST fields retain the legacy name with the same capacity
+semantics. Remaining sellable-room availability is not supplied by these
+tools and must not be inferred from rounded occupancy or maintenance counts.
+
 <a id="toc-pulse-layer"></a>
 ### PULSE layer — alerting tables (PULSE-owned)
 
@@ -69,6 +85,11 @@ GM-approved closed-loop Action Executor.
 | **pulse-alert-history** | alertId | version | propertyId-createdAt-index | Append-only status-change/version history (TTL `expiresAt`). |
 | **pulse-push-subscriptions** | gmAlias | endpointHash | — | Web Push (VAPID) device subscriptions per GM. |
 | **pulse-kitchen** | propertyId | — | — | One Kitchen/F&B snapshot per property (banquet countdown, F&B stats, delivery SLA, orders, channel mix) for the Kitchen tab. |
+
+For Kitchen snapshots, the Orders tile's value is the daily total, including
+completed orders. Its In-flight delta is the number of entries in the
+snapshot's active `kitchenOrders` feed. Both snapshot creation and the API read
+normalize that count, so existing stored snapshots do not require reseeding.
 
 See [`pulse/README.md`](../../pulse/README.md) and the PULSE spec
 (`pulse/.kiro/specs/initial-pulse-project/`) for the full attribute-level shapes

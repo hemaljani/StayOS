@@ -6,7 +6,7 @@
 #
 # Common targets:
 #   make help          list available targets
-#   make deploy-all    deploy the whole platform (needs APP_PASSWORD=...)
+#   make deploy-all    deploy the whole platform (preserves existing AppPassword)
 #   make destroy-all   tear it all down (needs CONFIRM=DESTROY)
 #   make test-all      run every feature's test suite
 #   make <feature>-<target>   e.g. lumi-deploy, pulse-test, shell-deploy, data-deploy
@@ -42,9 +42,12 @@ AWS_PROFILE_FLAG  := $(if $(PROFILE),--profile $(PROFILE),)
 AWS               := aws $(AWS_PROFILE_FLAG) --region $(REGION)
 CFN_PROFILE_FLAG  := $(if $(CLOUDFORMATION_PROFILE),--profile $(CLOUDFORMATION_PROFILE),)
 CFN_AWS           := aws $(CFN_PROFILE_FLAG) --region $(REGION)
-# APP_PASSWORD is required by deploy-all (sets the demo GM login password).
+# Creation / explicit replacement requires APP_PASSWORD; updates preserve it.
 APP_PASSWORD      ?=
-export APP_PASSWORD
+# Store the raw input without interpreting password dollars as Make variables.
+override APP_PASSWORD := $(value APP_PASSWORD)
+CHANGE_APP_PASSWORD ?= 0
+export APP_PASSWORD CHANGE_APP_PASSWORD
 
 .PHONY: help plan deployment-preflight deploy-all verify-deployment \
         deployment-summary deployment-summary-detailed destroy-all \
@@ -63,7 +66,8 @@ help:
 	@echo "  make lumi-voice-rollback VOICE_BASELINE=..."
 	@echo "                        restore the saved voice template and pinned image"
 	@echo "  make deploy-all       deploy LUMI, then deploy PULSE with LUMI's outputs threaded in"
-	@echo "                        requires APP_PASSWORD=...; honors PROFILE, REGION, ENVIRONMENT,"
+	@echo "                        skips APP_PASSWORD on updates; creation requires it in the environment"
+	@echo "                        replacement requires CHANGE_APP_PASSWORD=1; honors PROFILE, REGION, ENVIRONMENT,"
 	@echo "                        EXPECTED_ACCOUNT_ID, CLOUDFORMATION_PROFILE, and stack prefixes"
 	@echo "                        concise by default; VERBOSE=1 streams diagnostics, NO_COLOR=1"
 	@echo "                        disables color; full logs are written under logs/"
@@ -128,6 +132,20 @@ plan:
 		--data-stack-prefix '$(DATA_STACK_PREFIX)' \
 		$(if $(PROFILE),--profile '$(PROFILE)',)
 
+# Reviewed existing-resource publish; use capture first, then the saved baseline.
+FIX_PHASE ?= capture
+FIX_BASELINE ?=
+FIX_MANIFEST ?=
+.PHONY: deploy-pending-fixes
+deploy-pending-fixes:
+	@PYTHONPATH=tools python3 -m stayos_deploy.pending '$(FIX_PHASE)' \
+		--profile '$(PROFILE)' --cloudformation-profile '$(CLOUDFORMATION_PROFILE)' \
+		--region '$(REGION)' --expected-account-id '$(EXPECTED_ACCOUNT_ID)' \
+		--stack-prefix '$(LUMI_STACK_PREFIX)' \
+		--pulse-stack-prefix '$(PULSE_STACK_PREFIX)' \
+		$(if $(FIX_BASELINE),--baseline '$(FIX_BASELINE)',) \
+		$(if $(FIX_MANIFEST),--manifest '$(FIX_MANIFEST)',)
+
 deployment-preflight:
 	@set -e; \
 	account_id=$$($(AWS) sts get-caller-identity --query Account --output text); \
@@ -181,16 +199,9 @@ deploy-all:
 
 # Retained temporarily as a readable record of the pre-runner orchestration.
 # deploy-all above is the supported entry point.
-_deploy-all-legacy: deployment-preflight
-	@if [ -z "$(APP_PASSWORD)" ]; then \
-		echo ""; \
-		echo "ERROR: APP_PASSWORD is required (it sets the LUMI demo GM login password)."; \
-		echo "  make deploy-all APP_PASSWORD=your-secure-password [PROFILE=... REGION=...]"; \
-		echo ""; \
-		exit 1; \
-	fi
+_deploy-all-legacy: deployment-preflight lumi-password-preflight
 	@echo "══ [1/8] Deploying LUMI ($(LUMI_STACK)) ══"
-	@$(MAKE) -C lumi deploy APP_PASSWORD='$(APP_PASSWORD)' \
+	@$(MAKE) -C lumi deploy \
 		PROFILE='$(PROFILE)' REGION='$(REGION)' \
 		CLOUDFORMATION_PROFILE='$(CLOUDFORMATION_PROFILE)' \
 		ENVIRONMENT='$(ENVIRONMENT)' EXPECTED_ACCOUNT_ID='$(EXPECTED_ACCOUNT_ID)' \
@@ -268,7 +279,7 @@ _deploy-all-legacy: deployment-preflight
 		|| { echo ""; \
 		     echo "ERROR: PULSE stack deploy (pass 1) failed. LUMI ($(LUMI_STACK)) is already"; \
 		     echo "deployed and healthy - do NOT redeploy it. Fix the error above, then re-run"; \
-		     echo "  make deploy-all APP_PASSWORD=... PROFILE=$(PROFILE) REGION=$(REGION)"; \
+		     echo "  make deploy-all PROFILE=$(PROFILE) REGION=$(REGION)"; \
 		     echo ""; exit 1; }; \
 	echo ""; \
 	echo "══ [3/8] Registering PULSE tools on the shared StayOS Gateway ══"; \

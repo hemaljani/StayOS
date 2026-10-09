@@ -12,6 +12,26 @@ import pytest
 from data_validator import validate_narrative
 
 
+@pytest.mark.parametrize(
+    "text,language,value,valid",
+    [
+        ("RevPAR 151,89 euros.", "es-ES", 151.89, True),
+        ("RevPAR 151,89 euros.", "en-US", 151.89, False),
+        ("RevPAR 151.89 euros.", "es-ES", 151.89, True),
+        ("ADR 1.234,56 euros.", "es-ES", 1234.56, True),
+        ("RevPAR 999,89 euros.", "es-ES", 151.89, False),
+        ("ADR 1.234,56 euros.", "es-ES", 123.45, False),
+        ("Prioridades 2, 3.", "es-ES", [2, 3], True),
+    ],
+)
+def test_localized_numbers_keep_the_same_source_validation(
+    text, language, value, valid
+):
+    """Decimal punctuation must not become extra or whitelisted source values."""
+    result, _ = validate_narrative(text, {"metric": value}, language=language)
+    assert result is valid
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -104,8 +124,7 @@ class TestValidateNarrative:
         """Narrative containing a number not in source data fails validation."""
         # 95 does not appear anywhere in the source data
         narrative = (
-            "Your property is at 95% occupancy today, "
-            "with an ADR of 248 dollars."
+            "Your property is at 95% occupancy today, " "with an ADR of 248 dollars."
         )
 
         is_valid, discrepancies = validate_narrative(narrative, sample_source_data)
@@ -135,9 +154,7 @@ class TestValidateNarrative:
         assert is_valid is True
         assert discrepancies == []
 
-    def test_empty_narrative_passes(
-        self, sample_source_data: Dict[str, Any]
-    ) -> None:
+    def test_empty_narrative_passes(self, sample_source_data: Dict[str, Any]) -> None:
         """Empty narrative has no numbers to validate, so it passes."""
         is_valid, discrepancies = validate_narrative("", sample_source_data)
 

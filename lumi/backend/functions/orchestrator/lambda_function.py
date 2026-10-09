@@ -27,6 +27,7 @@ from audio_synthesizer import synthesize_audio
 from brief_generator import generate_brief_narrative
 from data_puller import pull_property_data
 from data_validator import validate_narrative
+from historical_repair import repair_existing_brief
 from orchestrator_exceptions import (
     AllSourcesFailedError,
     AudioSynthesisError,
@@ -81,6 +82,15 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         Dict with pipeline execution status and brief metadata.
     """
     action = event.get("action", "")
+
+    if action == "repair-existing":
+        return repair_existing_brief(
+            event,
+            _dynamodb_resource,
+            _read_gm_settings,
+            _generate_and_validate_narrative,
+            synthesize_audio,
+        )
 
     if action == "generate-single":
         # Per-GM schedule invocation (REQ-SCHED-4)
@@ -457,7 +467,11 @@ def _generate_and_validate_narrative(
             narrative = generate_brief_narrative(raw_data, settings)
 
             # Validate the narrative against source KPI data
-            is_valid, discrepancies = validate_narrative(narrative, raw_data)
+            is_valid, discrepancies = validate_narrative(
+                narrative,
+                raw_data,
+                language=settings.get("audioPreferences", {}).get("language", "en-US"),
+            )
 
             if is_valid:
                 logger.info(

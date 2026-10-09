@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import shlex
@@ -24,6 +25,16 @@ def _enabled(value: str) -> bool:
 
 def strip_color(value: str) -> str:
     return ANSI_ESCAPE.sub("", value)
+
+
+def redact_password(value: str, password: str) -> str:
+    """Redact both literal and JSON-escaped password values from diagnostics."""
+    if password:
+        for form in sorted(
+            {password, json.dumps(password)[1:-1]}, key=len, reverse=True
+        ):
+            value = value.replace(form, "<redacted>")
+    return value
 
 
 def format_duration(seconds: float) -> str:
@@ -182,7 +193,12 @@ class CommandRunner:
         extra_env: Mapping[str, str] | None = None,
         progress: Callable[[str], None] | None = None,
     ) -> CommandResult:
-        self._log_header(command, cwd)
+        password = (extra_env or {}).get("APP_PASSWORD") or self.environ.get(
+            "APP_PASSWORD", ""
+        )
+        self._log_header(
+            [redact_password(argument, password) for argument in command], cwd
+        )
         tail: deque[str] = deque(maxlen=80)
         warnings: list[str] = []
         captured: list[str] = []
@@ -198,13 +214,15 @@ class CommandRunner:
                 bufsize=1,
             )
         except OSError as error:
+            message = redact_password(str(error), password)
             with self.log_path.open("a", encoding="utf-8") as log:
-                log.write(f"{error}\n")
-            raise CommandFailed(command, 127, str(error)) from error
+                log.write(f"{message}\n")
+            raise CommandFailed(command, 127, message) from error
 
         assert process.stdout is not None
         with process.stdout, self.log_path.open("a", encoding="utf-8") as log:
             for line in process.stdout:
+                line = redact_password(line, password)
                 log.write(line)
                 log.flush()
                 captured.append(line)

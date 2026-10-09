@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import re
 import subprocess
@@ -27,6 +28,7 @@ from stayos_deploy.output import (
 class StubRunner:
     def __init__(self, fail_target=None, warning_target=None):
         self.commands = []
+        self.environments = []
         self.fail_target = fail_target
         self.warning_target = warning_target
 
@@ -35,8 +37,9 @@ class StubRunner:
         return command[command.index(name) + 1]
 
     def run(self, command, *, cwd, extra_env=None, progress=None):
-        del cwd, extra_env
+        del cwd
         self.commands.append(list(command))
+        self.environments.append(extra_env)
         if command[0] == "make":
             directory = command[2]
             target = command[3]
@@ -116,6 +119,13 @@ class StubRunner:
         joined = " ".join(command)
         if "sts get-caller-identity" in joined:
             return CommandResult("123456789012", [])
+        if "parameterKeys:Parameters[].ParameterKey" in joined:
+            return CommandResult(
+                json.dumps(
+                    {"status": "UPDATE_COMPLETE", "parameterKeys": ["AppPassword"]}
+                ),
+                [],
+            )
         if "describe-stack-resources" in joined:
             return CommandResult("stayos-data-nested", [])
         if "ssm get-parameter" in joined:
@@ -153,7 +163,7 @@ class StubRunner:
 
 
 class DeploymentTest(unittest.TestCase):
-    def _orchestrator(self, runner, stream, *, verbose=False):
+    def _orchestrator(self, runner, stream, *, verbose=False, password="", change="0"):
         config = DeploymentConfig.load(
             profile="test",
             cloudformation_profile="test-cfn",
@@ -163,6 +173,7 @@ class DeploymentTest(unittest.TestCase):
         output_environment = {
             "NO_COLOR": "1",
             "VERBOSE": "1" if verbose else "0",
+            "CHANGE_APP_PASSWORD": change,
         }
         console = Console(
             OutputSettings.load(output_environment, stream),
@@ -170,7 +181,7 @@ class DeploymentTest(unittest.TestCase):
         )
         return DeploymentOrchestrator(
             config,
-            app_password="secret",
+            app_password=password,
             root=ROOT,
             log_path=ROOT / "logs" / "stubbed.log",
             environ=output_environment,
@@ -214,6 +225,30 @@ class DeploymentTest(unittest.TestCase):
         )
         self.assertEqual(1, make_targets.count("deploy-initial"))
         self.assertEqual(1, make_targets.count("deploy-runtime-wiring"))
+        self.assertIn("APP_PASSWORD step skipped", output)
+
+    def test_explicit_replacement_supplies_password_only_to_lumi(self):
+        runner = StubRunner()
+        self._orchestrator(
+            runner, io.StringIO(), password="fixture-password", change="1"
+        ).deploy()
+        for command, environment in zip(runner.commands, runner.environments):
+            is_lumi = command[0] == "make" and command[2] == "lumi"
+            self.assertEqual(
+                "fixture-password" if is_lumi else "", environment["APP_PASSWORD"]
+            )
+            self.assertEqual(
+                "1" if is_lumi else "0", environment["CHANGE_APP_PASSWORD"]
+            )
+            self.assertNotIn("fixture-password", " ".join(command))
+
+    def test_ambiguous_password_stops_before_any_make_stage(self):
+        runner = StubRunner()
+        with self.assertRaises(DeploymentFailed):
+            self._orchestrator(
+                runner, io.StringIO(), password="fixture-password"
+            ).deploy()
+        self.assertTrue(all(command[0] != "make" for command in runner.commands))
 
     def test_verbose_summary_includes_detailed_diagnostics(self):
         stream = io.StringIO()

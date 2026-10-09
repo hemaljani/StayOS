@@ -2,6 +2,7 @@
 pytest==9.0.3
 moto[dynamodb,cognitoidp,s3,polly,sns,secretsmanager]==5.0.0
 pytest-mock==3.14.0
+hypothesis==6.168.5
 flake8==7.1.0
 mypy==1.11.0
 responses==0.25.0

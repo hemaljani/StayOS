@@ -8,7 +8,7 @@ Includes retry logic and template-based fallback for resilience.
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
@@ -74,6 +74,17 @@ DEFAULT_BRIEF_LENGTH = "standard"
 # Retry configuration
 MAX_RETRIES = 1
 RETRY_DELAY_SECONDS = 2
+
+
+def _narrative_date(property_data: Dict[str, Any]) -> str:
+    """Use the KPI source date when generating retained historical content."""
+    source_date = property_data.get("dailyKPIs", {}).get("date")
+    day = (
+        date.fromisoformat(source_date)
+        if source_date
+        else datetime.now(timezone.utc).date()
+    )
+    return day.strftime("%A, %B %d, %Y")
 
 
 def generate_brief_narrative(
@@ -240,8 +251,8 @@ def _fill_template_variables(
     # Build action items summary (top 3 by severity)
     action_summary = _build_action_items_summary(action_items)
 
-    # Format today's date in a human-readable format
-    today_date = datetime.now(tz=timezone.utc).strftime("%A, %B %d, %Y")
+    # Historical repair must describe the source day, not today's live state.
+    today_date = _narrative_date(property_data)
 
     # Build the variable mapping for template substitution
     variables = {
@@ -413,7 +424,7 @@ def _generate_fallback_narrative(
 
     gm_name = prop.get("gmName", settings.get("gmName", "Manager"))
     gm_first_name = gm_name.split()[0] if gm_name else "Manager"
-    today_date = datetime.now(tz=timezone.utc).strftime("%A, %B %d, %Y")
+    today_date = _narrative_date(property_data)
 
     # Count urgent/high items for the summary
     urgent_count = sum(1 for item in action_items if item.get("severity") == "URGENT")

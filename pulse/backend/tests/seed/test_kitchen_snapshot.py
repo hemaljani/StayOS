@@ -15,7 +15,13 @@ Confirms :func:`pulse.seed.kitchen_snapshot.build_kitchen_snapshot`:
 
 from __future__ import annotations
 
-from pulse.seed.kitchen_snapshot import DEMO_PROPERTY_ID, build_kitchen_snapshot
+import pytest
+
+from pulse.seed.kitchen_snapshot import (
+    DEMO_PROPERTY_ID,
+    build_kitchen_snapshot,
+    normalize_inflight_count,
+)
 
 _PILOT_PROPERTIES = (
     "ALOHA-CHI-001",
@@ -47,6 +53,7 @@ def test_chi_snapshot_matches_curated_prototype_values() -> None:
     assert snapshot["fbStats"][0]["value"] == "47"
     assert snapshot["deliverySla"]["pct"] == 90
     assert len(snapshot["kitchenOrders"]) == 5
+    assert snapshot["fbStats"][0]["delta"] == "In-flight: 5"
     assert snapshot["channelMix"][0] == {"label": "Room Svc", "pct": 62}
     assert snapshot["channelMix"][-1] == {
         "label": "3rd Party",
@@ -91,3 +98,23 @@ def test_snapshot_shape_complete_for_any_property() -> None:
         assert sum(slice_["pct"] for slice_ in snapshot["channelMix"]) == 100
         # A banquet setup order is always present in the feed.
         assert any(order["kind"] == "banquet" for order in snapshot["kitchenOrders"])
+        assert snapshot["fbStats"][0]["delta"] == (
+            f"In-flight: {len(snapshot['kitchenOrders'])}"
+        )
+
+
+@pytest.mark.parametrize("active_count", [0, 1, 5, 12])
+def test_inflight_count_tracks_feed_without_changing_daily_orders(active_count):
+    """Completed daily orders and currently active orders have distinct scopes."""
+    snapshot = {
+        "kitchenOrders": [{"id": str(index)} for index in range(active_count)],
+        "fbStats": [
+            {"label": "Orders", "value": "47", "delta": "In-flight: 12"},
+            {"label": "Avg ticket", "value": "$38", "delta": "up vs $32 avg"},
+        ],
+    }
+    result = normalize_inflight_count(snapshot)
+    assert result["fbStats"][0]["delta"] == f"In-flight: {active_count}"
+    assert result["fbStats"][0]["value"] == "47"
+    assert result["fbStats"][1] == snapshot["fbStats"][1]
+    assert snapshot["fbStats"][0]["delta"] == "In-flight: 12"

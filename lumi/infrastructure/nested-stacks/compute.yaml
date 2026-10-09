@@ -1203,7 +1203,8 @@ Resources:
           MDP_API_ENDPOINT: !Ref MdpApiEndpoint
           SPOG_SECRET_ARN: !Ref SpogSecretArn
           BEDROCK_MODEL_ID: !Ref BedrockModelId
-          MOCK_MODE: "true"
+          # Briefs and conversational tools read the same operational dataset.
+          MOCK_MODE: "false"
           # Dataset tables for live data queries (REQ-DS-7)
           RESERVATIONS_TABLE_NAME: !Ref ReservationsTableName
           ROOMS_TABLE_NAME: !Ref RoomsTableName

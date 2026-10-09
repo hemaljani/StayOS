@@ -44,14 +44,55 @@ and write, see [`data-model.md`](data-model.md).
 ## TL;DR
 
 ```bash
-make deploy-all APP_PASSWORD=YourSecurePassword123!
+make deploy-all
 ```
+
+Existing deployments skip the password step and preserve `AppPassword`. For a
+new deployment, supply `APP_PASSWORD` through the environment first. See
+[password handling](#deployment-password) for creation and intentional replacement.
 
 That single command deploys three things in a fixed order — **LUMI → PULSE →
 Data Orchestrator** — because each stage produces values the next stage needs.
 PULSE can never be deployed standalone from a clean account: it consumes
 outputs produced by the LUMI deploy. The final stage primes today's data, so
 every GM has a live daily brief the moment the command finishes.
+
+### Focused pending-fix publication
+
+For the reviewed BUG-010/012/013/016/017 update, use the root
+`deploy-pending-fixes` target with explicit `PROFILE`,
+`CLOUDFORMATION_PROFILE`, `REGION`, and `EXPECTED_ACCOUNT_ID`.
+First run `FIX_PHASE=capture FIX_MANIFEST=/path/to/reviewed-manifest.json`.
+The resulting private `logs/pending-fixes-...` directory is the rollback
+baseline. Pass it as `FIX_BASELINE` for subsequent phases, in order:
+`build`, `backend`, `repair`, `frontends`, and `verify`.
+
+This path preserves existing CloudFormation parameters and the dependency
+layer, previews the single mock-mode configuration change, updates only six
+selected Lambdas and the two conversational runtimes, and retains all eight
+shared Gateway tools. The frontend phase regenerates live configuration and
+keeps prior immutable assets during publication. It does not reseed operational
+data or publish the shell.
+
+Historical repair requires an existing, unexpired brief and same-date revenue
+source. It backs up the original record/audio in the existing encrypted deploy
+bucket, preserves historical snapshots and TTLs, generates new audio keys, and
+uses conditional writes to refuse concurrent changes. The approved manifest is
+bounded to 153 keys; it does not create missing dates. Run `FIX_PHASE=rollback`
+with the same baseline to restore the previous deployment and this run's
+unchanged repaired records. Keep the baseline until live acceptance checks pass.
+Do not mark bugs closed from deployment readiness alone.
+
+The `verify` phase checks published Lambda hashes, DEFAULT runtime versions,
+every retained repaired brief against its same-date revenue, preserved
+historical snapshots, and the narrative input hash recorded on each new MP3.
+Complete authenticated browser and microphone acceptance separately.
+
+If a repair-code correction is required after backend publication, run
+`FIX_PHASE=refresh-orchestrator` with the same baseline. It checks the current
+code hash before repackaging and updating only the orchestrator. The repair
+reads an exact property/date brief through the role's existing strongly
+consistent `Query` permission; it does not require an IAM policy change.
 
 <div align="right"><a href="#contents">↑ Back to top</a></div>
 
@@ -94,7 +135,7 @@ next:
 
 ```mermaid
 flowchart TB
-    Start(["make deploy-all<br/>APP_PASSWORD=..."])
+    Start(["make deploy-all"])
 
     subgraph LUMI["🔵 Stage 1 — LUMI"]
         L1["Deploy LUMI stack<br/>(stayos-us-east-1)"]
@@ -152,15 +193,16 @@ flowchart TB
 ### Stage 1 — Deploy LUMI
 
 ```
-make -C lumi deploy APP_PASSWORD=... PROFILE=... REGION=... \
+make -C lumi deploy PROFILE=... CLOUDFORMATION_PROFILE=... REGION=... \
     ENVIRONMENT=test EXPECTED_ACCOUNT_ID=...
 ```
 
 Deploys the LUMI root stack (`stayos-<region>`, e.g. `stayos-us-east-1`) and its
 nested stacks — including the `DataStack` that owns the 5 operational tables and
-their DynamoDB streams. `APP_PASSWORD` sets the login password for the 5 demo GM
-accounts. The existing ComputeStack owns the dependency-layer CodeBuild project
-and a Lambda-backed custom resource that waits for the build before creating
+their DynamoDB streams. On creation, `APP_PASSWORD` sets the initial password
+for the 5 demo GM accounts; existing-stack redeployments preserve the parameter
+without asking for a password. The existing ComputeStack owns the dependency-layer
+CodeBuild project and a Lambda-backed custom resource that waits for the build before creating
 the layer version. CodeBuild packages the shared layer on Lambda-compatible
 Python 3.12 / Amazon Linux / `x86_64` compute, requires binary wheels,
 validates its native imports, and writes it to a build-input-fingerprinted S3
@@ -301,7 +343,8 @@ false "no VIP arrivals".
 
 | Variable | Required | Default | Purpose |
 |----------|----------|---------|---------|
-| `APP_PASSWORD` | **Yes** | — | Login password for the 5 demo GM accounts (forwarded to the LUMI deploy). |
+| `APP_PASSWORD` | Creation or explicit replacement | — | Initial demo password / replacement stack parameter; supply through the environment. Omit on normal updates. |
+| `CHANGE_APP_PASSWORD` | No | `0` | Set to `1` with `APP_PASSWORD` to intentionally replace the parameter on an existing stack. Only `0` and `1` are accepted. |
 | `PROFILE` | No | default credential chain | Canonical AWS CLI profile / target account. `AWS_PROFILE` remains accepted for compatibility; `PROFILE` wins if both are set. |
 | `CLOUDFORMATION_PROFILE` | No | `PROFILE` | Optional role-chain profile used only for CloudFormation operations. It must resolve to the same target account and is useful when organization guardrails exempt a deployment role. |
 | `REGION` | No | `us-east-1` | Target AWS region. |
@@ -312,15 +355,15 @@ false "no VIP arrivals".
 | `DATA_STACK_PREFIX` | No | `stayos-data` | Stack and resource prefix for the shared Data Orchestrator. |
 
 ```bash
-# Default account, us-east-1
-make deploy-all APP_PASSWORD=YourSecurePassword123!
+# Redeploy an existing installation, preserving its password
+make deploy-all
 
 # A different account / region
-make deploy-all APP_PASSWORD=YourSecurePassword123! PROFILE=my-other-account \
+make deploy-all PROFILE=my-other-account \
   REGION=us-west-2 ENVIRONMENT=test EXPECTED_ACCOUNT_ID=123456789012
 
 # Target-account profile plus a same-account CloudFormation execution profile
-make deploy-all APP_PASSWORD=YourSecurePassword123! PROFILE=my-target-account \
+make deploy-all PROFILE=my-target-account \
   CLOUDFORMATION_PROFILE=my-target-cfn-role \
   REGION=us-east-1 ENVIRONMENT=test EXPECTED_ACCOUNT_ID=123456789012
 
@@ -328,6 +371,44 @@ make deploy-all APP_PASSWORD=YourSecurePassword123! PROFILE=my-target-account \
 make plan PROFILE=my-other-account REGION=us-west-2 \
   ENVIRONMENT=test EXPECTED_ACCOUNT_ID=123456789012
 ```
+
+### Deployment password
+
+For a **new installation**, enter the password privately in Bash or Zsh and
+export it only for deployment:
+
+```bash
+printf 'New deployment password: '
+IFS= read -r -s APP_PASSWORD
+printf '\n'
+export APP_PASSWORD
+make deploy-all PROFILE=my-target-account \
+  CLOUDFORMATION_PROFILE=my-target-cfn-role \
+  REGION=us-east-1 EXPECTED_ACCOUNT_ID=123456789012
+unset APP_PASSWORD
+```
+
+For a **normal redeployment**, omit `APP_PASSWORD` and use the same deployment
+context. If the environment retains it from a previous run, first run
+`unset APP_PASSWORD`. Supplying it on an existing stack without explicit change
+intent stops deployment before AWS writes rather than silently replacing it.
+
+To **intentionally replace the stack parameter**, enter and export
+`APP_PASSWORD` as above, then use `make deploy-all CHANGE_APP_PASSWORD=1` with the
+same deployment context. This changes the parameter, not existing users'
+Cognito passwords. The flag requires an existing stack and a nonempty password.
+Passwords are never interpolated into generated shell commands or written to
+deployment parameter files; AWS CLI receives parameter JSON through standard
+input. Prefer environment input to command-line passwords, which can appear in
+shell history and the invoking process's arguments.
+
+The root runner, direct LUMI deployment, and direct infrastructure deployment
+share this policy. Both profile identities are verified before inspecting the
+stack through `CLOUDFORMATION_PROFILE`. Only an explicit missing-stack response
+permits creation. Permission/authentication/network errors, malformed responses,
+and existing stacks without `AppPassword` stop deployment. Updates require
+`CREATE_COMPLETE`, `UPDATE_COMPLETE`, or `UPDATE_ROLLBACK_COMPLETE`; other
+states require recovery first.
 
 **Prerequisites** (one-time): AWS CLI v2.27+, Python 3.12+, Node.js 18+, and
 Amazon Bedrock model access enabled in the target account/region (Claude Sonnet,

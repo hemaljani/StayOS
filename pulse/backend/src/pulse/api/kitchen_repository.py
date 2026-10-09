@@ -23,6 +23,7 @@ from typing import Any, Optional
 from pulse.api.identity import CallerIdentity
 from pulse.common.dynamo import get_table
 from pulse.common.logging import get_logger
+from pulse.seed.kitchen_snapshot import normalize_inflight_count
 
 logger = get_logger("pulse-api")
 
@@ -120,7 +121,7 @@ def get_kitchen(
     item["banquetCountdown"] = live_banquet_countdown(
         item.get("banquetCountdown"), datetime.now(UTC)
     )
-    return item
+    return normalize_inflight_count(item)
 
 
 __all__ = [

@@ -1,7 +1,7 @@
-// Ops tab - facility summary, OOO rooms, and group checkout (Requirement 15.11).
+// Ops tab - facility summary, OOO/maintenance rooms, and group checkout.
 //
 // Fetches GET /ops (via useOps) and renders: a facility KPI grid (occupancy,
-// arrivals/departures, OOO count, open work orders), the out-of-order room cards
+// arrivals/departures, unavailable-room count, open work orders), the room cards
 // (each with its joined work-order status via OpsRoomCard), and a group-checkout
 // summary. Loading, empty, and error states mirror the PULSE tab.
 
@@ -48,10 +48,11 @@ export default function OpsPage() {
             sublabel="Today"
           />
           <KpiCard
-            label="Rooms OOO"
+            label="OOO & Maintenance"
             value={facility.oooCount}
             valueColor="text-tier-critical"
-            sublabel="Out of order"
+            sublabel="Unavailable rooms"
+            wrapLabel
           />
           <KpiCard
             label="Open Work Orders"
@@ -62,10 +63,10 @@ export default function OpsPage() {
         </div>
       )}
 
-      {/* Out-of-order rooms */}
-      <section aria-label="Rooms out of order" className="mb-5">
+      {/* The room-status tool combines OOO and MAINTENANCE records. */}
+      <section aria-label="OOO and maintenance rooms" className="mb-5">
         <h3 className="text-[10px] font-bold uppercase tracking-wide text-gray-400 mb-2">
-          Rooms Out of Order
+          Rooms OOO &amp; Maintenance
         </h3>
         {oooRooms.length > 0 ? (
           <div className="space-y-2">
@@ -76,7 +77,7 @@ export default function OpsPage() {
         ) : (
           <div className="bg-surface rounded-xl p-6 text-center border border-gray-800">
             <Wrench size={24} className="mx-auto text-success mb-2" strokeWidth={1.5} aria-hidden />
-            <p className="text-sm text-gray-400">No rooms out of order.</p>
+            <p className="text-sm text-gray-400">No rooms out of order or under maintenance.</p>
           </div>
         )}
       </section>

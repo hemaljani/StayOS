@@ -69,17 +69,17 @@ export const TIER_LABELS: Record<AlertTier, string> = {
 
 
 // VIP loyalty-tier styling (Task 21.2). The prototype styles each tier with a
-// distinct avatar gradient and pill; these token maps keep the VIP cards and
+// distinct avatar fill and pill; these token maps keep the VIP cards and
 // profile modal consistent. AMBASSADOR uses warning gold, PLATINUM the accent
 // blue/violet, TITANIUM a neutral slate.
 export const VIP_TIER_ORDER: VipTier[] = ['AMBASSADOR', 'TITANIUM', 'PLATINUM'];
 
-// Avatar gradient background per tier (Tailwind classes). Coastal Blue tiers:
-// AMBASSADOR warm gold, TITANIUM slate, PLATINUM accent blue.
+// Soft tier fills with theme-aware ink keep small initials readable in both
+// themes. The tier tokens use the existing gold, slate, and blue palette.
 export const VIP_TIER_AVATAR_COLORS: Record<string, string> = {
-  AMBASSADOR: 'bg-gradient-to-br from-tier-ambassador to-[#a56f1f]',
-  TITANIUM: 'bg-gradient-to-br from-tier-titanium to-[#6f7885]',
-  PLATINUM: 'bg-gradient-to-br from-tier-platinum to-accent-deep',
+  AMBASSADOR: 'bg-tier-ambassador/20 text-ink',
+  TITANIUM: 'bg-tier-titanium/20 text-ink',
+  PLATINUM: 'bg-tier-platinum/20 text-ink',
 };
 
 // Tier pill background + text per tier.
@@ -96,5 +96,5 @@ export function vipTierLabel(tier: VipTier): string {
 }
 
 // Fallback avatar/pill styling for an unexpected tier value.
-export const VIP_TIER_FALLBACK_AVATAR = 'bg-gradient-to-br from-ink-faint to-ink-soft';
+export const VIP_TIER_FALLBACK_AVATAR = 'bg-surface-2 text-ink';
 export const VIP_TIER_FALLBACK_PILL = 'bg-surface-2 text-ink-soft';

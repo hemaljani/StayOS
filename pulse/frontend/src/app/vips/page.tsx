@@ -70,7 +70,7 @@ export default function VipsPage() {
               {/* Guest cards */}
               <div className="space-y-2">
                 {group.guests.map((guest) => (
-                  <VipCard key={guest.guestId} guest={guest} onSelect={setSelectedGuest} />
+                  <VipCard key={guest.guestId} guest={guest} propertyId={data?.propertyId} onSelect={setSelectedGuest} />
                 ))}
               </div>
             </section>
@@ -80,7 +80,7 @@ export default function VipsPage() {
 
       {/* Profile modal */}
       {selectedGuest && (
-        <VipProfileModal guest={selectedGuest} onClose={() => setSelectedGuest(null)} />
+        <VipProfileModal guest={selectedGuest} propertyId={data?.propertyId} onClose={() => setSelectedGuest(null)} />
       )}
     </div>
   );

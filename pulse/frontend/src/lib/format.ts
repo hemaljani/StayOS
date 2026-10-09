@@ -83,6 +83,54 @@ export function clockTime(iso: string | null | undefined): string {
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
+// Pilot property zones from seed_data.py::GM_SEED_DATA, also used by the
+// data-orchestrator's PropertyTimezones mapping. Never use the viewer's zone.
+const PROPERTY_TIME_ZONES: Record<string, string> = {
+  'ALOHA-CHI-001': 'America/Chicago',
+  'ALOHA-MIA-001': 'America/New_York',
+  'ALOHA-TYO-001': 'Asia/Tokyo',
+  'ALOHA-MAD-001': 'Europe/Madrid',
+  'ALOHA-BOM-001': 'Asia/Kolkata',
+};
+
+/** Format a VIP arrival in property time, keeping date/zone context for details. */
+export function formatVipArrival(
+  iso: string | null | undefined,
+  propertyId?: string,
+): { time: string; detail: string } {
+  // A timestamp without an offset would be interpreted in the browser's zone.
+  if (!iso || !/T.*(?:Z|[+-]\d{2}:\d{2})$/i.test(iso)) {
+    return { time: '--', detail: 'Arrival time unavailable' };
+  }
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) {
+    return { time: '--', detail: 'Arrival time unavailable' };
+  }
+
+  const propertyZone = propertyId ? PROPERTY_TIME_ZONES[propertyId] : undefined;
+  // Unknown properties display an explicitly labeled UTC time, never a guessed
+  // property zone. New pilot properties must be added to the catalog above.
+  const timeZone = propertyZone ?? 'UTC';
+  const time = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    ...(!propertyZone ? { timeZoneName: 'short' as const } : {}),
+  }).format(date);
+  const detail = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    timeZoneName: 'short',
+  }).format(date);
+  return { time, detail };
+}
+
 // Whether an alert should appear in the live feed. Property 20 / Requirement
 // 12.4: RESOLVED alerts are excluded from the live feed and shown only in the
 // resolved history section.

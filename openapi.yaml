@@ -599,6 +599,41 @@ paths:
         "502":
           $ref: "#/components/responses/OpsDataUnavailable"
 
+  /kitchen:
+    get:
+      operationId: getKitchen
+      summary: Get the property's Kitchen and F&B snapshot
+      description: |
+        Returns the property-scoped Kitchen snapshot. Today's Orders value is
+        the daily total, including completed orders. Its In-flight count is
+        derived from the active kitchenOrders array, including for snapshots
+        stored before this normalization was introduced. The read does not
+        write or reseed the stored snapshot.
+      tags: [Ops]
+      parameters:
+        - $ref: "#/components/parameters/RequiredPropertyId"
+      responses:
+        "200":
+          description: Kitchen snapshot retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KitchenSnapshot"
+        "400":
+          $ref: "#/components/responses/PropertyIdRequired"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/PropertyForbidden"
+        "404":
+          description: Kitchen snapshot not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /demo/scenarios/{scenarioId}:
     post:
       operationId: runDemoScenario
@@ -1554,7 +1589,7 @@ components:
       description: Facility summary for the Ops tab
       properties:
         occupancyPct:
-          type: integer
+          type: number
           example: 87
         arrivalsTotal:
           type: integer
@@ -1567,6 +1602,7 @@ components:
           example: 374
         availableRooms:
           type: integer
+          description: Legacy name for total room inventory capacity, not remaining vacancy.
           example: 368
         oooCount:
           type: integer
@@ -1584,6 +1620,7 @@ components:
           example: 118
         availableRooms:
           type: integer
+          description: Legacy name for total room inventory capacity, not remaining vacancy.
           example: 368
         confirmedReservations:
           type: integer
@@ -1613,6 +1650,65 @@ components:
             $ref: "#/components/schemas/OooRoomCard"
         groupCheckout:
           $ref: "#/components/schemas/GroupCheckout"
+
+    KitchenSnapshot:
+      type: object
+      required: [propertyId, banquetCountdown, fbStats, deliverySla, kitchenOrders, channelMix, channelMixNote]
+      properties:
+        propertyId:
+          type: string
+        banquetCountdown:
+          type: object
+          nullable: true
+          properties:
+            title: {type: string}
+            badge: {type: string}
+            minutesRemaining: {type: integer}
+            progressPct: {type: integer}
+            subline: {type: string}
+        fbStats:
+          type: array
+          description: Daily summary; Orders delta reports the active kitchenOrders count.
+          items:
+            type: object
+            properties:
+              label: {type: string}
+              value: {type: string}
+              delta: {type: string}
+              deltaTone: {type: string, enum: [success, warning]}
+        deliverySla:
+          type: object
+          nullable: true
+          properties:
+            label: {type: string}
+            pct: {type: integer}
+            avgLabel: {type: string}
+            targetLabel: {type: string}
+            atRisk: {type: integer}
+            standardLabel: {type: string}
+        kitchenOrders:
+          type: array
+          description: Complete active order feed for this curated snapshot; its length determines the in-flight count.
+          items:
+            type: object
+            properties:
+              id: {type: string}
+              kind: {type: string, enum: [room-service, banquet, fnb, external]}
+              title: {type: string}
+              detail: {type: string}
+              elapsedLabel: {type: string}
+              slaState: {type: string, enum: [on-time, at-risk, breached]}
+              slaLabel: {type: string}
+        channelMix:
+          type: array
+          items:
+            type: object
+            properties:
+              label: {type: string}
+              pct: {type: integer}
+              warning: {type: boolean}
+        channelMixNote:
+          type: string
 
     DemoScenarioResponse:
       type: object

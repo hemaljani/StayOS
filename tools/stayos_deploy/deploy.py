@@ -14,6 +14,13 @@ from .output import (
     OutputSettings,
     format_duration,
 )
+from .password import (
+    PasswordAction,
+    PasswordError,
+    read_stack,
+    resolve_action,
+    verify_accounts,
+)
 
 
 @dataclass(frozen=True)
@@ -177,6 +184,13 @@ class DeploymentOrchestrator:
         self.root = root
         self.log_path = log_path
         self.environ = dict(os.environ if environ is None else environ)
+        self.change_app_password = self.environ.get("CHANGE_APP_PASSWORD", "0")
+        self.password_action = PasswordAction.PRESERVE
+        # Make command-line assignments may contain the password. Explicit
+        # context arguments below replace inherited overrides for child makes.
+        for name in ("MAKEFLAGS", "MFLAGS", "MAKEOVERRIDES"):
+            self.environ.pop(name, None)
+        self.environ["APP_PASSWORD"] = app_password
         settings = OutputSettings.load(self.environ)
         self.console = console or Console(settings)
         self.runner = runner or CommandRunner(
@@ -220,7 +234,11 @@ class DeploymentOrchestrator:
         result = self.runner.run(
             command,
             cwd=self.root if cwd is None else cwd,
-            extra_env=extra_env,
+            extra_env=(
+                {"APP_PASSWORD": "", "CHANGE_APP_PASSWORD": "0"}
+                if extra_env is None
+                else extra_env
+            ),
             progress=progress,
         )
         self.stage_warnings.extend(result.warnings)
@@ -293,59 +311,26 @@ class DeploymentOrchestrator:
             command.extend(f"{name}={value}" for name, value in variables.items())
         self._run(
             command,
-            extra_env={"APP_PASSWORD": self.app_password},
+            extra_env={
+                "APP_PASSWORD": self.app_password if directory == "lumi" else "",
+                "CHANGE_APP_PASSWORD": (
+                    self.change_app_password if directory == "lumi" else "0"
+                ),
+            },
             progress=MakeProgress(self.console, directory, target),
         )
 
     def _preflight(self) -> None:
-        if not self.app_password:
-            raise CommandFailed(
-                [],
-                2,
-                "APP_PASSWORD is required; pass APP_PASSWORD=... to make deploy-all",
+        try:
+            self.account_id = verify_accounts(self.config, self._capture)
+            self.password_action = resolve_action(
+                read_stack(self.config, self._capture),
+                self.app_password,
+                self.change_app_password,
             )
-        self.account_id = self._required(
-            "AWS account",
-            self._capture(
-                self._aws(
-                    "sts",
-                    "get-caller-identity",
-                    "--query",
-                    "Account",
-                    "--output",
-                    "text",
-                )
-            ),
-        )
-        cfn_account = self._required(
-            "CloudFormation account",
-            self._capture(
-                self._aws(
-                    "sts",
-                    "get-caller-identity",
-                    "--query",
-                    "Account",
-                    "--output",
-                    "text",
-                    cloudformation=True,
-                )
-            ),
-        )
-        if (
-            self.config.expected_account_id
-            and self.account_id != self.config.expected_account_id
-        ):
-            raise CommandFailed(
-                [],
-                1,
-                f"AWS account mismatch: expected {self.config.expected_account_id}, resolved {self.account_id}",
-            )
-        if cfn_account != self.account_id:
-            raise CommandFailed(
-                [],
-                1,
-                f"CloudFormation account mismatch: target {self.account_id}, resolved {cfn_account}",
-            )
+        except PasswordError as error:
+            raise CommandFailed([], 2, str(error)) from error
+        self.console.progress(self.password_action.message)
 
     def _deploy_lumi(self) -> None:
         self._make(
@@ -530,19 +515,29 @@ class DeploymentOrchestrator:
             self.config.profile or "<profile>",
             self.config.region,
         )
+        password_hint = (
+            " (supply APP_PASSWORD through the environment if the stack needs creation)"
+            if self.password_action == PasswordAction.CREATE
+            else ""
+        )
+        change_flag = (
+            " CHANGE_APP_PASSWORD=1"
+            if self.password_action == PasswordAction.REPLACE
+            else ""
+        )
         return [
             Stage(
                 1,
                 "LUMI",
                 "Foundation, Gateway, runtimes, and frontend ready",
-                f"make lumi-deploy APP_PASSWORD=... {context}",
+                f"make lumi-deploy {context}{change_flag}{password_hint}",
                 self._deploy_lumi,
             ),
             Stage(
                 2,
                 "PULSE infrastructure",
                 "Infrastructure, Lambda package, refresh, and seeds ready",
-                f"make deploy-all APP_PASSWORD=... {context}",
+                f"make deploy-all {context}",
                 self._deploy_pulse_initial,
             ),
             Stage(

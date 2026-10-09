@@ -8,6 +8,7 @@ Satisfies REQ-15 (Polly TTS) and REQ-26 (Audio Language Configuration).
 """
 
 import os
+import hashlib
 import uuid
 from typing import Any, Dict, Tuple
 
@@ -61,7 +62,8 @@ _s3_client = boto3.client("s3", config=_s3_config)
 
 
 def synthesize_audio(
-    narrative: str, language: str, property_id: str, date_str: str
+    narrative: str, language: str, property_id: str, date_str: str,
+    *, key_suffix: str = ""
 ) -> Dict[str, Any]:
     """Synthesize speech from narrative text and upload to S3.
 
@@ -91,6 +93,10 @@ def synthesize_audio(
     brief_id = str(uuid.uuid4())
     voice_id, engine = _get_voice_for_language(language)
     s3_key = _build_s3_key(property_id, date_str)
+    if key_suffix:
+        # Repair audio gets an immutable path; the prior brief remains playable
+        # until its conditional record replacement has succeeded.
+        s3_key = s3_key.replace("morning-brief.mp3", f"morning-brief-{key_suffix}.mp3")
 
     logger.info(
         "Synthesizing audio brief",
@@ -106,7 +112,13 @@ def synthesize_audio(
         audio_stream = _call_polly(narrative, voice_id, engine)
 
         # Upload the MP3 audio to S3
-        _upload_to_s3(audio_stream, s3_key)
+        if key_suffix:
+            _upload_to_s3(
+                audio_stream, s3_key,
+                narrative_hash=hashlib.sha256(narrative.encode()).hexdigest(),
+            )
+        else:
+            _upload_to_s3(audio_stream, s3_key)
 
         # Estimate duration based on word count
         duration_seconds = _estimate_duration(narrative)
@@ -256,7 +268,9 @@ def _call_polly(narrative: str, voice_id: str, engine: str) -> bytes:
         raise AudioSynthesisError(f"Polly API error: {error}")
 
 
-def _upload_to_s3(audio_bytes: bytes, s3_key: str) -> None:
+def _upload_to_s3(
+    audio_bytes: bytes, s3_key: str, *, narrative_hash: str = ""
+) -> None:
     """Upload MP3 audio to the configured S3 bucket.
 
     Sets content type and cache control headers for optimal
@@ -280,6 +294,10 @@ def _upload_to_s3(audio_bytes: bytes, s3_key: str) -> None:
             Body=audio_bytes,
             ContentType="audio/mpeg",
             CacheControl="max-age=86400",
+            **(
+                {"Metadata": {"narrative-sha256": narrative_hash}}
+                if narrative_hash else {}
+            ),
         )
 
         logger.info(

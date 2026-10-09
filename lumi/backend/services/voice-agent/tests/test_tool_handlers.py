@@ -66,6 +66,27 @@ def mock_dynamodb(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("item", "inventory"),
+    [
+        ({"availableRooms": Decimal("368"), "occupancyPct": Decimal("90.5")}, 368),
+        ({"totalRooms": Decimal("368"), "availableRooms": Decimal("0")}, 368),
+        ({}, 0),
+    ],
+)
+async def test_occupancy_exposes_inventory_without_remaining_vacancy(
+    mock_dynamodb: MagicMock, item: Dict[str, Any], inventory: int
+) -> None:
+    """Legacy/new records and missing data never publish an ambiguous room count."""
+    from tool_handlers import get_occupancy
+
+    mock_dynamodb.Table.return_value.get_item.return_value = {"Item": item}
+    result = await get_occupancy("PROP-001", date="2026-10-08")
+    assert result["data"]["totalRooms"] == inventory
+    assert "availableRooms" not in result["data"]
+
+
 class TestDispatchRouting:
     """Tests verifying dispatch_tool routes to the correct handler function."""
 
@@ -571,7 +592,8 @@ class TestHandlerResponseStructure:
         assert data["arrivalsTotal"] == 18
         assert data["departuresTotal"] == 10
         assert data["confirmedReservations"] == 55
-        assert data["availableRooms"] == 12
+        assert data["totalRooms"] == 12
+        assert "availableRooms" not in data
         # Verify Decimals were converted to native Python types
         assert not isinstance(data["occupancyPct"], Decimal)
 

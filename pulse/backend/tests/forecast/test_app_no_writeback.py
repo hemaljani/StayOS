@@ -1,9 +1,9 @@
 """Property test for the Forecasting Agent's advisory read + advise-only posture.
 
 Exercises the thin orchestrator ``app.run_forecast_session`` end to end with
-its collaborators injected (the Gateway ``call_tool`` seam and the alert
-reconciler), so no Strands/MCP client, Bedrock, or DynamoDB is touched. The
-property under test is the advisory posture of the whole run (Req 5.1, 2.5):
+its collaborators injected (the Gateway ``call_tool`` seam, narrative model,
+and alert reconciler), so no Strands/MCP client, Bedrock, or DynamoDB is touched.
+The property under test is the advisory posture of the whole run (Req 5.1, 2.5):
 across arbitrary canned read-only signals, the orchestrator only ever reaches
 the platform through the three READ-ONLY tools and the single ``reconcile``
 write seam, and every record it hands ``reconcile`` is a ``FORECAST_OVERSELL``
@@ -21,9 +21,7 @@ Validates: Requirements 5.1, 2.5.
 from __future__ import annotations
 
 from typing import Any
-
-from hypothesis import given, settings
-from hypothesis import strategies as st
+from unittest.mock import patch
 
 import app
 from forecast.alerts import FORECAST_ALERT_TYPE, ReconcileResult, UpsertResult
@@ -32,14 +30,15 @@ from forecast.signals import (
     TOOL_GET_REVENUE,
     TOOL_GET_SISTER_PROPERTY_AVAILABILITY,
 )
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from .conftest import RecordingToolCaller
 
 # The orchestration is heavier than a pure-engine property (it sequences read ->
-# forecast -> author -> reconcile), and the actionable path exercises the
-# Remediation Plan Author's deterministic template fallback, whose per-example
-# cost varies. max_examples is lowered to 50 and the per-example deadline is
-# disabled so that variable-but-correct timing is not mistaken for a failure.
+# forecast -> author -> reconcile), with a deterministic narrative fake below.
+# Keep 50 examples and disable the per-example deadline so variable but correct
+# orchestration timing is not mistaken for a failure.
 PROPERTY_SETTINGS = settings(max_examples=50, deadline=None)
 
 # The three tools the advisory agent is permitted to reach (Req 2.5, 5.1). Any
@@ -116,7 +115,8 @@ def _occupancy_records(rows: list[dict[str, Any]]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-# Feature: predictive-forecasting-agent, Property 23: Forecasting performs no write-back and never invokes the executor
+# Feature: predictive-forecasting-agent, Property 23:
+# Forecasting performs no write-back and never invokes the executor.
 @PROPERTY_SETTINGS
 @given(
     property_id=st.sampled_from(ENABLED_PROPERTY_IDS),
@@ -156,9 +156,7 @@ def test_property_23_no_writeback_never_invokes_executor(
     """
     # Canned read-only results for all three tools. The reader scopes each row to
     # the bound property, so echo the bound propertyId onto every record.
-    scoped_rows = [
-        {**row, "propertyId": property_id} for row in occupancy_rows
-    ]
+    scoped_rows = [{**row, "propertyId": property_id} for row in occupancy_rows]
     call_tool = RecordingToolCaller(
         {
             TOOL_GET_OCCUPANCY: _occupancy_records(scoped_rows),
@@ -175,17 +173,30 @@ def test_property_23_no_writeback_never_invokes_executor(
     )
     reconcile = RecordingReconciler()
 
-    summary = app.run_forecast_session(
-        {"propertyId": property_id},
-        call_tool=call_tool,
-        reconcile=reconcile,
-    )
+    # The configured model ID selects the default narrative invoker even when
+    # the Gateway/reconciler are faked. Replace that model boundary explicitly.
+    # Guard the client factory too so a swallowed model error cannot conceal I/O.
+    with (
+        patch(
+            "forecast.narrative._default_model_invoker",
+            return_value='{"narrative": "Deterministic forecast.", '
+            '"steps": ["Review the advisory with the front desk."]}',
+        ) as model,
+        patch("forecast.narrative._get_bedrock_client") as bedrock_client,
+    ):
+        summary = app.run_forecast_session(
+            {"propertyId": property_id},
+            call_tool=call_tool,
+            reconcile=reconcile,
+        )
+        bedrock_client.assert_not_called()
+        assert model.call_count == len(reconcile.predictions)
 
     # 1. Every tool the run reached is a read-only tool - no write/executor tool.
     for tool_name in call_tool.tool_names():
-        assert tool_name in READ_ONLY_TOOL_NAMES, (
-            f"orchestrator called a non-read-only tool: {tool_name!r}"
-        )
+        assert (
+            tool_name in READ_ONLY_TOOL_NAMES
+        ), f"orchestrator called a non-read-only tool: {tool_name!r}"
 
     # 2. The injected reconcile fake is the only write path, and every item it
     #    was handed is a FORECAST_OVERSELL advisory item (Req 5.1). There is no

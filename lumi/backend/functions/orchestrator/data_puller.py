@@ -21,6 +21,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from orchestrator_exceptions import AllSourcesFailedError
+from revenue_kpis import format_revenue_kpis
 
 logger = Logger(service="stayos-orchestrator")
 
@@ -233,7 +234,9 @@ def _query_revenue(property_id: str, date_str: str) -> Optional[Dict[str, Any]]:
         Revenue item dict or None if no record exists for today.
     """
     table = _dynamodb_resource.Table(REVENUES_TABLE)
-    response = table.get_item(Key={"propertyId": property_id, "date": date_str})
+    response = table.get_item(
+        Key={"propertyId": property_id, "date": date_str}, ConsistentRead=True
+    )
     return response.get("Item")
 
 
@@ -819,32 +822,6 @@ def _count_curated_vip_tiers(
     }
 
 
-def _derive_revpar_budget(
-    current_revpar: int,
-    occupancy_pct: int,
-    occupancy_vs_budget: float,
-) -> int:
-    """Estimate budget RevPAR from the available occupancy budget delta.
-
-    The prototype revenue dataset has no explicit RevPAR budget. Assuming ADR
-    is held constant, budget RevPAR scales current RevPAR by budget occupancy,
-    where budget occupancy is current occupancy minus ``vsBudget``.
-
-    Args:
-        current_revpar: Current RevPAR value.
-        occupancy_pct: Current occupancy percentage.
-        occupancy_vs_budget: Occupancy percentage-point delta versus budget.
-
-    Returns:
-        Defensible estimated budget RevPAR, or current RevPAR when occupancy
-        is unavailable.
-    """
-    if occupancy_pct <= 0:
-        return current_revpar
-    budget_occupancy = max(0.0, occupancy_pct - occupancy_vs_budget)
-    return round(current_revpar * budget_occupancy / occupancy_pct)
-
-
 def _format_kpis(
     revenue: Optional[Dict[str, Any]],
     arrivals: List[Dict[str, Any]],
@@ -861,7 +838,7 @@ def _format_kpis(
 
     Args:
         revenue: Today's revenue record from stayos-revenues, if available.
-        arrivals: Today's reservation rows, used only as a no-revenue fallback.
+        arrivals: Today's reservation rows, used when the arrival total is absent.
         vip_arrivals: Unique curated VIP entries selected for display.
         date_str: ISO date string for today.
 
@@ -884,46 +861,9 @@ def _format_kpis(
             "availableRooms": 0,
         }
 
-    occupancy_pct = _decimal_to_int(revenue.get("occupancyPct", 0))
-    current_revpar = _decimal_to_int(revenue.get("revpar", 0))
-    vs_last_week = _decimal_to_float(revenue.get("vsLastWeek", 0))
-    vs_budget = _decimal_to_float(revenue.get("vsBudget", 0))
-
-    return {
-        "date": date_str,
-        "asOf": now_iso,
-        "occupancy": {
-            "current": occupancy_pct,
-            "unit": "percent",
-            "vsLastWeek": vs_last_week,
-            "vsBudget": vs_budget,
-            "forecast3pm": occupancy_pct,
-        },
-        "adr": {
-            "current": _decimal_to_int(revenue.get("adr", 0)),
-            "currency": revenue.get("currency", "USD"),
-            "vsLastWeek": vs_last_week,
-            "vsBudget": vs_budget,
-            "pacePctOfBudget": max(0, round(100 + vs_budget)),
-        },
-        "revPAR": {
-            "current": current_revpar,
-            "currency": revenue.get("currency", "USD"),
-            "vsYOY": _decimal_to_float(revenue.get("vsYOY", 0)),
-            "budget": _derive_revpar_budget(current_revpar, occupancy_pct, vs_budget),
-        },
-        "arrivals": {
-            "total": _decimal_to_int(revenue.get("arrivals", len(arrivals))),
-            **vip_counts,
-        },
-        "departures": {
-            "total": _decimal_to_int(revenue.get("departures", 0)),
-            "groupCheckouts": 0,
-            "groupRooms": 0,
-        },
-        "confirmedReservations": _decimal_to_int(revenue.get("confirmedReservations", 0)),
-        "availableRooms": _decimal_to_int(revenue.get("availableRooms", 0)),
-    }
+    # Preserve the reservation fallback for partial legacy revenue records.
+    source = {**revenue, "arrivals": revenue.get("arrivals", len(arrivals))}
+    return format_revenue_kpis(source, date_str, now_iso, vip_counts)
 
 
 def _format_ooo_detail(rooms: List[Dict[str, Any]]) -> str:

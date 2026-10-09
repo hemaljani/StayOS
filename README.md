@@ -31,7 +31,7 @@ In this repo, StayOS ships with **two live features** today, both aimed at the G
   60-90 second AI-generated audio brief. If the GM needs more information, LUMI also provides a voice and chat interface.
 - <img src="stayos-shell/frontend/assets/pulse-logo.svg" alt="PULSE icon" width="18" height="18" align="absmiddle" /> **PULSE** takes the pulse of hotel operations and keeps the GM informed all day: real-time, tiered alerts (Critical / Warning / Info) pushed the moment a situation develops, each triaged by an AI agent that gathers the relevant property data and attaches a decision-ready brief, then resolved closed-loop — the GM approves, the agent executes. PULSE also looks *ahead*: a predictive Forecasting Agent runs on a daily schedule to warn the GM of likely room oversell before it happens (advisory, human-in-the-loop).
 
-And features are coming. StayOS is built as a platform, not a single tool
+More features are coming. StayOS is built as a platform, not a single tool
 
 Each app lives in its own top-level directory:
 
@@ -69,8 +69,21 @@ Nova Sonic, Polly). Region defaults to `us-east-1`.
 ```bash
 git clone https://github.com/hemaljani/StayOS.git
 cd StayOS
-make deploy-all APP_PASSWORD=YourSecurePassword123!
+# First deployment only: enter the password without displaying it (Bash / Zsh).
+printf 'New deployment password: '
+IFS= read -r -s APP_PASSWORD
+printf '\n'
+export APP_PASSWORD
+make deploy-all
+unset APP_PASSWORD
 ```
+
+For an existing installation, simply run `make deploy-all` with the same
+deployment profiles, region, and stack prefixes. The password step is skipped:
+the existing `AppPassword` parameter is preserved without retrieving its value.
+If `APP_PASSWORD` is still set, unset it before redeploying. Intentional parameter
+replacement requires both `CHANGE_APP_PASSWORD=1` and `APP_PASSWORD` in the
+environment; see [deployment configuration](docs/deployment-pipeline.md#parameters-and-configuration).
 
 Successful deployments are concise by default: the root pipeline prints eight
 timed stages, bounded live progress such as CodeBuild, CloudFormation, Lambda,
@@ -182,15 +195,3 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 ## License
 
 [MIT](LICENSE)
-
-## References
-
-- [AWS Well-Architected — Serverless Applications Lens](https://docs.aws.amazon.com/wellarchitected/latest/serverless-applications-lens/welcome.html)
-- [Amazon Bedrock AgentCore — Runtime Developer Guide](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/)
-- [Amazon Bedrock AgentCore — Gateway (MCP tool targets)](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway.html)
-- [Strands Agents SDK](https://strandsagents.com/)
-- [Amazon Bedrock — Converse API](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html)
-- [Amazon Nova Sonic — Bidirectional Streaming](https://docs.aws.amazon.com/nova/latest/userguide/speech.html)
-- [Amazon Polly — Neural Voices](https://docs.aws.amazon.com/polly/latest/dg/ntts-voices-main.html)
-- [DynamoDB Single-Table Design](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-general-nosql-design.html)
-- [Next.js 15 — App Router](https://nextjs.org/docs/app)

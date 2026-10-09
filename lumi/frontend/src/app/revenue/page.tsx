@@ -52,8 +52,8 @@ export default function RevenuePage() {
         Data as of {new Date(dailyKPIs.asOf).toLocaleString()}
       </p>
 
-      {/* KPI Summary Cards */}
-      <div className="grid grid-cols-3 gap-2 mb-5">
+      {/* Wrap cards before precise monetary values crowd their neighbours. */}
+      <div className="mb-5 flex flex-wrap gap-2 [&>div]:basis-32 [&>div]:grow">
         <KpiCard
           label="ADR"
           value={dailyKPIs.adr.current}
@@ -100,6 +100,11 @@ export default function RevenuePage() {
           percentage={Math.round((dailyKPIs.revPAR.current / dailyKPIs.revPAR.budget) * 100)}
           value={`$${dailyKPIs.revPAR.current}`}
         />
+      </div>
+
+      {/* Occupancy is compared with its 3 PM forecast, not a budget. */}
+      <div className="bg-surface rounded-xl p-4 mb-5">
+        <h3 className="text-sm text-gray-300 mb-3">Occupancy vs 3 PM Forecast</h3>
         <PaceBar
           label="Occupancy"
           percentage={Math.round((dailyKPIs.occupancy.current / dailyKPIs.occupancy.forecast3pm) * 100)}
@@ -109,7 +114,10 @@ export default function RevenuePage() {
 
       {/* Segment Mix Breakdown */}
       <div className="bg-surface rounded-xl p-4 mb-5">
-        <h3 className="text-sm font-semibold text-gray-300 mb-3">Segment Mix</h3>
+        <h3 className="text-sm font-semibold text-gray-300 mb-2">Illustrative Segment Mix</h3>
+        <p className="text-xs text-ink-soft mb-3">
+          Example percentages; actual property segment data is not available.
+        </p>
         <div className="space-y-2">
           <SegmentRow label="Group" percentage={35} color="bg-accent" />
           <SegmentRow label="Transient" percentage={50} color="bg-accent-secondary" />
