@@ -122,6 +122,6 @@ for a non-demo deploy.
 
 ## Links
 
-- REST API spec: [`../openapi.yaml`](../openapi.yaml)
+- Unified StayOS REST API contract for LUMI and PULSE: [`../openapi.yaml`](../openapi.yaml)
 - Data model: [`../docs/data-model.md`](../docs/data-model.md)
 - Deployment pipeline: [`../docs/deployment-pipeline.md`](../docs/deployment-pipeline.md)

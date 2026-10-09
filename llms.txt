@@ -147,8 +147,8 @@
   data-model reference (LUMI + PULSE tables, keys/GSIs, volumes) plus the
   Unified Data Orchestrator note — how the demo data is seeded, rolled forward,
   quiesced, baselined, and fired live on stage.
-- [openapi.yaml](openapi.yaml): StayOS REST API spec — currently the PULSE
-  real-time alerts API (LUMI's REST spec is in [lumi/openapi.yaml](lumi/openapi.yaml)).
+- [openapi.yaml](openapi.yaml): Unified StayOS REST API specification and
+  authoritative contract for both LUMI and PULSE.
 - [AGENTS.md](AGENTS.md): root contributor/agent guide — repo-wide safety,
   conventions, and per-feature workflow.
 - [docs/deployment-pipeline.md](docs/deployment-pipeline.md): account-aware

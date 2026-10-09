@@ -19,7 +19,6 @@ ready to consume during a property walk-through, not chained to a workstation.
    - [Voice Agent (AgentCore)](#voice-agent-agentcore)
 6. [Chat Agent (AgentCore + Gateway)](#chat-agent-agentcore--gateway)
 7. [Data Sources](#data-sources)
-8. [References](#references)
 
 ## Why This Exists
 
@@ -60,8 +59,11 @@ Deployed in a single AWS region (us-east-1) using a serverless & managed archite
 | Data | DynamoDB | GM settings, generated briefs, and 5 operational dataset tables |
 | Storage | S3 + CloudFront | Polly-generated MP3 audio with CDN delivery |
 | Auth | Amazon Cognito + shared `@stayos/auth` | Admin-provisioned GM accounts with JWT tokens; single sign-on shared with the StayOS shell and PULSE |
-| Security | AWS WAF | US-only geographic restriction on API + frontend |
+| Security | AWS WAF | US-only geographic restriction on CloudFront; Gateway managed rules and rate limiting when WebACL association succeeds |
 | Observability | CloudWatch + X-Ray | Unified logging, dashboards, alarms, distributed tracing |
+
+The REST API uses Cognito JWT authorization. The templates do not associate a
+WAF WebACL with its API Gateway stage.
 
 
 ## Pilot Properties
@@ -112,12 +114,13 @@ waits for every target to disappear before deleting and verifying the Gateway:
 make lumi-destroy [PROFILE=... REGION=...]   # full LUMI teardown (run only after PULSE + shell are gone)
 ```
 
-Or tear down just the CLI-managed AgentCore pieces without deleting the stack:
+Or, from the repository root, tear down just the CLI-managed AgentCore pieces
+without deleting the stack:
 
 ```bash
-make voice-destroy    # delete the voice AgentCore Runtime only
-make chat-destroy     # delete the chat AgentCore Runtime only
-make gateway-destroy  # tear down the shared AgentCore Gateway only
+make lumi-voice-destroy    # delete the voice AgentCore Runtime only
+make lumi-chat-destroy     # delete the chat AgentCore Runtime only
+make lumi-gateway-destroy  # tear down the shared AgentCore Gateway only
 ```
 
 ### Voice Agent (AgentCore)
@@ -142,7 +145,10 @@ before updating the parent stack and existing runtime. See the
 
 #### Voice Agent Environment Variables
 
-The agent container reads these environment variables at runtime (configured in `agentcore.yaml`):
+The deployment targets in [`lumi/Makefile`](Makefile) set these environment
+variables on the AgentCore Runtime. The voice service's
+[`agentcore.yaml`](backend/services/voice-agent/agentcore.yaml) documents the
+runtime configuration; the Makefile drives deployment.
 
 | Variable | Description | Example |
 |----------|-------------|---------|
@@ -151,18 +157,23 @@ The agent container reads these environment variables at runtime (configured in 
 | `GUESTS_TABLE_NAME` | DynamoDB guests table | `stayos-guests` |
 | `REVENUES_TABLE_NAME` | DynamoDB revenues table | `stayos-revenues` |
 | `WORK_ORDERS_TABLE_NAME` | DynamoDB work orders table | `stayos-work-orders` |
+| `BRIEFS_TABLE_NAME` | DynamoDB generated briefs table | `stayos-briefs` |
 | `SETTINGS_TABLE_NAME` | DynamoDB GM settings table | `stayos-settings` |
+| `COGNITO_USER_POOL_ID` | Cognito User Pool ID passed from stack outputs | `us-east-1_xxxxxxxxx` |
 | `AWS_DEFAULT_REGION` | AWS region for boto3 clients | `us-east-1` |
 
 #### Frontend Environment Variables
 
-The frontend needs these environment variables (set in `.env.local` or build environment):
+The voice frontend uses the variables below. For local development, set them
+in `frontend/.env.local`. Deployment runs `make lumi-write-frontend-env` from
+the repository root to generate `frontend/.env.production` from CloudFormation
+outputs and runtime IDs stored in SSM. This file is regenerated during deployment.
 
 | Variable | Description | Source |
 |----------|-------------|--------|
-| `NEXT_PUBLIC_AGENTCORE_RUNTIME_ARN` | AgentCore Runtime ARN for WebSocket endpoint | Written by `make voice-deploy` to `.voice-runtime-id` |
+| `NEXT_PUBLIC_AGENTCORE_RUNTIME_ARN` | AgentCore Runtime ARN for WebSocket endpoint | Constructed from the runtime ID in SSM `/${STACK_PREFIX}/voice/runtime-id`, plus the deployment account and region |
 | `NEXT_PUBLIC_COGNITO_IDENTITY_POOL_ID` | Identity Pool ID for credential exchange | CloudFormation output: `VoiceIdentityPoolId` |
-| `NEXT_PUBLIC_AWS_REGION` | AWS region | `us-east-1` |
+| `NEXT_PUBLIC_AWS_REGION` | AWS region | Deployment `REGION` (defaults to `us-east-1`) |
 
 #### Authentication Flow
 
@@ -192,29 +203,12 @@ See [`docs/voice-agent-architecture.png`](docs/voice-agent-architecture.png) for
 ## Chat Agent (AgentCore + Gateway)
 
 The LUMI chat agent runs on the same [Amazon Bedrock AgentCore Runtime](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/) as the voice agent, but answers General Manager questions as text instead of speech — useful when voice isn't practical (a noisy lobby, a meeting, or simply a preference for typing). It uses [Strands Agents](https://strandsagents.com/) with Claude Sonnet for reasoning, and discovers/calls tools through the **AgentCore Gateway** rather than in-process.
+The browser opens a SigV4-authenticated WebSocket to the chat agent in
+AgentCore Runtime. The agent discovers and calls tools through the Gateway
+over MCP. The Gateway invokes the Tool Lambda, which reads DynamoDB; the
+chat agent streams its response back to the browser.
 
-#### Why a Gateway instead of calling tools directly?
-
-The voice agent calls its 5 DynamoDB-query tools directly, in-process, for the lowest possible latency during a live audio session. The chat agent instead connects to an **AgentCore Gateway**, which exposes those same 5 tools as a standard MCP (Model Context Protocol) endpoint backed by a Lambda function (`stayos-tools`). This means:
-
-- The tool implementation lives in exactly one place (`backend/functions/tools/lambda_function.py`), reusing the same DynamoDB access patterns as the voice agent's `tool_handlers.py`
-- New tools registered on the Gateway are picked up by the chat agent automatically, with no redeploy
-- Future agents (or future write tools) can reuse the same Gateway without duplicating tool logic
-- The Gateway is protected by a dedicated regional AWS WAFv2 WebACL (managed rule groups + rate limiting) in front of the Lambda target
-
-```
-Browser              AgentCore Gateway           Tool Lambda          DynamoDB
-   |                        |                         |                  |
-   |-- WebSocket (SigV4) -->|                         |                  |
-   |   Chat Agent (Strands) |                         |                  |
-   |     tools/list ------->|                         |                  |
-   |<-- 5 tool specs -------|                         |                  |
-   |     tools/call ------->|-- invoke (SigV4) ------>|                  |
-   |                        |   flat event +          |-- GetItem/Query->|
-   |                        |   client_context.custom  |<-----------------|
-   |                        |<-- {status, data} -------|                  |
-   |<-- streamed response --|                         |                  |
-```
+![Chat agent architecture](docs/chat-agent-architecture.png)
 
 #### Chat Agent Deployment
 
@@ -225,14 +219,15 @@ is available. The pipeline mirrors the voice agent:
 2. Pushes the image to ECR
 3. Creates/updates the AgentCore Runtime via AWS CLI, injecting `GATEWAY_ENDPOINT_URL` (read from SSM) as an environment variable
 
-To iterate on the chat agent or Gateway on their own (LUMI already deployed):
+To iterate on the chat agent or Gateway on their own, run these commands from
+the repository root (LUMI already deployed):
 
 ```bash
-make gateway-deploy  # Create/update AgentCore Gateway + register Tool Lambda target + WAF
-make chat-build      # Zip source → S3 → CodeBuild → ECR image
-make chat-deploy     # Create/update AgentCore Runtime
-make chat-destroy    # Delete the AgentCore Runtime
-make gateway-destroy # Tear down the AgentCore Gateway
+make lumi-gateway-deploy  # Create/update Gateway + register target + attempt WAF association
+make lumi-chat-build      # Zip source → S3 → CodeBuild → ECR image
+make lumi-chat-deploy     # Create/update AgentCore Runtime
+make lumi-chat-destroy    # Delete the AgentCore Runtime
+make lumi-gateway-destroy # Tear down the AgentCore Gateway
 ```
 
 #### Chat Agent Environment Variables
@@ -251,9 +246,12 @@ make gateway-destroy # Tear down the AgentCore Gateway
 | `ChatPanel.tsx` | Full-screen chat UI: message thread rendered as Markdown (tables, bold, lists via `react-markdown` + `remark-gfm`), always-visible tappable example-question chips, typing indicator |
 | `useChatAgent.ts` | WebSocket session management, SigV4 auth (same Identity Pool as voice), message streaming/accumulation |
 
-Frontend env additions: `NEXT_PUBLIC_CHAT_RUNTIME_ARN` (written by `make write-frontend-env` from the chat runtime ID in SSM), reusing the existing `NEXT_PUBLIC_COGNITO_IDENTITY_POOL_ID`/`NEXT_PUBLIC_AWS_REGION` from the voice agent setup.
-
-See [`docs/chat-agent-architecture.png`](docs/chat-agent-architecture.png) for the full component diagram.
+Frontend env additions: `NEXT_PUBLIC_CHAT_RUNTIME_ARN` (written to
+`frontend/.env.production` by `make lumi-write-frontend-env` using the runtime ID
+in SSM `/${STACK_PREFIX}/chat/runtime-id`, plus the deployment account and
+region), reusing the existing
+`NEXT_PUBLIC_COGNITO_IDENTITY_POOL_ID`/`NEXT_PUBLIC_AWS_REGION` from the voice
+agent setup.
 
 ## Data Sources
 
@@ -264,16 +262,3 @@ CloudFormation custom resource, generates ~24,000 items across LUMI's 7
 its streams. See the canonical **[Data Model Reference](../docs/data-model.md)** for
 complete schemas, relationships, access patterns, enumerated values, and
 generation parameters for both LUMI and PULSE.
-
-
-## References
-
-- [AWS Well-Architected — Serverless Applications Lens](https://docs.aws.amazon.com/wellarchitected/latest/serverless-applications-lens/welcome.html)
-- [Amazon Bedrock AgentCore — Runtime Developer Guide](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/)
-- [Amazon Bedrock AgentCore — Gateway (MCP tool targets)](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway.html)
-- [Strands Agents SDK](https://strandsagents.com/)
-- [Amazon Bedrock — Converse API](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html)
-- [Amazon Nova Sonic — Bidirectional Streaming](https://docs.aws.amazon.com/nova/latest/userguide/speech.html)
-- [Amazon Polly — Neural Voices](https://docs.aws.amazon.com/polly/latest/dg/ntts-voices-main.html)
-- [DynamoDB Single-Table Design](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-general-nosql-design.html)
-- [Next.js 15 — App Router](https://nextjs.org/docs/app)

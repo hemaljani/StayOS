@@ -374,33 +374,42 @@ make plan PROFILE=my-other-account REGION=us-west-2 \
 
 ### Deployment password
 
-For a **new installation**, enter the password privately in Bash or Zsh and
-export it only for deployment:
+For a **new installation**, use a password with at least 8 characters,
+including uppercase, lowercase, and a number. Symbols are allowed but are not
+required. Every deployment-context variable in this example is optional:
+`PROFILE` selects a configured profile, `CLOUDFORMATION_PROFILE` defaults to
+that profile, `REGION` defaults to `us-east-1`, and `EXPECTED_ACCOUNT_ID` adds
+an account-safety check.
 
 ```bash
-printf 'New deployment password: '
-IFS= read -r -s APP_PASSWORD
-printf '\n'
-export APP_PASSWORD
-make deploy-all PROFILE=my-target-account \
-  CLOUDFORMATION_PROFILE=my-target-cfn-role \
-  REGION=us-east-1 EXPECTED_ACCOUNT_ID=123456789012
-unset APP_PASSWORD
+printf 'New demo-user password: '; IFS= read -r -s APP_PASSWORD; printf '\n'; APP_PASSWORD="$APP_PASSWORD" make deploy-all PROFILE=my-target-account CLOUDFORMATION_PROFILE=my-target-cfn-role REGION=us-east-1 EXPECTED_ACCOUNT_ID=123456789012; unset APP_PASSWORD
 ```
 
-For a **normal redeployment**, omit `APP_PASSWORD` and use the same deployment
-context. If the environment retains it from a previous run, first run
-`unset APP_PASSWORD`. Supplying it on an existing stack without explicit change
-intent stops deployment before AWS writes rather than silently replacing it.
+Password characters are intentionally invisible while you type; press Enter to
+finish. The password is passed only to this deployment, is not written into the
+command or shell history, and is removed from the current shell afterward.
 
-To **intentionally replace the stack parameter**, enter and export
-`APP_PASSWORD` as above, then use `make deploy-all CHANGE_APP_PASSWORD=1` with the
-same deployment context. This changes the parameter, not existing users'
-Cognito passwords. The flag requires an existing stack and a nonempty password.
-Passwords are never interpolated into generated shell commands or written to
-deployment parameter files; AWS CLI receives parameter JSON through standard
-input. Prefer environment input to command-line passwords, which can appear in
-shell history and the invoking process's arguments.
+For a **normal redeployment**, do not enter the password again. Defensively
+clear any old shell variable before using the same optional deployment context:
+
+```bash
+unset APP_PASSWORD
+make deploy-all
+```
+
+The existing `AppPassword` CloudFormation parameter is preserved without
+retrieving its value. Supplying `APP_PASSWORD` on an existing stack without
+explicit change intent stops deployment before AWS writes rather than silently
+replacing it.
+
+To **intentionally replace the stack parameter**, repeat the hidden-input
+command and add `CHANGE_APP_PASSWORD=1` after `make deploy-all`, along with any
+optional deployment context. This changes the stack parameter, not existing
+users' Cognito passwords. The flag requires an existing stack and a nonempty
+password. Passwords are never interpolated into generated shell commands or
+written to deployment parameter files; AWS CLI receives parameter JSON through
+standard input. Avoid command-line password values, which can appear in shell
+history and the invoking process's arguments.
 
 The root runner, direct LUMI deployment, and direct infrastructure deployment
 share this policy. Both profile identities are verified before inspecting the
@@ -410,9 +419,16 @@ and existing stacks without `AppPassword` stop deployment. Updates require
 `CREATE_COMPLETE`, `UPDATE_COMPLETE`, or `UPDATE_ROLLBACK_COMPLETE`; other
 states require recovery first.
 
-**Prerequisites** (one-time): AWS CLI v2.27+, Python 3.12+, Node.js 18+, and
-Amazon Bedrock model access enabled in the target account/region (Claude Sonnet,
-Nova Sonic, Polly).
+**Prerequisites** (one-time): Git, GNU Make, `zip`, AWS CLI v2.27 or later,
+Python 3.12 or later with `pip`, Node.js 22.13 or later with npm, and AWS
+credentials configured for the target account. In the target region, the
+deployment identity must be able to use Amazon Bedrock AgentCore and invoke
+[Anthropic Claude Sonnet 4.6](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html)
+and [Amazon Nova 2.5 Sonic](https://aws.amazon.com/about-aws/whats-new/2026/10/amazon-nova-2.5-Sonic/).
+Complete Anthropic's first-time-use setup if it applies to the account. StayOS
+also uses [Amazon Polly](https://docs.aws.amazon.com/polly/latest/dg/neural-voices.html)
+for generated MP3 briefs; Polly is a separate AWS service, not a Bedrock model.
+`REGION` defaults to `us-east-1`.
 
 <div align="right"><a href="#contents">↑ Back to top</a></div>
 

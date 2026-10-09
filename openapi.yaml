@@ -1,59 +1,391 @@
 openapi: "3.0.3"
 info:
-  title: StayOS API - Part of StayOS
-  version: "1.0.0"
+  title: StayOS API
+  version: "1.2.0"
   description: |
-    StayOS is the operating system for hotel General Managers and associates.
-    This root specification currently documents the **PULSE** real-time alerts
-    API (StayOS Feature #2): tiered (CRITICAL / WARNING / INFO), AI-triaged
-    operational alerts with a closed-loop "human approves, agent executes"
-    resolution flow.
-
-    LUMI's (Feature #1) brief/settings REST API is documented separately in
-    `lumi/openapi.yaml` and is intentionally **not** duplicated here.
+    StayOS is the shared intelligence platform for hotel General Managers and
+    associates. This authoritative REST contract documents its two separately
+    branded experiences: LUMI provides daily intelligence briefs and General
+    Manager settings, while PULSE provides real-time operational alerts,
+    closed-loop actions, delivery configuration, and operations views.
 
     All endpoints require Amazon Cognito JWT Bearer authentication and are
-    protected by AWS WAF (US-only geographic restriction, reused from LUMI).
-    Every route is scoped server-side to the caller's associated properties;
-    no route trusts a client-supplied scope.
+    protected by AWS WAF with a US-only geographic restriction. Every route is
+    scoped server-side to the caller's associated properties; no route trusts
+    client-supplied scope. LUMI and PULSE use distinct deployed API Gateway IDs
+    at the same `/v1` stage, represented by brand-specific server entries and
+    path-level server selection.
 
-    Note: the PULSE **foreground realtime** feed (live alert create /
-    status-change / resolve events) is delivered over a separate AWS AppSync
-    Events WebSocket channel, **not** over this REST API. Use
-    `GET /config/realtime` to obtain the WebSocket endpoint and namespace. This
-    REST API covers the request/response surface only.
+    The PULSE foreground realtime feed is delivered over a separate AWS
+    AppSync Events WebSocket channel and is not part of this REST contract. Use
+    `GET /config/realtime` to obtain its endpoint and namespace.
 
 externalDocs:
-  description: PULSE README - architecture, build, and deploy guide
-  url: pulse/README.md
+  description: StayOS platform overview, architecture, build, and deployment guide
+  url: README.md
 
 servers:
-  - url: https://{api-id}.execute-api.us-east-1.amazonaws.com/v1
-    description: Production API (us-east-1, protected by WAF + Cognito JWT)
+  - url: https://{lumi-api-id}.execute-api.us-east-1.amazonaws.com/v1
+    description: LUMI API (us-east-1, protected by WAF and Cognito JWT)
     variables:
-      api-id:
-        default: "your-api-gateway-id"
-        description: API Gateway REST API ID (from CloudFormation output)
+      lumi-api-id:
+        default: "your-lumi-api-gateway-id"
+        description: LUMI API Gateway REST API ID (from CloudFormation output ApiGatewayUrl)
+  - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
+    description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+    variables:
+      pulse-api-id:
+        default: "your-pulse-api-gateway-id"
+        description: PULSE API Gateway REST API ID (from CloudFormation output)
 
 security:
   - CognitoAuth: []
 
 tags:
-  - name: Alerts
+  - name: LUMI - Briefs
+    description: Daily GM intelligence briefs, history, KPIs, action items, VIP arrivals, and audio summaries
+    externalDocs:
+      description: LUMI feature documentation
+      url: lumi/README.md
+  - name: LUMI - Settings
+    description: General Manager delivery settings and preferences
+    externalDocs:
+      description: LUMI feature documentation
+      url: lumi/README.md
+  - name: PULSE - Alerts
     description: Alert feed, detail, lifecycle transitions, and the Article 14 approval gate
-  - name: History
-    description: Shift-handover log
-  - name: Rules
-    description: Admin rule-definition read/update
-  - name: Delivery
-    description: Web Push subscriptions and client delivery configuration
-  - name: Ops
-    description: VIPs and Ops read facade (live data via the shared AgentCore Gateway)
-  - name: Demo
-    description: Demo Scenario Simulator (demo-only, gated by EnableDemoSimulator)
+    externalDocs:
+      description: PULSE feature documentation
+      url: pulse/README.md
+  - name: PULSE - History
+    description: Shift-handover alert history
+    externalDocs:
+      description: PULSE feature documentation
+      url: pulse/README.md
+  - name: PULSE - Rules
+    description: Administrative alert rule definitions
+    externalDocs:
+      description: PULSE feature documentation
+      url: pulse/README.md
+  - name: PULSE - Delivery
+    description: Web Push subscriptions and realtime client configuration
+    externalDocs:
+      description: PULSE feature documentation
+      url: pulse/README.md
+  - name: PULSE - Operations
+    description: VIP, operations, and kitchen read facades
+    externalDocs:
+      description: PULSE feature documentation
+      url: pulse/README.md
+  - name: PULSE - Demo
+    description: Demo Scenario Simulator operations
+    externalDocs:
+      description: PULSE feature documentation
+      url: pulse/README.md
 
 paths:
+  /briefs/{propertyId}:
+    servers:
+      - url: https://{lumi-api-id}.execute-api.us-east-1.amazonaws.com/v1
+        description: LUMI API (us-east-1, protected by WAF and Cognito JWT)
+        variables:
+          lumi-api-id:
+            default: "your-lumi-api-gateway-id"
+            description: LUMI API Gateway REST API ID (from CloudFormation output)
+    get:
+      operationId: getBrief
+      summary: Get the latest daily brief for a property
+      description: |
+        Returns the most recent daily brief for the specified property,
+        including KPIs, action items, VIP arrivals, and audio brief metadata.
+        The requesting GM must own the property (validated via Cognito claims).
+      tags:
+        - LUMI - Briefs
+      parameters:
+        - name: propertyId
+          in: path
+          required: true
+          description: Property identifier (e.g., ALOHA-CHI-001)
+          schema:
+            type: string
+            example: ALOHA-CHI-001
+      responses:
+        "200":
+          description: Daily brief retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DailyBriefResponse"
+        "401":
+          description: Unauthorized - invalid or expired token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LumiErrorResponse"
+              example:
+                error:
+                  code: UNAUTHORIZED
+                  message: Invalid or expired token
+        "403":
+          description: Forbidden - user does not own this property
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LumiErrorResponse"
+              example:
+                error:
+                  code: FORBIDDEN
+                  message: You do not have access to this property's brief
+        "404":
+          description: No brief found for property
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LumiErrorResponse"
+              example:
+                error:
+                  code: PROPERTY_NOT_FOUND
+                  message: No brief found for property ALOHA-CHI-001
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LumiErrorResponse"
+              example:
+                error:
+                  code: INTERNAL_ERROR
+                  message: An internal error occurred
+
+  /briefs/{propertyId}/{briefDate}:
+    servers:
+      - url: https://{lumi-api-id}.execute-api.us-east-1.amazonaws.com/v1
+        description: LUMI API (us-east-1, protected by WAF and Cognito JWT)
+        variables:
+          lumi-api-id:
+            default: "your-lumi-api-gateway-id"
+            description: LUMI API Gateway REST API ID (from CloudFormation output)
+    get:
+      operationId: getBriefByDate
+      summary: Get a specific dated brief for a property
+      description: |
+        Returns the brief for a specific property and date. Used by the
+        frontend to display full past brief detail views from the history carousel.
+      tags:
+        - LUMI - Briefs
+      parameters:
+        - name: propertyId
+          in: path
+          required: true
+          description: Property identifier
+          schema:
+            type: string
+            example: ALOHA-CHI-001
+        - name: briefDate
+          in: path
+          required: true
+          description: Brief date in YYYY-MM-DD format
+          schema:
+            type: string
+            format: date
+            example: "2026-08-06"
+      responses:
+        "200":
+          description: Dated brief retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DailyBriefResponse"
+        "400":
+          description: Invalid date format
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LumiErrorResponse"
+        "404":
+          description: No brief found for property/date
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LumiErrorResponse"
+
+  /briefs/history:
+    servers:
+      - url: https://{lumi-api-id}.execute-api.us-east-1.amazonaws.com/v1
+        description: LUMI API (us-east-1, protected by WAF and Cognito JWT)
+        variables:
+          lumi-api-id:
+            default: "your-lumi-api-gateway-id"
+            description: LUMI API Gateway REST API ID (from CloudFormation output)
+    get:
+      operationId: getBriefHistory
+      summary: Get brief history summaries for a property
+      description: |
+        Returns a list of past brief summaries (date, status, key KPIs,
+        narrative preview) for the past-briefs carousel on the main dashboard.
+        Property is determined from the Cognito JWT claims (custom:propertyId).
+      tags:
+        - LUMI - Briefs
+      parameters:
+        - name: days
+          in: query
+          required: false
+          description: Number of days of history to return
+          schema:
+            type: integer
+            default: 7
+            maximum: 30
+      responses:
+        "200":
+          description: Brief history retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BriefHistorySummary"
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LumiErrorResponse"
+
+  /settings/{gmAlias}:
+    servers:
+      - url: https://{lumi-api-id}.execute-api.us-east-1.amazonaws.com/v1
+        description: LUMI API (us-east-1, protected by WAF and Cognito JWT)
+        variables:
+          lumi-api-id:
+            default: "your-lumi-api-gateway-id"
+            description: LUMI API Gateway REST API ID (from CloudFormation output)
+    get:
+      operationId: getSettings
+      summary: Get GM settings
+      description: |
+        Returns the current configuration for the specified GM.
+        The requesting user must own the settings (gmAlias must match claims).
+      tags:
+        - LUMI - Settings
+      parameters:
+        - name: gmAlias
+          in: path
+          required: true
+          description: GM alias identifier (e.g., jsmith)
+          schema:
+            type: string
+            example: jsmith
+      responses:
+        "200":
+          description: GM settings retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GmSettings"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LumiErrorResponse"
+        "403":
+          description: Forbidden - cannot access another GM's settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LumiErrorResponse"
+        "404":
+          description: GM settings not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LumiErrorResponse"
+              example:
+                error:
+                  code: SETTINGS_NOT_FOUND
+                  message: No settings found for GM jsmith
+
+    put:
+      operationId: putSettings
+      summary: Update GM settings
+      description: |
+        Updates the GM's configuration. Partial updates are supported -
+        only provided fields are updated. All fields are validated before persist.
+      tags:
+        - LUMI - Settings
+      parameters:
+        - name: gmAlias
+          in: path
+          required: true
+          description: GM alias identifier
+          schema:
+            type: string
+            example: jsmith
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GmSettingsUpdate"
+            example:
+              briefDeliveryTime: "06:30"
+              alertToggles:
+                overbookingRisk: true
+                roomsOutOfOrder: true
+                vipArrivalAlert: true
+                upsellOpportunity: true
+                staffingConfirmed: true
+              kpiThresholds:
+                occupancyAlertBelow: 70
+                adrAlertBelow: 200
+              audioPreferences:
+                language: en-US
+                briefLength: standard
+      responses:
+        "200":
+          description: Settings updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GmSettings"
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LumiErrorResponse"
+              example:
+                error:
+                  code: VALIDATION_ERROR
+                  message: "briefDeliveryTime must be in HH:MM format (00:00-23:59)"
+                  field: briefDeliveryTime
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LumiErrorResponse"
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LumiErrorResponse"
+        "404":
+          description: GM settings not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LumiErrorResponse"
+
   /alerts:
+    servers:
+      - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
+        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        variables:
+          pulse-api-id:
+            default: "your-pulse-api-gateway-id"
+            description: PULSE API Gateway REST API ID (from CloudFormation output)
     get:
       operationId: listAlerts
       summary: List alerts (feed + optional tier/status filters)
@@ -64,7 +396,7 @@ paths:
         caller must be associated with it, otherwise an empty result is returned
         without leaking existence.
       tags:
-        - Alerts
+        - PULSE - Alerts
       parameters:
         - name: propertyId
           in: query
@@ -98,6 +430,13 @@ paths:
           $ref: "#/components/responses/InternalError"
 
   /alerts/{alertId}:
+    servers:
+      - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
+        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        variables:
+          pulse-api-id:
+            default: "your-pulse-api-gateway-id"
+            description: PULSE API Gateway REST API ID (from CloudFormation output)
     get:
       operationId: getAlert
       summary: Get a single alert (detail including triage brief)
@@ -106,7 +445,7 @@ paths:
         when present. Returns 404 when the alert does not exist or belongs to a
         property the caller is not associated with (existence is not leaked).
       tags:
-        - Alerts
+        - PULSE - Alerts
       parameters:
         - $ref: "#/components/parameters/AlertId"
       responses:
@@ -131,6 +470,13 @@ paths:
           $ref: "#/components/responses/InternalError"
 
   /alerts/{alertId}/acknowledgements:
+    servers:
+      - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
+        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        variables:
+          pulse-api-id:
+            default: "your-pulse-api-gateway-id"
+            description: PULSE API Gateway REST API ID (from CloudFormation output)
     post:
       operationId: acknowledgeAlert
       summary: Acknowledge an alert
@@ -139,7 +485,7 @@ paths:
         recording the acknowledging user and a UTC timestamp, and halting any
         in-flight escalation. A resolved alert cannot be acknowledged.
       tags:
-        - Alerts
+        - PULSE - Alerts
       parameters:
         - $ref: "#/components/parameters/AlertId"
       responses:
@@ -177,6 +523,13 @@ paths:
           $ref: "#/components/responses/InternalError"
 
   /alerts/{alertId}/resolutions:
+    servers:
+      - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
+        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        variables:
+          pulse-api-id:
+            default: "your-pulse-api-gateway-id"
+            description: PULSE API Gateway REST API ID (from CloudFormation output)
     post:
       operationId: resolveAlert
       summary: Resolve an alert
@@ -186,7 +539,7 @@ paths:
         terminal; resolving an already-resolved alert is rejected with state
         unchanged.
       tags:
-        - Alerts
+        - PULSE - Alerts
       parameters:
         - $ref: "#/components/parameters/AlertId"
       responses:
@@ -224,6 +577,13 @@ paths:
           $ref: "#/components/responses/InternalError"
 
   /alerts/{alertId}/approvals:
+    servers:
+      - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
+        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        variables:
+          pulse-api-id:
+            default: "your-pulse-api-gateway-id"
+            description: PULSE API Gateway REST API ID (from CloudFormation output)
     post:
       operationId: decideApproval
       summary: Approve or reject a triage ranked option (Article 14 gate)
@@ -235,7 +595,7 @@ paths:
         the rejection and never executes. An approval must name a `selectedOption`
         that exists on the alert's triage brief when the brief carries options.
       tags:
-        - Alerts
+        - PULSE - Alerts
       parameters:
         - $ref: "#/components/parameters/AlertId"
       requestBody:
@@ -287,6 +647,13 @@ paths:
           $ref: "#/components/responses/InternalError"
 
   /shift-handover:
+    servers:
+      - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
+        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        variables:
+          pulse-api-id:
+            default: "your-pulse-api-gateway-id"
+            description: PULSE API Gateway REST API ID (from CloudFormation output)
     get:
       operationId: getShiftHandover
       summary: Get the shift-handover log for a property window
@@ -296,7 +663,7 @@ paths:
         `from`, and `to` are all required. A window for a property the caller is
         not associated with returns an empty result rather than leaking existence.
       tags:
-        - History
+        - PULSE - History
       parameters:
         - name: propertyId
           in: query
@@ -343,6 +710,13 @@ paths:
           $ref: "#/components/responses/InternalError"
 
   /rules:
+    servers:
+      - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
+        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        variables:
+          pulse-api-id:
+            default: "your-pulse-api-gateway-id"
+            description: PULSE API Gateway REST API ID (from CloudFormation output)
     get:
       operationId: listRules
       summary: List rule definitions for a property
@@ -351,7 +725,7 @@ paths:
         empty list when `propertyId` is missing or the caller is not associated
         with it.
       tags:
-        - Rules
+        - PULSE - Rules
       parameters:
         - name: propertyId
           in: query
@@ -373,6 +747,13 @@ paths:
           $ref: "#/components/responses/InternalError"
 
   /rules/{ruleId}:
+    servers:
+      - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
+        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        variables:
+          pulse-api-id:
+            default: "your-pulse-api-gateway-id"
+            description: PULSE API Gateway REST API ID (from CloudFormation output)
     put:
       operationId: updateRule
       summary: Update a rule definition (admin)
@@ -384,7 +765,7 @@ paths:
         attribute is reported. The update is denied when the caller is not
         associated with the target property.
       tags:
-        - Rules
+        - PULSE - Rules
       parameters:
         - name: ruleId
           in: path
@@ -442,6 +823,13 @@ paths:
           $ref: "#/components/responses/InternalError"
 
   /push-subscriptions:
+    servers:
+      - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
+        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        variables:
+          pulse-api-id:
+            default: "your-pulse-api-gateway-id"
+            description: PULSE API Gateway REST API ID (from CloudFormation output)
     post:
       operationId: registerPushSubscription
       summary: Register a Web Push (VAPID) subscription
@@ -450,7 +838,7 @@ paths:
         wake a closed or backgrounded PWA for CRITICAL/WARNING alerts. The
         subscription is always stored under the authenticated caller's identity.
       tags:
-        - Delivery
+        - PULSE - Delivery
       requestBody:
         required: true
         content:
@@ -487,6 +875,13 @@ paths:
           $ref: "#/components/responses/InternalError"
 
   /config/vapid-public-key:
+    servers:
+      - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
+        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        variables:
+          pulse-api-id:
+            default: "your-pulse-api-gateway-id"
+            description: PULSE API Gateway REST API ID (from CloudFormation output)
     get:
       operationId: getVapidPublicKey
       summary: Get the VAPID public key for Web Push subscription
@@ -494,7 +889,7 @@ paths:
         Returns the VAPID public key the PWA service worker uses to create its
         Web Push subscription.
       tags:
-        - Delivery
+        - PULSE - Delivery
       responses:
         "200":
           description: VAPID public key retrieved successfully
@@ -510,6 +905,13 @@ paths:
           $ref: "#/components/responses/InternalError"
 
   /config/realtime:
+    servers:
+      - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
+        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        variables:
+          pulse-api-id:
+            default: "your-pulse-api-gateway-id"
+            description: PULSE API Gateway REST API ID (from CloudFormation output)
     get:
       operationId: getRealtimeConfig
       summary: Get the AppSync Events realtime endpoint configuration
@@ -519,7 +921,7 @@ paths:
         The realtime feed itself is delivered over that WebSocket channel, not
         over this REST API.
       tags:
-        - Delivery
+        - PULSE - Delivery
       responses:
         "200":
           description: Realtime configuration retrieved successfully
@@ -537,6 +939,13 @@ paths:
           $ref: "#/components/responses/InternalError"
 
   /vips:
+    servers:
+      - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
+        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        variables:
+          pulse-api-id:
+            default: "your-pulse-api-gateway-id"
+            description: PULSE API Gateway REST API ID (from CloudFormation output)
     get:
       operationId: getVips
       summary: Get VIP arrivals grouped by loyalty tier
@@ -546,7 +955,7 @@ paths:
         AgentCore Gateway (`get_vip_guests`), scoped server-side to the property.
         Sensitive guest notes are never returned.
       tags:
-        - Ops
+        - PULSE - Operations
       parameters:
         - $ref: "#/components/parameters/RequiredPropertyId"
       responses:
@@ -568,6 +977,13 @@ paths:
           $ref: "#/components/responses/OpsDataUnavailable"
 
   /ops:
+    servers:
+      - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
+        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        variables:
+          pulse-api-id:
+            default: "your-pulse-api-gateway-id"
+            description: PULSE API Gateway REST API ID (from CloudFormation output)
     get:
       operationId: getOps
       summary: Get the operations snapshot (facility, OOO rooms, group checkout)
@@ -578,7 +994,7 @@ paths:
         (`get_occupancy`, `get_room_status`, `get_work_orders`), scoped
         server-side to the property.
       tags:
-        - Ops
+        - PULSE - Operations
       parameters:
         - $ref: "#/components/parameters/RequiredPropertyId"
       responses:
@@ -600,6 +1016,13 @@ paths:
           $ref: "#/components/responses/OpsDataUnavailable"
 
   /kitchen:
+    servers:
+      - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
+        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        variables:
+          pulse-api-id:
+            default: "your-pulse-api-gateway-id"
+            description: PULSE API Gateway REST API ID (from CloudFormation output)
     get:
       operationId: getKitchen
       summary: Get the property's Kitchen and F&B snapshot
@@ -609,7 +1032,8 @@ paths:
         derived from the active kitchenOrders array, including for snapshots
         stored before this normalization was introduced. The read does not
         write or reseed the stored snapshot.
-      tags: [Ops]
+      tags:
+        - PULSE - Operations
       parameters:
         - $ref: "#/components/parameters/RequiredPropertyId"
       responses:
@@ -635,6 +1059,13 @@ paths:
           $ref: "#/components/responses/InternalError"
 
   /demo/scenarios/{scenarioId}:
+    servers:
+      - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
+        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        variables:
+          pulse-api-id:
+            default: "your-pulse-api-gateway-id"
+            description: PULSE API Gateway REST API ID (from CloudFormation output)
     post:
       operationId: runDemoScenario
       summary: Run a demo scenario (demo-only)
@@ -645,7 +1076,7 @@ paths:
         (default); a real deployment sets it false and this route returns 404 as
         if absent.
       tags:
-        - Demo
+        - PULSE - Demo
       parameters:
         - $ref: "#/components/parameters/ScenarioId"
       responses:
@@ -687,6 +1118,13 @@ paths:
           $ref: "#/components/responses/InternalError"
 
   /demo/scenarios/{scenarioId}/reset:
+    servers:
+      - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
+        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        variables:
+          pulse-api-id:
+            default: "your-pulse-api-gateway-id"
+            description: PULSE API Gateway REST API ID (from CloudFormation output)
     post:
       operationId: resetDemoScenario
       summary: Reset a demo scenario (demo-only)
@@ -696,7 +1134,7 @@ paths:
         (the reset counterpart to running the scenario). Exposed only when
         `EnableDemoSimulator` is truthy; otherwise returns 404 as if absent.
       tags:
-        - Demo
+        - PULSE - Demo
       parameters:
         - $ref: "#/components/parameters/ScenarioId"
       responses:
@@ -820,6 +1258,504 @@ components:
               reason: gateway-timeout
 
   schemas:
+    # -----------------------------------------------------------------------
+    # LUMI daily brief and settings shapes
+    # -----------------------------------------------------------------------
+    LumiErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code
+              example: VALIDATION_ERROR
+            message:
+              type: string
+              description: Human-readable error description
+              example: "briefDeliveryTime must be in HH:MM format"
+            field:
+              type: string
+              description: Field name for validation errors (optional)
+              example: briefDeliveryTime
+
+    DailyBriefResponse:
+      type: object
+      required:
+        - property
+        - dailyKPIs
+        - actionItems
+        - vipArrivals
+        - audioBrief
+      properties:
+        property:
+          $ref: "#/components/schemas/Property"
+        dailyKPIs:
+          $ref: "#/components/schemas/DailyKPIs"
+        actionItems:
+          type: array
+          items:
+            $ref: "#/components/schemas/ActionItem"
+        vipArrivals:
+          type: array
+          items:
+            $ref: "#/components/schemas/VipArrival"
+        audioBrief:
+          $ref: "#/components/schemas/AudioBrief"
+
+    Property:
+      type: object
+      properties:
+        propertyId:
+          type: string
+          example: ALOHA-CHI-001
+        propertyName:
+          type: string
+          example: Aloha Grand Chicago
+        brand:
+          type: string
+          example: "Aloha Hotels & Resorts"
+        timezone:
+          type: string
+          example: America/Chicago
+        totalRooms:
+          type: integer
+          example: 368
+
+    DailyKPIs:
+      type: object
+      required:
+        - date
+        - asOf
+        - occupancy
+        - adr
+        - revPAR
+        - arrivals
+        - departures
+      properties:
+        date:
+          type: string
+          format: date
+          example: "2026-08-03"
+        asOf:
+          type: string
+          format: date-time
+          example: "2026-08-03T09:07:00-05:00"
+        occupancy:
+          $ref: "#/components/schemas/Occupancy"
+        adr:
+          $ref: "#/components/schemas/Adr"
+        revPAR:
+          $ref: "#/components/schemas/RevPar"
+        arrivals:
+          $ref: "#/components/schemas/Arrivals"
+        departures:
+          $ref: "#/components/schemas/Departures"
+        confirmedReservations:
+          type: integer
+          example: 374
+        availableRooms:
+          type: integer
+          description: Legacy field for total room inventory capacity; not vacant or remaining sellable rooms.
+          example: 368
+
+    Occupancy:
+      type: object
+      properties:
+        current:
+          type: number
+          description: Current occupancy percentage
+          example: 87
+        unit:
+          type: string
+          enum: [percent]
+          example: percent
+        vsLastWeek:
+          type: number
+          format: float
+          description: Delta vs same day last week
+          example: 4.2
+        vsBudget:
+          type: number
+          format: float
+          description: Delta vs budget
+          example: 2.1
+        forecast3pm:
+          type: number
+          description: Prototype baseline using current occupancy; no separate intraday forecast exists in the dataset.
+          example: 91
+
+    Adr:
+      type: object
+      properties:
+        current:
+          type: number
+          description: Current ADR in currency units
+          example: 248
+        currency:
+          type: string
+          example: USD
+        vsLastWeek:
+          type: number
+          format: float
+          example: 12
+        vsBudget:
+          type: number
+          format: float
+          example: 8
+        pacePctOfBudget:
+          type: integer
+          description: Pace as percentage of budget
+          example: 103
+
+    RevPar:
+      type: object
+      properties:
+        current:
+          type: number
+          description: Current RevPAR in currency units
+          example: 216
+        currency:
+          type: string
+          example: USD
+        vsYOY:
+          type: number
+          format: float
+          description: Year-over-year percentage change
+          example: 7.1
+        budget:
+          type: number
+          description: Estimated budget at constant ADR, derived from the occupancy budget delta.
+          example: 202
+
+    Arrivals:
+      type: object
+      properties:
+        total:
+          type: integer
+          example: 142
+        vipCount:
+          type: integer
+          example: 7
+        ambassadorCount:
+          type: integer
+          example: 3
+        titaniumCount:
+          type: integer
+          example: 4
+        platinumCount:
+          type: integer
+          example: 0
+
+    Departures:
+      type: object
+      properties:
+        total:
+          type: integer
+          example: 118
+        groupCheckouts:
+          type: integer
+          example: 1
+        groupRooms:
+          type: integer
+          example: 82
+
+    ActionItem:
+      type: object
+      required:
+        - id
+        - type
+        - severity
+        - title
+        - detail
+      properties:
+        id:
+          type: string
+          example: action-001
+        type:
+          type: string
+          enum:
+            - OVERBOOKING_RISK
+            - ROOMS_OUT_OF_ORDER
+            - VIP_ARRIVAL_ALERT
+            - UPSELL_OPPORTUNITY
+            - STAFFING_CONFIRMED
+          example: OVERBOOKING_RISK
+        severity:
+          type: string
+          enum: [URGENT, HIGH, MEDIUM, LOW]
+          example: URGENT
+        title:
+          type: string
+          example: "Overbooking Risk - +6 Rooms"
+        detail:
+          type: string
+          example: "374 confirmed vs 368 available. Walk strategy required by 7 AM."
+        data:
+          type: object
+          description: Type-specific payload (varies by action type)
+          additionalProperties: true
+        source:
+          type: string
+          description: Data source that generated this action
+          example: SPOG_XPMS
+        generatedAt:
+          type: string
+          format: date-time
+          example: "2026-08-03T06:00:00-05:00"
+
+    VipArrival:
+      type: object
+      required:
+        - guestId
+        - guestName
+        - loyaltyTier
+        - roomNumber
+      properties:
+        guestId:
+          type: string
+          example: ALH-MBR-00238471
+        guestName:
+          type: string
+          example: David Chen
+        initials:
+          type: string
+          example: DC
+        loyaltyTier:
+          type: string
+          enum: [AMBASSADOR, TITANIUM, PLATINUM]
+          example: AMBASSADOR
+        totalStays:
+          type: integer
+          example: 47
+        roomNumber:
+          type: string
+          example: "2401"
+        roomType:
+          type: string
+          enum: [PENTHOUSE, SUITE, KING_DELUXE, QUEEN_DELUXE, KING_STANDARD]
+          example: SUITE
+        estimatedArrival:
+          type: string
+          format: date-time
+          example: "2026-08-03T14:00:00-05:00"
+        specialOccasion:
+          type: string
+          nullable: true
+          enum: [ANNIVERSARY, BIRTHDAY, null]
+          example: ANNIVERSARY
+        preferences:
+          type: array
+          items:
+            type: string
+          example: ["HIGH_FLOOR", "FEATHER_FREE_BEDDING", "CHAMPAGNE_ARRIVAL"]
+        accountType:
+          type: string
+          enum: [PERSONAL, CORPORATE]
+          example: PERSONAL
+
+    AudioBrief:
+      type: object
+      required:
+        - briefId
+        - status
+      properties:
+        briefId:
+          type: string
+          example: brief-2026-08-03-ALOHA-CHI-001
+        durationSeconds:
+          type: integer
+          description: Audio duration in seconds
+          example: 74
+        status:
+          type: string
+          enum: [READY, GENERATING, FAILED, TEXT_ONLY]
+          example: READY
+        audioUrl:
+          type: string
+          format: uri
+          description: CloudFront URL for streaming the audio brief
+          example: "https://audio.lumi.example.com/briefs/2026/08/03/ALOHA-CHI-001/morning-brief.mp3"
+        transcriptSnippet:
+          type: string
+          description: First few sentences of the AI-generated narrative
+          example: "Good morning, Jennifer..."
+
+    GmSettings:
+      type: object
+      required:
+        - gmAlias
+        - propertyId
+        - briefDeliveryTime
+        - alertToggles
+        - kpiThresholds
+        - audioPreferences
+      properties:
+        gmAlias:
+          type: string
+          example: jsmith
+        propertyId:
+          type: string
+          example: ALOHA-CHI-001
+        briefDeliveryTime:
+          type: string
+          pattern: "^([01]\\d|2[0-3]):[0-5]\\d$"
+          description: "Brief delivery time in HH:MM format (24-hour)"
+          example: "06:30"
+        alertToggles:
+          $ref: "#/components/schemas/AlertToggles"
+        kpiThresholds:
+          $ref: "#/components/schemas/KpiThresholds"
+        audioPreferences:
+          $ref: "#/components/schemas/AudioPreferences"
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    GmSettingsUpdate:
+      type: object
+      description: Partial update - only include fields to change
+      properties:
+        briefDeliveryTime:
+          type: string
+          pattern: "^([01]\\d|2[0-3]):[0-5]\\d$"
+          description: "Brief delivery time in HH:MM format (24-hour)"
+          example: "06:30"
+        alertToggles:
+          $ref: "#/components/schemas/AlertToggles"
+        kpiThresholds:
+          $ref: "#/components/schemas/KpiThresholds"
+        audioPreferences:
+          $ref: "#/components/schemas/AudioPreferences"
+
+    AlertToggles:
+      type: object
+      properties:
+        overbookingRisk:
+          type: boolean
+          example: true
+        roomsOutOfOrder:
+          type: boolean
+          example: true
+        vipArrivalAlert:
+          type: boolean
+          example: true
+        upsellOpportunity:
+          type: boolean
+          example: true
+        staffingConfirmed:
+          type: boolean
+          example: true
+
+    KpiThresholds:
+      type: object
+      properties:
+        occupancyAlertBelow:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Alert when occupancy drops below this percentage
+          example: 70
+        adrAlertBelow:
+          type: integer
+          minimum: 0
+          maximum: 1000
+          description: Alert when ADR drops below this value
+          example: 200
+
+    AudioPreferences:
+      type: object
+      properties:
+        language:
+          type: string
+          enum: [en-US, es-ES, ja-JP, zh-CN]
+          description: Audio brief language
+          example: en-US
+        briefLength:
+          type: string
+          enum: [brief, standard, detailed]
+          description: Preferred brief length
+          example: standard
+
+    BriefHistorySummary:
+      type: object
+      required:
+        - briefDate
+        - status
+        - dailyKPIs
+      properties:
+        briefDate:
+          type: string
+          format: date
+          example: "2026-08-06"
+        status:
+          type: string
+          enum: [DELIVERED, GENERATED, FAILED]
+          example: DELIVERED
+        dailyKPIs:
+          type: object
+          properties:
+            occupancy:
+              type: object
+              properties:
+                current:
+                  type: integer
+                  example: 85
+            adr:
+              type: object
+              properties:
+                current:
+                  type: integer
+                  example: 248
+            revPAR:
+              type: object
+              properties:
+                current:
+                  type: integer
+                  example: 211
+        narrativePreview:
+          type: string
+          description: First sentence of the AI-generated narrative
+          example: "Buenos dias, Jennifer. Hoy es viernes, 7..."
+
+    OooRoomDetail:
+      type: object
+      description: Out-of-order room detail within ROOMS_OUT_OF_ORDER action item data
+      properties:
+        roomNumber:
+          type: string
+          example: "2102"
+        issue:
+          type: string
+          description: Issue type from the linked work order
+          example: IT_NETWORK
+        isPremium:
+          type: boolean
+          example: true
+        view:
+          type: string
+          enum: [LAKE, PARK, CITY, OCEAN, NONE]
+          example: LAKE
+        workOrderId:
+          type: string
+          example: WO-CHI-0146
+        openHours:
+          type: integer
+          description: Hours since work order creation (or estimated resolution hours if timestamp is unavailable)
+          example: 14
+
+    # -----------------------------------------------------------------------
+    # PULSE alerting and operations shapes
+    # -----------------------------------------------------------------------
     # -----------------------------------------------------------------------
     # Enumerations (values match pulse.common.models exactly)
     # -----------------------------------------------------------------------

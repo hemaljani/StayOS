@@ -72,7 +72,7 @@ NEXT_PUBLIC_COGNITO_REGION=us-east-1
 
 ## Commands
 
-**Prerequisites:** Node.js 18.18+ and npm (required by Next.js 15 / React 19).
+**Prerequisites:** Node.js 22.13 or later with npm (required by the committed dependency lockfile).
 
 ```bash
 cd frontend
