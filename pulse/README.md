@@ -94,32 +94,6 @@ npm install && npm run lint && npm run build && npm run test:run
 cfn-lint root-stack.yaml nested-stacks/*.yaml
 ```
 
-## Deploy & teardown
-
-**Whole platform:** use the repo root — `make deploy-all` / `make destroy-all CONFIRM=DESTROY`.
-See the [root README](../README.md#deployment) and
-[`docs/deployment-pipeline.md`](../docs/deployment-pipeline.md) for the full flow.
-PULSE can't deploy standalone from a clean account — it needs values `deploy-all`
-captures from LUMI (Cognito pool, the 5 stream ARNs, Gateway endpoint, Tool Lambda ARN).
-
-**PULSE-only redeploys** (LUMI must already exist):
-
-```bash
-make pulse-deploy PROFILE=... REGION=...            # redeploy the PULSE stack
-make pulse-triage-deploy PROFILE=... REGION=...      # rebuild + deploy the Triage Agent
-make pulse-forecast-deploy PROFILE=... REGION=...    # rebuild + deploy the Forecasting Agent
-make pulse-gateway-deploy PROFILE=... REGION=...     # (re)register PULSE Gateway tools
-make pulse-deploy-frontend PROFILE=... REGION=...    # rebuild + publish the PWA to /pulse
-make pulse-destroy PROFILE=... REGION=...            # PULSE-only teardown
-```
-
-The Triage and Forecasting agents deploy **out-of-band** (Finch/CodeBuild → shared
-ECR, ARM64), each writing its runtime ARN to SSM (`/pulse/{triage,forecast}/runtime-arn`)
-which the stack threads back in. The root pipeline uses `deploy-initial` for the
-one-time infrastructure/package/Lambda/seed pass and `deploy-runtime-wiring`
-for the final CloudFormation-only ARN update. Set `EnableDemoSimulator=false`
-for a non-demo deploy.
-
 ## Links
 
 - Unified StayOS REST API contract for LUMI and PULSE: [`../openapi.yaml`](../openapi.yaml)

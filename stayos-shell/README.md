@@ -84,23 +84,6 @@ npm run test:run     # vitest (component + property tests)
 npm run build        # static export to out/
 ```
 
-## Deploy
-
-The shell is static assets published to the **root** of the shared StayOS S3
-bucket / CloudFront distribution, so `/` serves the shell while `/lumi/*` and
-`/pulse/*` serve the features. Deploy after LUMI's stack exists (the shell reads
-LUMI's shared Cognito for its build-time config):
-
-```bash
-# From the repo root (delegates to this feature's Makefile):
-make shell-deploy [PROFILE=... REGION=...]
-```
-
-`shell-deploy` generates the shell's Cognito config from the LUMI stack outputs,
-builds the static export, syncs it to the bucket root (excluding `/lumi/*` and
-`/pulse/*`), and invalidates the shell's root cache entries. See the
-[root README](../README.md#deployment) for the full-platform deploy order.
-
 ## Contributing
 
 Contributions are welcome. See the [contributing guide](../CONTRIBUTING.md) for

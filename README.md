@@ -69,10 +69,6 @@ StayOS/
 
 ## Deployment
 
-This root README is the single source of truth for **deploying the whole
-platform**. Each feature's own README covers only its feature-specific targets
-and internals.
-
 **Prerequisites** (one-time): Git, GNU Make, `zip`, AWS CLI v2.27 or later,
 Python 3.12 or later with `pip`, Node.js with npm, and AWS credentials configured
 for the target account. Node.js must be 22.22.2 or later within 22.x, 24.15.0 or
@@ -132,17 +128,19 @@ always receive stable line-oriented output. Use
 `make deployment-summary-detailed` after deployment for runtime ARNs, artifact
 locations, API endpoints, and application URLs.
 
-LUMI's shared Python dependency layer is built remotely on AWS CodeBuild using
+LUMI's shared Python dependency layer is built remotely by a CodeBuild project
+and Lambda-backed custom resource in the existing ComputeStack, using
 Lambda-compatible Python 3.12, Amazon Linux, and `x86_64`. Developers therefore
 produce the same target-compatible layer from macOS, Linux, or Windows without
-installing Docker. The build-input-fingerprinted layer artifact is reused until
-its requirements or build definition changes.
+local container tooling or another CloudFormation stack. The
+build-input-fingerprinted layer artifact is reused until its requirements or
+build definition changes.
 
 ## Deployment Pipeline
 
-`make deploy-all` runs one ordered pipeline — each stage feeds the next, so
-**PULSE is never deployed standalone**: it consumes outputs captured from the
-LUMI deploy. In order, it deploys **LUMI → PULSE → Data Orchestrator**:
+`make deploy-all` runs one ordered pipeline — each stage feeds the next.
+**PULSE depends on LUMI's outputs**, which the root workflow captures and passes
+to its deployment. In order, it deploys **LUMI → PULSE → Data Orchestrator**:
 
 1. Deploy the **LUMI** stack (the shared foundation).
 2. Capture LUMI's outputs (Cognito pool, the five operational-table stream ARNs,
@@ -158,6 +156,23 @@ LUMI deploy. In order, it deploys **LUMI → PULSE → Data Orchestrator**:
 6. Verify all stacks, required outputs, and runtime parameters, then print the
    deployed stacks, artifacts, runtimes, and real application URLs.
 
+LUMI's voice and chat agents use ARM64 container images built on CodeBuild and
+pushed to ECR. The Makefile creates or updates their AgentCore runtimes through
+the AWS CLI. The chat runtime follows Gateway registration and receives
+`GATEWAY_ENDPOINT_URL` from SSM.
+
+PULSE's Triage and Forecasting agents use the shared build resources and ECR
+repository. Their runtime ARNs are stored in SSM at
+`/pulse/{triage,forecast}/runtime-arn` and wired into a final stack update.
+The initial PULSE pass uses `deploy-initial`; the final ARN update uses
+`deploy-runtime-wiring`. The `EnableDemoSimulator` CloudFormation parameter
+controls whether demo simulator resources are enabled.
+
+Frontend deployment generates production configuration from stack outputs and
+SSM runtime IDs. The shell build uses LUMI's shared Cognito configuration,
+publishes to the shared bucket root while excluding `lumi/*` and `pulse/*`,
+and invalidates the shell's root cache entries.
+
 Two behaviors worth calling out:
 
 - **The Data Orchestrator is additive** — it rolls data forward and lays down the
@@ -172,9 +187,41 @@ Two behaviors worth calling out:
 walks through the full eight-stage pipeline with a diagram, the Makefile structure,
 every parameter, and failure-recovery steps.
 
-> Run `make help` from the repo root for the full target list (per-feature
-> deploys, tests, and `make data-<target>` for the orchestrator). See each
-> feature's README for its own targets and internals.
+### Component redeployments
+
+Use `make deploy-all` for a complete platform update. The following targets
+support focused work on an existing installation. Use the same deployment
+profiles, region, account, and stack prefixes as the original installation.
+PULSE and the shell require LUMI's shared resources to exist.
+
+| Command from the repository root | Purpose |
+|---|---|
+| `make lumi-gateway-deploy` | Update the shared Gateway and Tool Lambda target, and attempt WAF association |
+| `make lumi-chat-build` | Build the chat image on CodeBuild and push it to ECR |
+| `make lumi-chat-deploy` | Build and create/update the chat AgentCore Runtime |
+| `make lumi-write-frontend-env` | Regenerate LUMI's `frontend/.env.production` from stack outputs and SSM |
+| `make pulse-deploy` | Update the PULSE stack with explicitly supplied LUMI inputs |
+| `make pulse-triage-deploy` | Build and create/update the Triage Agent runtime |
+| `make pulse-forecast-deploy` | Build and create/update the Forecasting Agent runtime |
+| `make pulse-gateway-deploy` | Register PULSE tools on the shared Gateway |
+| `make pulse-deploy-frontend` | Build and publish PULSE assets at `/pulse` |
+| `make shell-deploy` | Generate configuration, build, and publish the shell at `/` |
+
+To upgrade only an existing voice deployment, use:
+
+```bash
+make lumi-voice-upgrade PROFILE=... CLOUDFORMATION_PROFILE=... \
+  REGION=us-east-1 EXPECTED_ACCOUNT_ID=...
+```
+
+This preserves the existing password, other nested template references, and
+runtime configuration. It builds with the existing CodeBuild project and
+previews the voice IAM policy change before updating the parent stack and
+runtime. See the
+[focused upgrade and rollback procedure](docs/deployment-pipeline.md#focused-voice-upgrade).
+
+Run `make help` for the complete target list. Feature READMEs document their
+architecture, configuration, and local build/test commands.
 
 ## Teardown
 
@@ -191,9 +238,19 @@ make destroy-all CONFIRM=DESTROY
 make destroy-all CONFIRM=DESTROY PROFILE=my-other-account REGION=us-west-2
 ```
 
-Each phase empties its S3 buckets and purges its ECR images before deleting the
-stack (CloudFormation cannot delete a non-empty bucket/repo), and waits for the
-delete to complete before the next phase runs.
+The root workflow performs these phases in order:
+
+| Phase | Resources removed |
+|---|---|
+| Data Orchestrator | The shared roll-forward stack; waits for deletion to finish |
+| Shell | Root assets in the shared bucket, excluding `lumi/*` and `pulse/*` |
+| PULSE | Triage and Forecasting runtimes, `/pulse` assets, their shared ECR image tags, deploy-bucket contents, and the PULSE stack |
+| LUMI | Voice/chat runtimes, the shared Gateway, frontend/audio/deploy-bucket contents, voice/chat ECR images, and the shared foundation stack |
+
+LUMI owns the shared Cognito pool, Gateway, ECR repositories, frontend bucket,
+and CloudFront distribution, so it is removed last. Gateway teardown waits for
+every target to disappear before deleting and verifying the Gateway. Buckets
+and repositories are emptied before CloudFormation deletion.
 
 📖 **Further reading:** [`docs/deployment-pipeline.md`](docs/deployment-pipeline.md#teardown)
 covers the full reverse-order teardown — the per-phase breakdown, a diagram, the
@@ -228,7 +285,3 @@ volumes. It is not duplicated here to avoid drift.
 ## Contributing
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md).
-
-## License
-
-[MIT](LICENSE)

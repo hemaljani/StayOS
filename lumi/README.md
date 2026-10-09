@@ -15,8 +15,7 @@ ready to consume during a property walk-through, not chained to a workstation.
 2. [What GMs Get from LUMI](#what-gms-get-from-lumi)
 3. [Architecture Overview](#architecture-overview)
 4. [Pilot Properties](#pilot-properties)
-5. [Deployment](#deployment)
-   - [Voice Agent (AgentCore)](#voice-agent-agentcore)
+5. [Voice Agent (AgentCore)](#voice-agent-agentcore)
 6. [Chat Agent (AgentCore + Gateway)](#chat-agent-agentcore--gateway)
 7. [Data Sources](#data-sources)
 
@@ -78,72 +77,11 @@ WAF WebACL with its API Gateway stage.
 | Carlos Garcia | cgarcia | ALOHA-MAD-001 | Madrid, Spain | Europe/Madrid | es-ES |
 | Priya Desai | pdesai | ALOHA-BOM-001 | Mumbai | Asia/Kolkata | en-US |
 
-## Deployment
-
-> **Deployment is driven from the repo root.** Deploy the whole platform with a
-> single `make deploy-all` — existing deployments skip the password step;
-> new deployments require `APP_PASSWORD` in the environment. See the
-> [root README → Deployment](../README.md#deployment) for prerequisites,
-> parameters, and the full target list (`make help`).
->
-> The rest of this section is LUMI-specific **reference** for the components
-> `deploy-all` provisions: the voice agent, the chat agent + Gateway, their
-> environment variables, and the shared data sources.
-
-The shared Python dependency layer is built by a CodeBuild project and
-Lambda-backed custom resource owned by the existing ComputeStack. It uses
-Lambda-compatible Python 3.12 / Amazon Linux / `x86_64` compute. The
-build-input-fingerprinted artifact is target-compatible whether deployment
-starts from macOS, Linux, or Windows, and developers do not need local Docker
-or another CloudFormation stack for this build.
-
-### Teardown
-
-> **Teardown is driven from the repo root too.** `make destroy-all
-> CONFIRM=DESTROY` tears the whole platform down in reverse order — see the
-> [root README → Teardown](../README.md#teardown).
-
-LUMI is the shared foundation (it owns the Cognito pool, AgentCore Gateway,
-shared ECR repos, and the shared frontend bucket + CloudFront), so it is
-destroyed **last**. `make lumi-destroy` runs the voice/chat AgentCore runtime
-deletes and the Gateway teardown, empties the shared frontend + deploy buckets,
-purges the voice/chat ECR repos, then deletes the LUMI stack. Gateway teardown
-waits for every target to disappear before deleting and verifying the Gateway:
-
-```bash
-make lumi-destroy [PROFILE=... REGION=...]   # full LUMI teardown (run only after PULSE + shell are gone)
-```
-
-Or, from the repository root, tear down just the CLI-managed AgentCore pieces
-without deleting the stack:
-
-```bash
-make lumi-voice-destroy    # delete the voice AgentCore Runtime only
-make lumi-chat-destroy     # delete the chat AgentCore Runtime only
-make lumi-gateway-destroy  # tear down the shared AgentCore Gateway only
-```
-
-### Voice Agent (AgentCore)
+## Voice Agent (AgentCore)
 
 The LUMI voice agent runs on [Amazon Bedrock AgentCore Runtime](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/) - a managed service providing session-isolated microVMs, WebSocket endpoints, and scale-to-zero when idle.
 
-#### Voice Agent Deployment
-
-The voice agent is deployed automatically as part of the platform deploy
-(`make deploy-all`, see the [root README](../README.md#deployment)). The pipeline:
-1. Builds an ARM64 container image via CodeBuild (no local Docker/Finch required)
-2. Pushes the image to ECR
-3. Creates/updates the AgentCore Runtime via AWS CLI
-
-To upgrade only an existing voice deployment, use `make lumi-voice-upgrade`
-from the repository root with explicit `PROFILE`, `CLOUDFORMATION_PROFILE`,
-`REGION`, and `EXPECTED_ACCOUNT_ID`. This preserves the existing password,
-all other nested template references, and the runtime configuration. It builds
-with the existing CodeBuild project and previews the voice IAM policy change
-before updating the parent stack and existing runtime. See the
-[focused upgrade and rollback procedure](../docs/deployment-pipeline.md#focused-voice-upgrade).
-
-#### Voice Agent Environment Variables
+### Voice Agent Environment Variables
 
 The deployment targets in [`lumi/Makefile`](Makefile) set these environment
 variables on the AgentCore Runtime. The voice service's
@@ -162,12 +100,11 @@ runtime configuration; the Makefile drives deployment.
 | `COGNITO_USER_POOL_ID` | Cognito User Pool ID passed from stack outputs | `us-east-1_xxxxxxxxx` |
 | `AWS_DEFAULT_REGION` | AWS region for boto3 clients | `us-east-1` |
 
-#### Frontend Environment Variables
+### Frontend Environment Variables
 
 The voice frontend uses the variables below. For local development, set them
-in `frontend/.env.local`. Deployment runs `make lumi-write-frontend-env` from
-the repository root to generate `frontend/.env.production` from CloudFormation
-outputs and runtime IDs stored in SSM. This file is regenerated during deployment.
+in `frontend/.env.local`. Deployment generates `frontend/.env.production` from
+CloudFormation outputs and runtime IDs stored in SSM.
 
 | Variable | Description | Source |
 |----------|-------------|--------|
@@ -175,7 +112,7 @@ outputs and runtime IDs stored in SSM. This file is regenerated during deploymen
 | `NEXT_PUBLIC_COGNITO_IDENTITY_POOL_ID` | Identity Pool ID for credential exchange | CloudFormation output: `VoiceIdentityPoolId` |
 | `NEXT_PUBLIC_AWS_REGION` | AWS region | Deployment `REGION` (defaults to `us-east-1`) |
 
-#### Authentication Flow
+### Authentication Flow
 
 The voice agent uses SigV4 authentication via Cognito Identity Pool (replacing the previous JWT-in-URL pattern):
 
@@ -210,27 +147,7 @@ chat agent streams its response back to the browser.
 
 ![Chat agent architecture](docs/chat-agent-architecture.png)
 
-#### Chat Agent Deployment
-
-The chat agent is deployed automatically as part of the platform deploy
-(`make deploy-all`), after the Gateway is registered so the Gateway endpoint URL
-is available. The pipeline mirrors the voice agent:
-1. Builds an ARM64 container image via CodeBuild
-2. Pushes the image to ECR
-3. Creates/updates the AgentCore Runtime via AWS CLI, injecting `GATEWAY_ENDPOINT_URL` (read from SSM) as an environment variable
-
-To iterate on the chat agent or Gateway on their own, run these commands from
-the repository root (LUMI already deployed):
-
-```bash
-make lumi-gateway-deploy  # Create/update Gateway + register target + attempt WAF association
-make lumi-chat-build      # Zip source → S3 → CodeBuild → ECR image
-make lumi-chat-deploy     # Create/update AgentCore Runtime
-make lumi-chat-destroy    # Delete the AgentCore Runtime
-make lumi-gateway-destroy # Tear down the AgentCore Gateway
-```
-
-#### Chat Agent Environment Variables
+### Chat Agent Environment Variables
 
 | Variable | Description | Example |
 |----------|-------------|---------|
@@ -238,7 +155,7 @@ make lumi-gateway-destroy # Tear down the AgentCore Gateway
 | `COGNITO_USER_POOL_ID` | Cognito User Pool for identity resolution | `us-east-1_xxxxxxxxx` |
 | `AWS_DEFAULT_REGION` | AWS region for boto3 clients and the Gateway SigV4 signer | `us-east-1` |
 
-#### Frontend Chat Additions
+### Frontend Chat Additions
 
 | Component | Role |
 |-----------|------|
@@ -247,7 +164,7 @@ make lumi-gateway-destroy # Tear down the AgentCore Gateway
 | `useChatAgent.ts` | WebSocket session management, SigV4 auth (same Identity Pool as voice), message streaming/accumulation |
 
 Frontend env additions: `NEXT_PUBLIC_CHAT_RUNTIME_ARN` (written to
-`frontend/.env.production` by `make lumi-write-frontend-env` using the runtime ID
+`frontend/.env.production` using the runtime ID
 in SSM `/${STACK_PREFIX}/chat/runtime-id`, plus the deployment account and
 region), reusing the existing
 `NEXT_PUBLIC_COGNITO_IDENTITY_POOL_ID`/`NEXT_PUBLIC_AWS_REGION` from the voice
