@@ -420,8 +420,10 @@ and existing stacks without `AppPassword` stop deployment. Updates require
 states require recovery first.
 
 **Prerequisites** (one-time): Git, GNU Make, `zip`, AWS CLI v2.27 or later,
-Python 3.12 or later with `pip`, Node.js 22.13 or later with npm, and AWS
-credentials configured for the target account. In the target region, the
+Python 3.12 or later with `pip`, Node.js with npm, and AWS credentials configured
+for the target account. Node.js must be 22.22.2 or later within 22.x, 24.15.0 or
+later within 24.x, or 26.0.0 or later, matching the committed frontend test
+dependencies (`^22.22.2 || ^24.15.0 || >=26.0.0`). In the target region, the
 deployment identity must be able to use Amazon Bedrock AgentCore and invoke
 [Anthropic Claude Sonnet 4.6](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html)
 and [Amazon Nova 2.5 Sonic](https://aws.amazon.com/about-aws/whats-new/2026/10/amazon-nova-2.5-Sonic/).

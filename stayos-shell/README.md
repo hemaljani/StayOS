@@ -72,7 +72,9 @@ NEXT_PUBLIC_COGNITO_REGION=us-east-1
 
 ## Commands
 
-**Prerequisites:** Node.js 22.13 or later with npm (required by the committed dependency lockfile).
+**Prerequisites:** Node.js with npm: 22.22.2 or later within 22.x, 24.15.0 or
+later within 24.x, or 26.0.0 or later. This matches the committed frontend test
+dependencies (`^22.22.2 || ^24.15.0 || >=26.0.0`).
 
 ```bash
 cd frontend
