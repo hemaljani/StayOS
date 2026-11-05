@@ -31,3 +31,6 @@ aws-lambda-powertools>=2.30.0
 # HTTP client for IMDS credential fetching (AgentCore provides credentials via IMDS)
 # Used by the startup credential loader and background refresh task
 requests>=2.31.0
+
+# Verify Cognito RS256 JWTs locally before GetUser and bind OAuth identity.
+pyjwt[crypto]==2.15.0

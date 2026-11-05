@@ -42,6 +42,19 @@ Parameters:
     Type: String
     Description: CloudFront domain for audio distribution (from storage stack)
 
+  AudioSigningKeyId:
+    Type: String
+    Default: ""
+
+  AudioSigningSecretArn:
+    Type: String
+    Default: ""
+
+  ApiCodeS3Key:
+    Type: String
+    Default: functions/stayos-api.zip
+    Description: Immutable tested API release artifact key
+
   FrontendDistributionDomain:
     Type: String
     Description: CloudFront domain for frontend (used in CORS allowed origins)
@@ -144,6 +157,9 @@ Parameters:
 # -------------------------------------------------------------------
 # Resources
 # -------------------------------------------------------------------
+Conditions:
+  AudioSigningConfigured: !Not [!Equals [!Ref AudioSigningKeyId, ""]]
+
 Resources:
 
   # ================================================================= OBSERVABILITY =================================================================
@@ -1138,13 +1154,25 @@ Resources:
         LogFormat: JSON
       Code:
         S3Bucket: !Ref DeployBucket
-        S3Key: functions/stayos-api.zip
+        S3Key: !Ref ApiCodeS3Key
       Environment:
         Variables:
           BRIEFS_TABLE_NAME: !Ref BriefsTableName
           SETTINGS_TABLE_NAME: !Ref SettingsTableName
           AUDIO_CLOUDFRONT_DOMAIN: !Ref AudioDistributionDomain
+          AUDIO_SIGNING_KEY_ID: !If
+            - AudioSigningConfigured
+            - !Ref AudioSigningKeyId
+            - !Ref AWS::NoValue
+          # CloudFormation resolves the secret; release tooling never reads it.
+          AUDIO_SIGNING_PRIVATE_KEY: !If
+            - AudioSigningConfigured
+            - !Sub "{{resolve:secretsmanager:${AudioSigningSecretArn}:SecretString:privateKey}}"
+            - !Ref AWS::NoValue
           COGNITO_USER_POOL_ID: !Ref UserPoolId
+          COGNITO_CLIENT_ID: !Ref UserPoolClientId
+          # Keep brief contents and signed playback capabilities out of X-Ray metadata.
+          POWERTOOLS_TRACER_CAPTURE_RESPONSE: "false"
           FRONTEND_ORIGIN: !Sub "https://${FrontendDistributionDomain}"
           # Per-GM schedule management (REQ-SCHED-2)
           SCHEDULE_GROUP_NAME: !Sub "${StackPrefix}-briefs"
@@ -1305,6 +1333,10 @@ Resources:
     Properties:
       Name: !Sub "${StackPrefix}-api-gateway"
       Description: LUMI REST API - brief retrieval and settings management
+      # Regional APIs cannot migrate directly from legacy TLS_1_0 to TLS_1_2.
+      # This enhanced policy permits TLS 1.2/1.3; BASIC preserves endpoint access.
+      SecurityPolicy: SecurityPolicy_TLS13_1_2_2021_06
+      EndpointAccessMode: BASIC
       EndpointConfiguration:
         Types:
           - REGIONAL

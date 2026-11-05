@@ -21,6 +21,13 @@ from handlers.briefs_handler import get_brief, get_brief_by_date
 # Fixtures
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def configured_audio_domain(monkeypatch):
+    """Handlers are imported before environment fixtures execute."""
+    monkeypatch.setattr(
+        "handlers.briefs_handler.AUDIO_CLOUDFRONT_DOMAIN", "d1234567890.cloudfront.net"
+    )
+
 
 @pytest.fixture
 def mock_brief_item() -> Dict[str, Any]:
@@ -168,7 +175,9 @@ def test_get_brief_constructs_audio_url(mock_brief_item: Dict[str, Any]) -> None
         result = get_brief(event, params)
 
     expected_url = "https://d1234567890.cloudfront.net/briefs/2026/08/03/ALOHA-CHI-001/morning-brief.mp3"
-    assert result["audioBrief"]["audioUrl"] == expected_url
+    assert result["audioBrief"]["audioUrl"].startswith(expected_url + "?")
+    assert "Key-Pair-Id=TESTKEY" in result["audioBrief"]["audioUrl"]
+    assert result["audioBrief"]["audioUrlExpiresAt"]
 
 
 @moto.mock_aws
@@ -364,9 +373,9 @@ def test_get_brief_by_date_attaches_audio_url(mock_brief_item: Dict[str, Any]) -
          patch("handlers.briefs_handler.AUDIO_CLOUDFRONT_DOMAIN", "d123.cloudfront.net"):
         result = get_brief_by_date(event, params)
 
-    assert result["audioBrief"]["audioUrl"] == (
+    assert result["audioBrief"]["audioUrl"].startswith(
         "https://d123.cloudfront.net/"
-        "briefs/2026/08/03/ALOHA-CHI-001/morning-brief.mp3"
+        "briefs/2026/08/03/ALOHA-CHI-001/morning-brief.mp3?"
     )
 
 

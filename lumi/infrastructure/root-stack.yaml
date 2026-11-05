@@ -37,6 +37,24 @@ Parameters:
     Type: String
     Description: Build-input-fingerprinted S3 key for the Python 3.12 x86_64 dependency layer
 
+  AudioSigningPublicKeyPem:
+    Type: String
+    Default: ""
+    Description: Public RSA PEM paired with the deployment-managed signing secret
+
+  ApiCodeS3Key:
+    Type: String
+    Default: functions/stayos-api.zip
+
+  FrontendDomain:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?'
+    Description: Browser frontend hostname for API CORS; blank uses the CloudFront hostname
+
+Conditions:
+  HasFrontendDomain: !Not [!Equals [!Ref FrontendDomain, ""]]
+
 Resources:
   # -----------------------------------------------------------------
   # Data: S3 buckets, CloudFront distributions, DynamoDB tables,
@@ -50,6 +68,7 @@ Resources:
       Parameters:
         StackPrefix: !Ref StackPrefix
         AccountId: !Ref AccountId
+        AudioSigningPublicKeyPem: !Ref AudioSigningPublicKeyPem
       Tags:
         - Key: Project
           Value: StayOS
@@ -94,7 +113,15 @@ Resources:
         SettingsTableArn: !GetAtt DataStack.Outputs.SettingsTableArn
         AudioBucketName: !GetAtt DataStack.Outputs.AudioBucketName
         AudioDistributionDomain: !GetAtt DataStack.Outputs.AudioDistributionDomain
-        FrontendDistributionDomain: !GetAtt DataStack.Outputs.FrontendDistributionDomain
+        AudioSigningSecretArn: !GetAtt DataStack.Outputs.AudioSigningSecretArn
+        AudioSigningKeyId: !GetAtt DataStack.Outputs.AudioSigningKeyId
+        ApiCodeS3Key: !Ref ApiCodeS3Key
+        # The browser origin can use a custom hostname while CloudFront keeps
+        # its existing distribution and generated domain.
+        FrontendDistributionDomain: !If
+          - HasFrontendDomain
+          - !Ref FrontendDomain
+          - !GetAtt DataStack.Outputs.FrontendDistributionDomain
         UserPoolId: !GetAtt AuthStack.Outputs.UserPoolId
         UserPoolArn: !GetAtt AuthStack.Outputs.UserPoolArn
         UserPoolClientId: !GetAtt AuthStack.Outputs.UserPoolClientId

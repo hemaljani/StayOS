@@ -15,10 +15,52 @@ Parameters:
   AccountId:
     Type: String
 
+  AudioSigningPublicKeyPem:
+    Type: String
+    Default: ""
+    Description: Public RSA 2048 PEM paired with the audio signing secret
+
+Conditions:
+  AudioSigningConfigured: !Not [!Equals [!Ref AudioSigningPublicKeyPem, ""]]
+
 # -------------------------------------------------------------------
 # Resources
 # -------------------------------------------------------------------
 Resources:
+
+  # The authorized release generates a private key in memory and writes it
+  # directly to this secret. CloudFormation resolves it for the API Lambda;
+  # deployment tooling never retrieves the value.
+  AudioSigningSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Sub "${StackPrefix}/audio/signing-key"
+      Description: Private RSA key for short-lived CloudFront audio URLs
+      Tags:
+        - Key: Project
+          Value: StayOS
+
+  AudioSigningPublicKey:
+    Type: AWS::CloudFront::PublicKey
+    Condition: AudioSigningConfigured
+    Properties:
+      PublicKeyConfig:
+        Name: !Sub "${StackPrefix}-audio-signing"
+        CallerReference: !Sub "${StackPrefix}-audio-signing-v1"
+        EncodedKey: !Ref AudioSigningPublicKeyPem
+        Comment: Public key for property-authorized audio capabilities
+
+  AudioSigningKeyGroup:
+    Type: AWS::CloudFront::KeyGroup
+    Condition: AudioSigningConfigured
+    Properties:
+      KeyGroupConfig:
+        Name: !Sub "${StackPrefix}-audio-signing"
+        Comment: Trusted signer for existing audio distribution
+        Items:
+          - !Ref AudioSigningPublicKey
 
   # =================================================================
   # WAF
@@ -380,6 +422,11 @@ Resources:
               OriginAccessIdentity: ""
         DefaultCacheBehavior:
           TargetOriginId: AudioS3Origin
+          # CloudFront validates viewer signatures even when the MP3 is cached.
+          TrustedKeyGroups: !If
+            - AudioSigningConfigured
+            - [!Ref AudioSigningKeyGroup]
+            - !Ref AWS::NoValue
           ViewerProtocolPolicy: redirect-to-https
           # CachingOptimized - 86400s (24h) default TTL, suitable for daily audio
           CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
@@ -792,6 +839,14 @@ Resources:
 # root stack needs distribution domains).
 # -------------------------------------------------------------------
 Outputs:
+  AudioSigningSecretArn:
+    Description: Secret resolved by CloudFormation for the API signing key
+    Value: !Ref AudioSigningSecret
+
+  AudioSigningKeyId:
+    Description: CloudFront public key ID for short-lived audio URLs
+    Value: !If [AudioSigningConfigured, !Ref AudioSigningPublicKey, ""]
+
   WebAclArn:
     Description: ARN of the WAF WebACL for CloudFront distribution association
     Value: !GetAtt WebAcl.Arn

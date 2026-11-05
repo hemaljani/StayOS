@@ -12,7 +12,7 @@ from typing import Any, Dict
 
 from aws_lambda_powertools import Logger, Tracer
 
-from exceptions import ApiError, InternalError
+from exceptions import ApiError, InternalError, UnauthorizedError
 from router import dispatch
 
 # Import handlers to trigger route registration via decorators.
@@ -33,6 +33,15 @@ BRIEFS_TABLE_NAME = os.environ.get("BRIEFS_TABLE_NAME", "")
 SETTINGS_TABLE_NAME = os.environ.get("SETTINGS_TABLE_NAME", "")
 FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "*")
 
+def _validate_api_identity(event: Dict[str, Any]) -> None:
+    """Bind API Gateway's verified Cognito identity to this public app client."""
+    client = os.environ.get("COGNITO_CLIENT_ID", "")
+    if not client:
+        raise InternalError("API identity validation is not configured")
+    claims = event.get("requestContext", {}).get("authorizer", {}).get("claims", {})
+    if claims.get("aud") != client or claims.get("token_use") != "id":
+        raise UnauthorizedError()
+
 
 def _build_response(status_code: int, body: Any) -> Dict[str, Any]:
     """Build an API Gateway Lambda proxy response.
@@ -51,6 +60,10 @@ def _build_response(status_code: int, body: Any) -> Dict[str, Any]:
         "statusCode": status_code,
         "headers": {
             "Content-Type": "application/json",
+            # Authenticated data and short-lived audio capabilities must not be
+            # reused by a browser, service worker, or shared proxy cache.
+            "Cache-Control": "private, no-store",
+            "Pragma": "no-cache",
             "Access-Control-Allow-Origin": FRONTEND_ORIGIN,
             "Access-Control-Allow-Headers": "Authorization,Content-Type",
             "Access-Control-Allow-Methods": "GET,PUT,OPTIONS",
@@ -88,6 +101,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     )
 
     try:
+        _validate_api_identity(event)
         # Dispatch to the matched route handler
         result = dispatch(event)
 

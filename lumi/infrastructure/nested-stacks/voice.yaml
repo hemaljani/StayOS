@@ -142,7 +142,11 @@ Resources:
               # Allow authenticated users to connect to the voice agent via WebSocket
               - Effect: Allow
                 Action: bedrock-agentcore:InvokeAgentRuntimeWithWebSocketStream
-                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AccountId}:runtime/*"
+                # Only this application's chat and voice runtime families.
+                # PULSE agents and other account runtimes stay inaccessible.
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AccountId}:runtime/${StackPrefix}_voice_agent-*"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AccountId}:runtime/${StackPrefix}_chat_agent-*"
       Tags:
         - Key: Project
           Value: StayOS

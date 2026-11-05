@@ -122,11 +122,23 @@ Resources:
     Type: AWS::Logs::MetricFilter
     Properties:
       LogGroupName: !Sub "/${StackPrefix}/pipeline"
-      # Forecast run-failure marker: app.py logs "Forecast run failure" when a
-      # forecast run raises/aborts before producing an outcome.
+      # The invoker logs this marker when invocation or result validation fails,
+      # so failures reach this pipeline group even when runtime logs are separate.
       FilterPattern: '{ $.message = "Forecast run failure*" }'
       MetricTransformations:
         - MetricName: ForecastRunFailures
+          MetricNamespace: PULSE/Pipeline
+          MetricValue: "1"
+          DefaultValue: 0
+          Unit: Count
+
+  ForecastRunCompletedMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub "/${StackPrefix}/pipeline"
+      FilterPattern: '{ $.message = "Forecast invocation completed" }'
+      MetricTransformations:
+        - MetricName: ForecastRunCompleted
           MetricNamespace: PULSE/Pipeline
           MetricValue: "1"
           DefaultValue: 0
@@ -466,6 +478,7 @@ Resources:
                 "yAxis": { "left": { "min": 0 } },
                 "metrics": [
                   [ "PULSE/Pipeline", "ForecastRunFailures", { "label": "Run failures" } ],
+                  [ "PULSE/Pipeline", "ForecastRunCompleted", { "label": "Completed invocations" } ],
                   [ "PULSE/Pipeline", "ForecastToolExhausted", { "label": "Tool exhausted" } ],
                   [ "PULSE/Pipeline", "ForecastNoAlert", { "label": "No-alert outcomes" } ]
                 ]

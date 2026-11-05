@@ -110,6 +110,9 @@ export default function BriefDetail() {
       {/* Audio player (if available) */}
       <AudioBriefPlayer
         audioUrl={brief.audioBrief?.audioUrl}
+        audioUrlExpiresAt={brief.audioBrief?.audioUrlExpiresAt}
+        propertyId={brief.property.propertyId}
+        briefDate={briefDate}
         durationSeconds={brief.audioBrief?.durationSeconds}
       />
 

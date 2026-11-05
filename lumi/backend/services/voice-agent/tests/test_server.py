@@ -113,12 +113,38 @@ def mock_websocket() -> AsyncMock:
         AsyncMock configured to behave like a Starlette WebSocket instance.
     """
     ws = AsyncMock()
+    ws.headers = {}
     ws.accept = AsyncMock()
     ws.receive_text = AsyncMock()
     ws.send_json = AsyncMock()
     ws.send_text = AsyncMock()
     ws.close = AsyncMock()
     return ws
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("offered,selected", [
+    ("base64UrlBearerAuthorization.ZHVtbXk, base64UrlBearerAuthorization", "base64UrlBearerAuthorization"),
+    ("base64UrlBearerAuthorization", "base64UrlBearerAuthorization"),
+    ("base64UrlBearerAuthorization.ZHVtbXk", None),
+    ("", None),
+])
+async def test_browser_upgrade_selects_only_the_public_oauth_sentinel(
+    mock_websocket, offered, selected,
+):
+    """Negotiate the browser protocol without reflecting a credential as the selection."""
+    import server
+
+    mock_websocket.headers = {"sec-websocket-protocol": offered}
+    with (
+        patch.object(server, "_shutting_down", False),
+        patch.object(server, "_process_identity_message", AsyncMock(return_value=None)),
+    ):
+        await server.websocket_handler(mock_websocket, None)
+    if selected:
+        mock_websocket.accept.assert_awaited_once_with(subprotocol=selected)
+    else:
+        mock_websocket.accept.assert_awaited_once_with()
 
 
 @pytest.fixture()

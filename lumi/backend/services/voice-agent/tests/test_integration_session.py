@@ -115,6 +115,7 @@ def mock_websocket() -> AsyncMock:
         AsyncMock configured to behave like a Starlette WebSocket instance.
     """
     ws = AsyncMock()
+    ws.headers = {"authorization": "Bearer transport-access-token"}
     ws.accept = AsyncMock()
     ws.receive_text = AsyncMock()
     ws.send_json = AsyncMock()
@@ -266,7 +267,10 @@ class TestWebSocketSessionLifecycle:
         mock_websocket.accept.assert_called_once()
 
         # 2. Identity was resolved with the correct access token
-        mock_resolve.assert_called_once_with("valid-cognito-access-token-xyz")
+        mock_resolve.assert_called_once_with(
+            "valid-cognito-access-token-xyz",
+            transport_authorization="Bearer transport-access-token",
+        )
 
         # 3. Language preference was loaded from DynamoDB
         mock_dynamodb_resource.Table.assert_called_with("stayos-settings")

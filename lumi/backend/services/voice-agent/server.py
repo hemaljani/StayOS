@@ -117,8 +117,16 @@ async def websocket_handler(websocket: WebSocket, context: Any) -> None:
         await websocket.close(code=1013, reason="Server shutting down")
         return
 
-    # Accept the WebSocket upgrade
-    await websocket.accept()
+    # Browsers require the requested public sentinel in the upgrade response.
+    # Never reflect the credential-bearing protocol; OAuth/JWT checks still
+    # authenticate the connection and the first identity message independently.
+    offered = websocket.headers.get("sec-websocket-protocol", "")
+    if isinstance(offered, str) and "base64UrlBearerAuthorization" in {
+        protocol.strip() for protocol in offered.split(",")
+    }:
+        await websocket.accept(subprotocol="base64UrlBearerAuthorization")
+    else:
+        await websocket.accept()
 
     # Step 1: Receive and validate the identity message (first message)
     identity = await _process_identity_message(websocket)
@@ -241,9 +249,11 @@ async def _process_identity_message(websocket: WebSocket) -> Dict[str, str] | No
         )
         return None
 
-    # Validate the token via Cognito GetUser and extract claims
+    # Bind the access token to the OAuth principal forwarded by AgentCore.
     try:
-        identity = await resolve_identity(access_token)
+        identity = await resolve_identity(
+            access_token, transport_authorization=websocket.headers.get("authorization", "")
+        )
     except IdentityError as exc:
         logger.warning(
             "Identity resolution failed",

@@ -9,8 +9,11 @@ info:
     Manager settings, while PULSE provides real-time operational alerts,
     closed-loop actions, delivery configuration, and operations views.
 
-    All endpoints require Amazon Cognito JWT Bearer authentication and are
-    protected by AWS WAF with a US-only geographic restriction. Every route is
+    All endpoints require Amazon Cognito JWT Bearer authentication. LUMI requires
+    an ID token for its configured public app client. Its Lambda responses carry
+    Cache-Control: private, no-store, including errors. Frontend CloudFront WAF
+    protection does not establish WAF coverage of direct execute-api endpoints.
+    Every route is
     scoped server-side to the caller's associated properties; no route trusts
     client-supplied scope. LUMI and PULSE use distinct deployed API Gateway IDs
     at the same `/v1` stage, represented by brand-specific server entries and
@@ -26,13 +29,13 @@ externalDocs:
 
 servers:
   - url: https://{lumi-api-id}.execute-api.us-east-1.amazonaws.com/v1
-    description: LUMI API (us-east-1, protected by WAF and Cognito JWT)
+    description: LUMI API (us-east-1, authenticated with Cognito JWT)
     variables:
       lumi-api-id:
         default: "your-lumi-api-gateway-id"
         description: LUMI API Gateway REST API ID (from CloudFormation output ApiGatewayUrl)
   - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
-    description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+    description: PULSE API (us-east-1, authenticated with Cognito JWT)
     variables:
       pulse-api-id:
         default: "your-pulse-api-gateway-id"
@@ -87,7 +90,7 @@ paths:
   /briefs/{propertyId}:
     servers:
       - url: https://{lumi-api-id}.execute-api.us-east-1.amazonaws.com/v1
-        description: LUMI API (us-east-1, protected by WAF and Cognito JWT)
+        description: LUMI API (us-east-1, authenticated with Cognito JWT)
         variables:
           lumi-api-id:
             default: "your-lumi-api-gateway-id"
@@ -112,12 +115,15 @@ paths:
       responses:
         "200":
           description: Daily brief retrieved successfully
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/LumiPrivateCacheControl"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DailyBriefResponse"
         "401":
-          description: Unauthorized - invalid or expired token
+          description: Unauthorized - missing, invalid, expired, wrong-client, or non-ID token
           content:
             application/json:
               schema:
@@ -160,7 +166,7 @@ paths:
   /briefs/{propertyId}/{briefDate}:
     servers:
       - url: https://{lumi-api-id}.execute-api.us-east-1.amazonaws.com/v1
-        description: LUMI API (us-east-1, protected by WAF and Cognito JWT)
+        description: LUMI API (us-east-1, authenticated with Cognito JWT)
         variables:
           lumi-api-id:
             default: "your-lumi-api-gateway-id"
@@ -192,12 +198,23 @@ paths:
       responses:
         "200":
           description: Dated brief retrieved successfully
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/LumiPrivateCacheControl"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/DailyBriefResponse"
         "400":
           description: Invalid date format
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LumiErrorResponse"
+        "401":
+          $ref: "#/components/responses/LumiUnauthorized"
+        "403":
+          description: Forbidden - user does not own this property
           content:
             application/json:
               schema:
@@ -212,7 +229,7 @@ paths:
   /briefs/history:
     servers:
       - url: https://{lumi-api-id}.execute-api.us-east-1.amazonaws.com/v1
-        description: LUMI API (us-east-1, protected by WAF and Cognito JWT)
+        description: LUMI API (us-east-1, authenticated with Cognito JWT)
         variables:
           lumi-api-id:
             default: "your-lumi-api-gateway-id"
@@ -238,12 +255,17 @@ paths:
       responses:
         "200":
           description: Brief history retrieved successfully
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/LumiPrivateCacheControl"
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: "#/components/schemas/BriefHistorySummary"
+        "401":
+          $ref: "#/components/responses/LumiUnauthorized"
         "403":
           description: Forbidden
           content:
@@ -254,7 +276,7 @@ paths:
   /settings/{gmAlias}:
     servers:
       - url: https://{lumi-api-id}.execute-api.us-east-1.amazonaws.com/v1
-        description: LUMI API (us-east-1, protected by WAF and Cognito JWT)
+        description: LUMI API (us-east-1, authenticated with Cognito JWT)
         variables:
           lumi-api-id:
             default: "your-lumi-api-gateway-id"
@@ -278,6 +300,9 @@ paths:
       responses:
         "200":
           description: GM settings retrieved successfully
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/LumiPrivateCacheControl"
           content:
             application/json:
               schema:
@@ -344,6 +369,9 @@ paths:
       responses:
         "200":
           description: Settings updated successfully
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/LumiPrivateCacheControl"
           content:
             application/json:
               schema:
@@ -381,7 +409,7 @@ paths:
   /alerts:
     servers:
       - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
-        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        description: PULSE API (us-east-1, authenticated with Cognito JWT)
         variables:
           pulse-api-id:
             default: "your-pulse-api-gateway-id"
@@ -432,7 +460,7 @@ paths:
   /alerts/{alertId}:
     servers:
       - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
-        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        description: PULSE API (us-east-1, authenticated with Cognito JWT)
         variables:
           pulse-api-id:
             default: "your-pulse-api-gateway-id"
@@ -472,7 +500,7 @@ paths:
   /alerts/{alertId}/acknowledgements:
     servers:
       - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
-        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        description: PULSE API (us-east-1, authenticated with Cognito JWT)
         variables:
           pulse-api-id:
             default: "your-pulse-api-gateway-id"
@@ -525,7 +553,7 @@ paths:
   /alerts/{alertId}/resolutions:
     servers:
       - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
-        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        description: PULSE API (us-east-1, authenticated with Cognito JWT)
         variables:
           pulse-api-id:
             default: "your-pulse-api-gateway-id"
@@ -579,7 +607,7 @@ paths:
   /alerts/{alertId}/approvals:
     servers:
       - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
-        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        description: PULSE API (us-east-1, authenticated with Cognito JWT)
         variables:
           pulse-api-id:
             default: "your-pulse-api-gateway-id"
@@ -649,7 +677,7 @@ paths:
   /shift-handover:
     servers:
       - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
-        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        description: PULSE API (us-east-1, authenticated with Cognito JWT)
         variables:
           pulse-api-id:
             default: "your-pulse-api-gateway-id"
@@ -712,7 +740,7 @@ paths:
   /rules:
     servers:
       - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
-        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        description: PULSE API (us-east-1, authenticated with Cognito JWT)
         variables:
           pulse-api-id:
             default: "your-pulse-api-gateway-id"
@@ -749,7 +777,7 @@ paths:
   /rules/{ruleId}:
     servers:
       - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
-        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        description: PULSE API (us-east-1, authenticated with Cognito JWT)
         variables:
           pulse-api-id:
             default: "your-pulse-api-gateway-id"
@@ -825,7 +853,7 @@ paths:
   /push-subscriptions:
     servers:
       - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
-        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        description: PULSE API (us-east-1, authenticated with Cognito JWT)
         variables:
           pulse-api-id:
             default: "your-pulse-api-gateway-id"
@@ -877,7 +905,7 @@ paths:
   /config/vapid-public-key:
     servers:
       - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
-        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        description: PULSE API (us-east-1, authenticated with Cognito JWT)
         variables:
           pulse-api-id:
             default: "your-pulse-api-gateway-id"
@@ -907,7 +935,7 @@ paths:
   /config/realtime:
     servers:
       - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
-        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        description: PULSE API (us-east-1, authenticated with Cognito JWT)
         variables:
           pulse-api-id:
             default: "your-pulse-api-gateway-id"
@@ -941,7 +969,7 @@ paths:
   /vips:
     servers:
       - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
-        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        description: PULSE API (us-east-1, authenticated with Cognito JWT)
         variables:
           pulse-api-id:
             default: "your-pulse-api-gateway-id"
@@ -979,7 +1007,7 @@ paths:
   /ops:
     servers:
       - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
-        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        description: PULSE API (us-east-1, authenticated with Cognito JWT)
         variables:
           pulse-api-id:
             default: "your-pulse-api-gateway-id"
@@ -1018,7 +1046,7 @@ paths:
   /kitchen:
     servers:
       - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
-        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        description: PULSE API (us-east-1, authenticated with Cognito JWT)
         variables:
           pulse-api-id:
             default: "your-pulse-api-gateway-id"
@@ -1061,7 +1089,7 @@ paths:
   /demo/scenarios/{scenarioId}:
     servers:
       - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
-        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        description: PULSE API (us-east-1, authenticated with Cognito JWT)
         variables:
           pulse-api-id:
             default: "your-pulse-api-gateway-id"
@@ -1120,7 +1148,7 @@ paths:
   /demo/scenarios/{scenarioId}/reset:
     servers:
       - url: https://{pulse-api-id}.execute-api.us-east-1.amazonaws.com/v1
-        description: PULSE API (us-east-1, protected by WAF and Cognito JWT)
+        description: PULSE API (us-east-1, authenticated with Cognito JWT)
         variables:
           pulse-api-id:
             default: "your-pulse-api-gateway-id"
@@ -1181,7 +1209,16 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
-      description: Amazon Cognito JWT (access token or ID token)
+      description: >
+        Amazon Cognito JWT. LUMI requires an ID token with aud equal to the
+        configured public app client and token_use equal to id.
+
+  headers:
+    LumiPrivateCacheControl:
+      description: Authenticated responses and audio capabilities must not be stored
+      schema:
+        type: string
+        enum: ["private, no-store"]
 
   parameters:
     AlertId:
@@ -1210,6 +1247,12 @@ components:
         example: walk-risk
 
   responses:
+    LumiUnauthorized:
+      description: Unauthorized - missing, invalid, expired, wrong-client, or non-ID token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/LumiErrorResponse"
     Unauthorized:
       description: Unauthorized - invalid, expired, or missing token
       content:
@@ -1580,8 +1623,15 @@ components:
         audioUrl:
           type: string
           format: uri
-          description: CloudFront URL for streaming the audio brief
-          example: "https://audio.lumi.example.com/briefs/2026/08/03/ALOHA-CHI-001/morning-brief.mp3"
+          description: >
+            CloudFront signed URL for one property-authorized audio brief.
+            Valid for 900 seconds. Unsigned or expired requests are denied.
+            Renew by retrieving the same dated brief through the authenticated
+            API. Brief responses carry Cache-Control private, no-store.
+        audioUrlExpiresAt:
+          type: string
+          format: date-time
+          description: Expiration of audioUrl; renew before resuming expired playback
         transcriptSnippet:
           type: string
           description: First few sentences of the AI-generated narrative

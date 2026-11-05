@@ -53,6 +53,9 @@ export default function DailyBriefPage() {
       {/* Audio player */}
       <AudioBriefPlayer
         audioUrl={brief.audioBrief.audioUrl}
+        audioUrlExpiresAt={brief.audioBrief.audioUrlExpiresAt}
+        propertyId={brief.property.propertyId}
+        briefDate={brief.dailyKPIs.date}
         durationSeconds={brief.audioBrief.durationSeconds}
       />
 

@@ -1,31 +1,18 @@
-"""Identity resolution module for the StayOS Chat Agent on AgentCore.
+"""Bind chat/voice identity to the configured Cognito WebSocket principal.
 
-Validates Cognito Access Tokens by calling the Cognito GetUser API and extracts
-custom:propertyId and custom:gmAlias for property-scoped data access. This is
-an adapted copy of the voice agent's identity_resolver.py - the identity
-resolution logic is not voice-specific, so it is reused as-is with only the
-logger service name changed.
-
-Role in project: Called by server.py after the first WebSocket message is
-received. The Access Token (sent by the browser as the first message) is
-validated via Cognito GetUser, which simultaneously verifies token validity
-and retrieves the user's custom attributes. The extracted propertyId is
-injected into every Gateway tool call made during the chat session.
-
-Why GetUser instead of local JWT validation:
-    - AgentCore already authenticates the caller via SigV4 at the platform level
-    - GetUser respects token revocation (sign-out) immediately
-    - No JWKS caching, key rotation, or crypto dependencies needed
-    - Single boto3 call vs multi-step JWKS fetch + RS256 verification
-
-Environment variables:
-    AWS_DEFAULT_REGION: AWS region for the Cognito User Pool (default: us-east-1)
+Verify both the first-message access token and forwarded OAuth transport token
+against the configured pool/client. GetUser then checks revocation and supplies
+current property attributes; it cannot substitute for issuer/client validation.
+Public JWKS are cached and refreshed on rotation. Tokens are never logged.
 """
 
+import asyncio
 import os
+from functools import lru_cache
 from typing import Any, Dict, List
 
 import boto3
+import jwt
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from aws_lambda_powertools import Logger
@@ -76,6 +63,73 @@ class IdentityError(Exception):
         self.reason = reason
 
 
+@lru_cache(maxsize=2)
+def _jwks_client(issuer: str) -> jwt.PyJWKClient:
+    """Use a fixed trusted endpoint, never a URL taken from an unverified JWT."""
+    return jwt.PyJWKClient(
+        issuer + "/.well-known/jwks.json",
+        cache_keys=True,
+        max_cached_keys=4,
+        lifespan=300,
+        timeout=5,
+    )
+
+
+def _verified_claims(token: str) -> Dict[str, Any]:
+    """Require Cognito's RS256 signature, issuer, client, use and expiry."""
+    pool = os.environ.get("COGNITO_USER_POOL_ID", "")
+    client = os.environ.get("COGNITO_CLIENT_ID", "")
+    if not pool.startswith(AWS_REGION + "_") or not client:
+        raise IdentityError("Identity validation is not configured", "configuration_error")
+    if not isinstance(token, str) or not token or len(token) > 16384:
+        raise IdentityError("Invalid access token", "token_invalid")
+    issuer = f"https://cognito-idp.{AWS_REGION}.amazonaws.com/{pool}"
+    try:
+        header = jwt.get_unverified_header(token)
+        if header.get("alg") != "RS256" or not isinstance(header.get("kid"), str):
+            raise IdentityError("Invalid token signing algorithm or key", "token_invalid")
+        if not header["kid"] or len(header["kid"]) > 256:
+            raise IdentityError("Invalid token signing key", "token_invalid")
+        key = _jwks_client(issuer).get_signing_key_from_jwt(token)
+        claims = jwt.decode(
+            token,
+            key.key,
+            algorithms=["RS256"],
+            issuer=issuer,
+            options={
+                # Cognito access tokens identify the app using client_id.
+                "verify_aud": False,
+                "require": ["exp", "iat", "sub", "iss", "token_use", "client_id"],
+            },
+        )
+    except jwt.PyJWTError as exc:
+        raise IdentityError("Access token verification failed", "token_invalid") from exc
+    if (
+        claims.get("token_use") != "access"
+        or claims.get("client_id") != client
+        or not isinstance(claims.get("sub"), str)
+        or not claims["sub"]
+    ):
+        raise IdentityError("Access token claims are not authorized", "token_invalid")
+    return claims
+
+
+def _validate_session_tokens(
+    access_token: str, transport_authorization: str
+) -> Dict[str, Any]:
+    """Reject substituting another user's identity into an authenticated socket."""
+    if not isinstance(transport_authorization, str):
+        raise IdentityError("Authenticated transport identity is required", "transport_missing")
+    scheme, _, transport_token = transport_authorization.partition(" ")
+    if scheme.lower() != "bearer" or not transport_token:
+        raise IdentityError("Authenticated transport identity is required", "transport_missing")
+    transport_claims = _verified_claims(transport_token)
+    claims = _verified_claims(access_token)
+    if transport_claims["sub"] != claims["sub"]:
+        raise IdentityError("Identity does not match the connected user", "identity_mismatch")
+    return claims
+
+
 def _extract_attribute(
     user_attributes: List[Dict[str, str]], attribute_name: str
 ) -> str:
@@ -123,16 +177,13 @@ def _extract_attribute(
     )
 
 
-async def resolve_identity(access_token: str) -> Dict[str, str]:
+async def resolve_identity(
+    access_token: str, transport_authorization: str = ""
+) -> Dict[str, str]:
     """Validate a Cognito Access Token and extract property-scoped claims.
 
-    Calls the Cognito GetUser API with the Access Token. If the call succeeds,
-    the token is valid and the user's custom attributes are returned. If it
-    fails (expired, revoked, malformed), an IdentityError is raised.
-
-    This function is async to match the server's async WebSocket handler pattern,
-    though the underlying boto3 call is synchronous. The async wrapper enables
-    future migration to aioboto3 if needed without changing the caller interface.
+    Validate JWTs before GetUser, then bind its returned subject to the verified
+    subject. Blocking crypto/JWKS and SDK work runs off the WebSocket event loop.
 
     Args:
         access_token: The Cognito Access Token received as the first WebSocket
@@ -154,16 +205,21 @@ async def resolve_identity(access_token: str) -> Dict[str, str]:
             reason="token_empty",
         )
 
+    claims = await asyncio.to_thread(
+        _validate_session_tokens, access_token, transport_authorization
+    )
     try:
         # Call Cognito GetUser to validate the token and retrieve user attributes.
         # This single API call handles token signature verification, expiration
         # checking, and revocation status - no local crypto needed.
-        response = _cognito_client.get_user(AccessToken=access_token)
+        response = await asyncio.to_thread(
+            _cognito_client.get_user, AccessToken=access_token
+        )
     except _cognito_client.exceptions.NotAuthorizedException as exc:
         # Token is invalid, expired, or has been revoked (user signed out).
         logger.warning(
             "Access token authorization failed",
-            extra={"error_type": "NotAuthorizedException", "error": str(exc)},
+            extra={"error_type": "NotAuthorizedException"},
         )
         raise IdentityError(
             "Access token is invalid or expired",
@@ -173,7 +229,7 @@ async def resolve_identity(access_token: str) -> Dict[str, str]:
         # User associated with the token no longer exists in the User Pool.
         logger.warning(
             "User not found for the provided access token",
-            extra={"error_type": "UserNotFoundException", "error": str(exc)},
+            extra={"error_type": "UserNotFoundException"},
         )
         raise IdentityError(
             "User associated with the token was not found",
@@ -184,7 +240,7 @@ async def resolve_identity(access_token: str) -> Dict[str, str]:
         error_code = exc.response.get("Error", {}).get("Code", "Unknown")
         logger.error(
             "Unexpected Cognito API error during identity resolution",
-            extra={"error_code": error_code, "error": str(exc)},
+            extra={"error_code": error_code},
         )
         raise IdentityError(
             f"Identity resolution failed due to service error: {error_code}",
@@ -194,11 +250,13 @@ async def resolve_identity(access_token: str) -> Dict[str, str]:
     # Extract user attributes from the GetUser response.
     # UserAttributes is a list of {"Name": "...", "Value": "..."} dicts.
     user_attributes: List[Dict[str, str]] = response.get("UserAttributes", [])
+    if _extract_attribute(user_attributes, "sub") != claims["sub"]:
+        raise IdentityError("User response does not match token subject", "identity_mismatch")
 
-    # Extract custom:propertyId - required for property-scoped tool invocations.
+    # Extract custom:propertyId - required for property-scoped DynamoDB access.
     property_id = _extract_attribute(user_attributes, "custom:propertyId")
 
-    # Extract custom:gmAlias - required for logging context and personalization.
+    # Extract custom:gmAlias - required for settings lookup and logging context.
     gm_alias = _extract_attribute(user_attributes, "custom:gmAlias")
 
     logger.info(

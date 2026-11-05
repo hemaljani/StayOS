@@ -65,10 +65,9 @@ Parameters:
       skeleton stage: realtime publish is best-effort and is skipped when unset.
   RealtimeApiArn:
     Type: String
-    Default: "*"
     Description: >
-      AppSync Events API ARN for scoping appsync:EventPublish. Defaults to "*"
-      until the realtime API ARN is threaded from pulse-api (tightened later).
+      AppSync Events API ARN from pulse-api. Publishers are restricted to its
+      pulse channel namespace.
 
   # --- Web Push (VAPID) secret ---
   VapidSecretName:
@@ -175,6 +174,7 @@ Parameters:
 # Conditions
 # -------------------------------------------------------------------
 Conditions:
+  HasForecastRuntimeArn: !Not [!Equals [!Ref ForecastAgentRuntimeArn, ""]]
   # Gate the demo simulator (Lambda + schedule + write IAM) so a real
   # deployment can exclude it by setting EnableDemoSimulator=false (Task 20).
   ShouldEnableDemoSimulator: !Equals [!Ref EnableDemoSimulator, "true"]
@@ -276,6 +276,15 @@ Resources:
                 # amazonlinux x86_64 / py3.12.
                 - pip3 install ".[ops-read]" -t pkg --quiet --disable-pip-version-check
                 - cd pkg && zip -r ../pulse-backend.zip . -x "*.pyc" "__pycache__/*" > /dev/null && cd ..
+                # Import the handler from the final archive in an isolated
+                # interpreter before uploading. No AWS calls or credentials.
+                - >-
+                  python3 -I -c "import importlib, sys, tempfile, zipfile;
+                  artifact = tempfile.TemporaryDirectory();
+                  zipfile.ZipFile('pulse-backend.zip').extractall(artifact.name);
+                  sys.path.insert(0, artifact.name);
+                  handler = importlib.import_module('pulse.forecast_invoker').lambda_handler;
+                  assert callable(handler), 'Forecast handler is not callable'"
                 - echo "Uploading s3://$DEPLOY_BUCKET/$LAMBDA_CODE_S3_KEY"
                 - aws s3 cp pulse-backend.zip "s3://$DEPLOY_BUCKET/$LAMBDA_CODE_S3_KEY" --quiet
                 - echo "Backend package build complete."
@@ -546,7 +555,7 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: "appsync:EventPublish"
-                Resource: !Ref RealtimeApiArn
+                Resource: !Sub "${RealtimeApiArn}/channelNamespace/pulse"
         - PolicyName: Observability
           PolicyDocument:
             Version: "2012-10-17"
@@ -607,7 +616,7 @@ Resources:
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${VapidSecretName}-*"
               - Effect: Allow
                 Action: "appsync:EventPublish"
-                Resource: !Ref RealtimeApiArn
+                Resource: !Sub "${RealtimeApiArn}/channelNamespace/pulse"
         - PolicyName: Observability
           PolicyDocument:
             Version: "2012-10-17"
@@ -664,7 +673,7 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: "appsync:EventPublish"
-                Resource: !Ref RealtimeApiArn
+                Resource: !Sub "${RealtimeApiArn}/channelNamespace/pulse"
         - PolicyName: Observability
           PolicyDocument:
             Version: "2012-10-17"
@@ -904,21 +913,21 @@ Resources:
               Service: lambda.amazonaws.com
             Action: "sts:AssumeRole"
       Policies:
-        - PolicyName: InvokeForecasterRuntime
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              # Start an AgentCore Runtime session for the Forecasting Agent.
-              # Scoped to ONLY the pulse-forecaster runtime (least privilege): a
-              # concrete ARN when threaded via ForecastAgentRuntimeArn, and the
-              # named-runtime ARN pattern so the grant is still forecaster-only
-              # while that parameter is empty (the runtime is deployed
-              # out-of-band). Mirrors how PulseTriageInvokerRole scopes its
-              # InvokeAgentRuntime grant to the triage runtime.
-              - Effect: Allow
-                Action: "bedrock-agentcore:InvokeAgentRuntime"
-                Resource:
-                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/pulse-forecaster*"
+        # No invocation grant until the out-of-band runtime is configured.
+        # Invocation requires both the runtime and DEFAULT endpoint. Scope both
+        # exactly; runtime names use underscores, not hyphens.
+        - !If
+          - HasForecastRuntimeArn
+          - PolicyName: InvokeForecasterRuntime
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: "bedrock-agentcore:InvokeAgentRuntime"
+                  Resource:
+                    - !Ref ForecastAgentRuntimeArn
+                    - !Sub "${ForecastAgentRuntimeArn}/runtime-endpoint/DEFAULT"
+          - !Ref "AWS::NoValue"
         - PolicyName: Observability
           PolicyDocument:
             Version: "2012-10-17"
@@ -947,23 +956,14 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${StackPrefix}-forecaster-invoker"
-      Description: Thin Scheduler target that starts a pulse-forecaster AgentCore Runtime session
+      Description: Scheduler target that invokes forecasting and validates its completed result
       Runtime: python3.12
-      # NOTE: Unlike the sibling pipeline Lambdas (rule-evaluator, escalation,
-      # etc.) whose code lives inside the shared `pulse` package and are reached
-      # via dotted module paths (e.g. pulse.rule_engine.handler.lambda_handler),
-      # the forecast invoker lives at functions/forecast-invoker/lambda_function.py
-      # and is NOT inside the pulse package. Its handler is therefore the module
-      # path within its own package root: `lambda_function.lambda_handler`
-      # (design says handler `lambda_handler`). This assumes the deployment
-      # package places functions/forecast-invoker/lambda_function.py at the zip
-      # root; if the shared build instead nests it under the pulse package, the
-      # handler must be updated to match that layout at packaging time.
-      Handler: lambda_function.lambda_handler
-      # Thin invoker: it only starts a Runtime session (fire-and-forget style),
-      # so a small memory footprint and a short timeout are sufficient.
+      # Included by setuptools from src/ in the shared pulse-backend.zip.
+      Handler: pulse.forecast_invoker.lambda_handler
       MemorySize: 128
-      Timeout: 30
+      # Wait for the forecast summary, including bounded SDK retries, instead
+      # of returning success as soon as the runtime accepts the request.
+      Timeout: 600
       Role: !GetAtt PulseForecasterInvokerRole.Arn
       TracingConfig:
         # Req (invoker tracing): capture the invoker segment and propagate the
@@ -1139,7 +1139,7 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: "appsync:EventPublish"
-                Resource: !Ref RealtimeApiArn
+                Resource: !Sub "${RealtimeApiArn}/channelNamespace/pulse"
         - PolicyName: Observability
           PolicyDocument:
             Version: "2012-10-17"
@@ -1286,7 +1286,7 @@ Resources:
               # Best-effort post-commit ALERT_RESOLVED realtime event.
               - Effect: Allow
                 Action: "appsync:EventPublish"
-                Resource: !Ref RealtimeApiArn
+                Resource: !Sub "${RealtimeApiArn}/channelNamespace/pulse"
         - PolicyName: Observability
           PolicyDocument:
             Version: "2012-10-17"

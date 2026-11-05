@@ -164,6 +164,50 @@ Conditions:
 # -------------------------------------------------------------------
 # Resources
 # -------------------------------------------------------------------
+Mappings:
+  # Shared fixed-channel probe implementation; both roles execute identical code.
+  RealtimeProbeCode:
+    Python:
+      Source: |
+        """Publish a fixed integration event with this Lambda's role credentials."""
+        import json
+        import os
+        import urllib.error
+        import urllib.request
+
+        import boto3
+        from botocore.auth import SigV4Auth
+        from botocore.awsrequest import AWSRequest
+
+        def lambda_handler(event, context):
+            # Ignore invocation input: the probe cannot target customer channels.
+            url = os.environ["REALTIME_HTTP_ENDPOINT"].rstrip("/") + "/event"
+            payload = json.dumps({
+                "channel": "/pulse/integration/authorization",
+                "events": [json.dumps({"probe": "realtime-authorization"})],
+            }).encode()
+            request = AWSRequest(
+                method="POST", url=url, data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            credentials = boto3.Session().get_credentials().get_frozen_credentials()
+            SigV4Auth(credentials, "appsync", os.environ["AWS_REGION"]).add_auth(request)
+            http = urllib.request.Request(
+                url, data=payload, headers=dict(request.headers.items()), method="POST"
+            )
+            try:
+                with urllib.request.urlopen(http, timeout=5) as response:
+                    result = json.loads(response.read())
+                    return {
+                        "httpStatus": response.status,
+                        "successful": len(result.get("successful", [])),
+                        "failed": len(result.get("failed", [])),
+                    }
+            except urllib.error.HTTPError as error:
+                # Never return signing headers, tokens, or arbitrary server text.
+                error.close()
+                return {"httpStatus": error.code, "successful": 0}
+
 Resources:
 
   # =================================================================
@@ -295,8 +339,7 @@ Resources:
               - Effect: Allow
                 Action: "appsync:EventPublish"
                 Resource:
-                  - !GetAtt PulseRealtimeEventApi.ApiArn
-                  - !Sub "${PulseRealtimeEventApi.ApiArn}/*"
+                  - !Sub "${PulseRealtimeEventApi.ApiArn}/channelNamespace/pulse"
         - PolicyName: Observability
           PolicyDocument:
             Version: "2012-10-17"
@@ -496,6 +539,13 @@ Resources:
       # stage segment in the path.
       StageName: "v1"
       AutoDeploy: true
+      # Reuse the API's existing log group; never include credentials or bodies.
+      AccessLogSettings:
+        DestinationArn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackPrefix}-api"
+        Format: '{"service":"pulse-api-gateway","requestId":"$context.requestId","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","status":"$context.status","responseLength":"$context.responseLength","integrationLatency":"$context.integrationLatency"}'
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 100
+        ThrottlingRateLimit: 50
       Tags:
         Project: StayOS
         resilience-tier: business-critical
@@ -713,17 +763,18 @@ Resources:
     Properties:
       Name: !Sub "${StackPrefix}-realtime"
       EventConfig:
-        # Cognito (LUMI user pool) authorizes connect / subscribe / publish so
-        # realtime clients reuse the same JWT they already hold.
+        # Browsers connect/subscribe with Cognito; only IAM backend callers
+        # publish. Namespace-scoped role policies authorize those publishers.
         AuthProviders:
           - AuthType: AMAZON_COGNITO_USER_POOLS
             CognitoConfig:
               UserPoolId: !Ref UserPoolId
               AwsRegion: !Ref "AWS::Region"
+          - AuthType: AWS_IAM
         ConnectionAuthModes:
           - AuthType: AMAZON_COGNITO_USER_POOLS
         DefaultPublishAuthModes:
-          - AuthType: AMAZON_COGNITO_USER_POOLS
+          - AuthType: AWS_IAM
         DefaultSubscribeAuthModes:
           - AuthType: AMAZON_COGNITO_USER_POOLS
         LogConfig:
@@ -749,7 +800,7 @@ Resources:
       SubscribeAuthModes:
         - AuthType: AMAZON_COGNITO_USER_POOLS
       PublishAuthModes:
-        - AuthType: AMAZON_COGNITO_USER_POOLS
+        - AuthType: AWS_IAM
       CodeHandlers: |
         import { util } from '@aws-appsync/utils';
 
@@ -870,6 +921,60 @@ Resources:
           return ctx.events;
         }
 
+  # Demo-only regression probes validate real Lambda role credentials without
+  # touching hotel data or broadcasting into users' alert feeds. No schedules,
+  # public endpoints, or resource-based invoke permissions are attached.
+  PulseRealtimePublishProbe:
+    Type: AWS::Lambda::Function
+    Condition: ShouldEnableDemoSimulator
+    Properties:
+      FunctionName: !Sub "${StackPrefix}-realtime-publish-probe"
+      Description: Demo realtime publishing authorization regression probe
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 15
+      MemorySize: 128
+      Role: !GetAtt PulseApiRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref PulseApiLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          REALTIME_HTTP_ENDPOINT: !Sub "https://${PulseRealtimeEventApi.Dns.Http}"
+      Code:
+        ZipFile: !FindInMap [RealtimeProbeCode, Python, Source]
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: Component
+          Value: realtime-validation
+
+  PulseRealtimeDeniedProbe:
+    Type: AWS::Lambda::Function
+    Condition: ShouldEnableDemoSimulator
+    Properties:
+      FunctionName: !Sub "${StackPrefix}-realtime-denied-probe"
+      Description: Demo unrelated-role publishing denial regression probe
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 15
+      MemorySize: 128
+      # The read-only facade role has no AppSync publishing grant.
+      Role: !GetAtt PulseOpsReadRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref PulseOpsReadLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          REALTIME_HTTP_ENDPOINT: !Sub "https://${PulseRealtimeEventApi.Dns.Http}"
+      Code:
+        ZipFile: !FindInMap [RealtimeProbeCode, Python, Source]
+      Tags:
+        - Key: Project
+          Value: StayOS
+        - Key: Component
+          Value: realtime-validation
+
   # Associate the LUMI WAF web ACL with the AppSync Events API (supported for
   # AppSync). Only created when a web ACL ARN is supplied.
   PulseRealtimeWafAssociation:
@@ -959,8 +1064,7 @@ Resources:
               - Effect: Allow
                 Action: "appsync:EventPublish"
                 Resource:
-                  - !GetAtt PulseRealtimeEventApi.ApiArn
-                  - !Sub "${PulseRealtimeEventApi.ApiArn}/*"
+                  - !Sub "${PulseRealtimeEventApi.ApiArn}/channelNamespace/pulse"
         # Read the shared gateway endpoint and the triage runtime config params
         # from SSM (the deploy step sets container env from these).
         - PolicyName: SsmConfigRead
@@ -1195,8 +1299,7 @@ Resources:
               - Effect: Allow
                 Action: "appsync:EventPublish"
                 Resource:
-                  - !GetAtt PulseRealtimeEventApi.ApiArn
-                  - !Sub "${PulseRealtimeEventApi.ApiArn}/*"
+                  - !Sub "${PulseRealtimeEventApi.ApiArn}/channelNamespace/pulse"
         # CloudWatch Logs - the forecaster emits its structured JSON logs to
         # the shared unified pipeline log group (/pulse/pipeline), AND its
         # container stdout/stderr is captured by the AgentCore Runtime into the

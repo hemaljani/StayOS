@@ -38,6 +38,9 @@ shared/data-orchestrator/build/
 # Local-only deployment bug journal (working notes, not tracked).
 docs/bugs.md
 
+# Local deployment review and account-specific validation records.
+/AWS_WELL_ARCHITECTED_REVIEW.md
+
 # Logs
 logs
 *.log

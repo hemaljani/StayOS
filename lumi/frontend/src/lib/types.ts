@@ -96,6 +96,7 @@ export interface AudioBrief {
   durationSeconds: number;
   status: 'READY' | 'GENERATING' | 'FAILED' | 'TEXT_ONLY';
   audioUrl?: string;
+  audioUrlExpiresAt?: string;
   transcriptSnippet?: string;
 }
 

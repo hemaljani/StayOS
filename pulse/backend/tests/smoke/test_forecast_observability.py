@@ -3,7 +3,7 @@
 Single-execution CloudFormation assertions that the predictive-forecasting
 agent is observable end-to-end:
 
-    * three log metric filters on the shared ``/${StackPrefix}/pipeline`` log
+    * four log metric filters on the shared ``/${StackPrefix}/pipeline`` log
       group derive the forecast run-outcome counters into ``PULSE/Pipeline``,
     * the two forecast alarms fire into the ``pulse-alarms`` SNS topic,
     * the ``pulse-overview`` dashboard renders the forecast run-outcome widget,
@@ -46,6 +46,10 @@ def _xray_actions(role_properties: dict[str, Any]) -> set[str]:
     """
     actions: set[str] = set()
     for policy in role_properties.get("Policies", []):
+        if "If" in policy:
+            # Inspect the configured-runtime branch. Observability permissions
+            # remain unconditional and must also be present when it is absent.
+            policy = policy["If"][1]
         for statement in policy["PolicyDocument"]["Statement"]:
             action = statement.get("Action", [])
             # Action may be a single string or a list; normalize to a list.
@@ -61,7 +65,7 @@ def _xray_actions(role_properties: dict[str, Any]) -> set[str]:
 def test_forecast_metric_filters_on_pipeline_log_group(
     pulse_observability_template: dict[str, Any],
 ) -> None:
-    """The three forecast metric filters derive PULSE/Pipeline counters.
+    """The four forecast metric filters derive PULSE/Pipeline counters.
 
     Each filter lives on the shared ``/${StackPrefix}/pipeline`` log group and
     increments its named count metric in the ``PULSE/Pipeline`` namespace.
@@ -73,6 +77,7 @@ def test_forecast_metric_filters_on_pipeline_log_group(
     # logical id -> expected derived metric name.
     expected_filters = {
         "ForecastRunFailureMetricFilter": "ForecastRunFailures",
+        "ForecastRunCompletedMetricFilter": "ForecastRunCompleted",
         "ForecastToolExhaustedMetricFilter": "ForecastToolExhausted",
         "ForecastNoAlertMetricFilter": "ForecastNoAlert",
     }
@@ -138,7 +143,12 @@ def test_dashboard_includes_forecast_widget(
     ]
     body = _sub_value(dashboard["DashboardBody"])
 
-    for metric in ("ForecastRunFailures", "ForecastToolExhausted", "ForecastNoAlert"):
+    for metric in (
+        "ForecastRunFailures",
+        "ForecastRunCompleted",
+        "ForecastToolExhausted",
+        "ForecastNoAlert",
+    ):
         assert metric in body, f"dashboard missing {metric} on the forecast widget"
 
 

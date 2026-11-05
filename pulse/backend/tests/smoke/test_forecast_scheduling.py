@@ -246,6 +246,40 @@ def test_invoker_function_definition(pulse_pipeline_template: dict[str, Any]) ->
     assert props.get("TracingConfig", {}).get("Mode") == "Active", (
         "invoker TracingConfig.Mode must be Active"
     )
+    assert props["Handler"] == "pulse.forecast_invoker.lambda_handler"
+    # Wait for the forecast's JSON result, not just an accepted invocation.
+    from pulse.forecast_invoker import BOTO_CONFIG
+
+    assert props["Timeout"] > (
+        BOTO_CONFIG.retries["total_max_attempts"]
+        * (BOTO_CONFIG.read_timeout + BOTO_CONFIG.connect_timeout)
+    )
+
+
+def test_invoker_role_grants_only_configured_runtime(
+    pulse_pipeline_template: dict[str, Any],
+) -> None:
+    """Only the configured runtime and DEFAULT endpoint receive invocation."""
+    policies = _resources(pulse_pipeline_template)["PulseForecasterInvokerRole"][
+        "Properties"
+    ]["Policies"]
+    conditional_policy = next(policy["If"] for policy in policies if "If" in policy)
+    condition, granted, absent = conditional_policy
+    assert condition == "HasForecastRuntimeArn"
+    assert pulse_pipeline_template["Conditions"][condition] == {
+        "Not": [{"Equals": [{"Ref": "ForecastAgentRuntimeArn"}, ""]}]
+    }
+    assert absent == {"Ref": "AWS::NoValue"}
+    assert granted["PolicyDocument"]["Statement"] == [
+        {
+            "Effect": "Allow",
+            "Action": "bedrock-agentcore:InvokeAgentRuntime",
+            "Resource": [
+                {"Ref": "ForecastAgentRuntimeArn"},
+                {"Sub": "${ForecastAgentRuntimeArn}/runtime-endpoint/DEFAULT"},
+            ],
+        }
+    ]
 
 
 def test_scheduler_role_trust_and_scoped_invoke(

@@ -22,3 +22,6 @@ smithy-http[awscrt]==0.5.0
 # Structured logging (Powertools Logger works outside Lambda context)
 # Provides structured JSON logging with context enrichment for CloudWatch Logs
 aws-lambda-powertools>=2.30.0
+
+# Verify Cognito RS256 JWTs locally before GetUser and bind OAuth identity.
+pyjwt[crypto]==2.15.0

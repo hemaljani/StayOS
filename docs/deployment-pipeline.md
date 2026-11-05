@@ -27,6 +27,7 @@ and write, see [`data-model.md`](data-model.md).
 - [Deployment output and logs](#deployment-output-and-logs)
 - [How the root Makefile is structured](#how-the-root-makefile-is-structured)
 - [Focused voice upgrade](#focused-voice-upgrade)
+- [Focused forecast invoker release](#focused-forecast-invoker-release)
 - [Failure recovery](#failure-recovery)
 - [Teardown](#teardown)
   - [Why the order reverses](#why-the-order-reverses)
@@ -596,6 +597,47 @@ Rollback updates the existing parent stack through the same guarded
 CloudFormation deploy preview and restores the old image as a new runtime
 version. Verify the previous voice functionality with the microphone before
 calling rollback complete.
+
+## Focused forecast invoker release
+
+For an existing PULSE deployment, `make deploy-forecast-invoker` releases only
+the forecast invoker repair. It captures deployed templates, preserves every
+existing parameter, builds a uniquely named ZIP with the existing CodeBuild
+project, and applies the update through the root nested CloudFormation stack.
+It does not run data seeds or refresh the other PULSE Lambdas.
+
+Run these phases in the project's Python 3.12 environment so `python3` resolves
+to the supported interpreter. Set `PROFILE`, `CLOUDFORMATION_PROFILE`, `REGION`,
+`EXPECTED_ACCOUNT_ID`, and
+`FORECAST_RELEASE_DIR` explicitly. Use the same release directory for each
+phase:
+
+```sh
+make deploy-forecast-invoker FORECAST_RELEASE_PHASE=prepare
+make deploy-forecast-invoker FORECAST_RELEASE_PHASE=preview
+make deploy-forecast-invoker FORECAST_RELEASE_PHASE=deploy
+# After the root stack reaches UPDATE_COMPLETE:
+make deploy-forecast-invoker FORECAST_RELEASE_PHASE=verify
+```
+
+`prepare` uploads source and builds the ZIP; if observation is interrupted,
+`FORECAST_RELEASE_PHASE=finish-build` polls the recorded build without
+starting another. The build imports the final archive's handler on Amazon
+Linux/Python 3.12. `preview` runs `aws cloudformation deploy` without execution
+and inspects a nested change set. It refuses unrelated resource changes or
+replacements. The allowed leaves are the forecast Lambda and role, the backend
+build specification, the completion metric filter, and the existing dashboard.
+`deploy` executes the reviewed nested change set. `verify` checks the deployed
+handler, timeout, runtime ARN, ZIP hash, and every other PULSE Lambda's unchanged
+code hash and handler.
+
+The release directory retains templates, build identifiers, change-set
+evidence, and the built archive. Keep it for validation and recovery. The
+verification phase checks deployment configuration; integration testing still
+requires an explicit invocation of the deployed forecast Lambda. That
+invocation can reconcile forecast alerts for the selected property, so use the
+intended test deployment. A no-alert result alone does not prove that all
+forecasting input data is evaluable. No phase commits or pushes to GitHub.
 
 ## Failure recovery
 

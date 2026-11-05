@@ -434,8 +434,12 @@ Resources:
                   - bedrock:InvokeModel
                   - bedrock:InvokeModelWithResponseStream
                 Resource:
-                  - "arn:aws:bedrock:*::foundation-model/anthropic.*"
-                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AccountId}:inference-profile/*"
+                  # The installed US inference profile routes to these three
+                  # regions. Other model families and profiles are denied.
+                  - "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-6"
+                  - "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-sonnet-4-6"
+                  - "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-sonnet-4-6"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AccountId}:inference-profile/us.anthropic.claude-sonnet-4-6"
         # AgentCore Gateway invocation for MCP tool calls
         - PolicyName: AgentCoreGateway
           PolicyDocument:
@@ -445,7 +449,7 @@ Resources:
                 Action:
                   - bedrock-agentcore:InvokeGateway
                 Resource:
-                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AccountId}:gateway/*"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AccountId}:gateway/${StackPrefix}-gateway-*"
         # Cognito GetUser to validate Access Tokens and extract user claims
         - PolicyName: CognitoGetUser
           PolicyDocument:

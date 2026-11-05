@@ -35,7 +35,12 @@ def mock_cognito_client() -> MagicMock:
     Yields:
         MagicMock representing the cognito-idp client.
     """
-    with patch("identity_resolver._cognito_client") as mock_client:
+    # Attribute/error tests isolate GetUser; real JWT/transport tests live in
+    # test_identity_authorization.py and exercise both agent packages.
+    with patch("identity_resolver._cognito_client") as mock_client, patch(
+        "identity_resolver._validate_session_tokens",
+        return_value={"sub": "user-uuid-12345"},
+    ):
         # Create exception classes that behave like boto3 typed exceptions.
         # These are classes (not instances) attached to client.exceptions.
         mock_client.exceptions.NotAuthorizedException = type(

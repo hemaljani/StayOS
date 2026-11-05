@@ -14,6 +14,7 @@ import boto3
 from aws_lambda_powertools import Logger, Tracer
 
 from exceptions import BriefNotFoundException, ForbiddenError, ValidationError
+from audio_signing import sign_brief_audio
 from router import route
 
 # Module-level clients for connection reuse per PYQUALITY-06
@@ -65,19 +66,14 @@ def _validate_property_ownership(event: Dict[str, Any], property_id: str) -> Non
         raise ForbiddenError("You do not have access to this property's brief")
 
 
-def _attach_audio_url(brief: Dict[str, Any]) -> None:
-    """Construct and attach the CloudFront audio URL to a brief record.
-
-    Mutates the brief dict in place, adding an audioUrl field to the
-    audioBrief object if an s3Key and CloudFront domain are available.
-
-    Args:
-        brief: Full brief record from DynamoDB.
-    """
+def _attach_audio_url(brief: Dict[str, Any], property_id: str) -> None:
+    """Replace stored URLs with a fresh capability after property authorization."""
     audio_brief = brief.get("audioBrief", {})
-    if audio_brief.get("s3Key") and AUDIO_CLOUDFRONT_DOMAIN:
-        audio_brief["audioUrl"] = (
-            f"https://{AUDIO_CLOUDFRONT_DOMAIN}/{audio_brief['s3Key']}"
+    audio_brief.pop("audioUrl", None)
+    audio_brief.pop("audioUrlExpiresAt", None)
+    if audio_brief.get("s3Key"):
+        audio_brief["audioUrl"], audio_brief["audioUrlExpiresAt"] = sign_brief_audio(
+            AUDIO_CLOUDFRONT_DOMAIN, audio_brief["s3Key"], property_id
         )
 
 
@@ -130,7 +126,7 @@ def get_brief_by_date(event: Dict[str, Any], params: Dict[str, str]) -> Dict[str
     if not item:
         raise BriefNotFoundException(property_id)
 
-    _attach_audio_url(item)
+    _attach_audio_url(item, property_id)
 
     logger.info(
         "Dated brief retrieved successfully",
@@ -185,7 +181,7 @@ def get_brief(event: Dict[str, Any], params: Dict[str, str]) -> Dict[str, Any]:
         raise BriefNotFoundException(property_id)
 
     brief = items[0]
-    _attach_audio_url(brief)
+    _attach_audio_url(brief, property_id)
 
     logger.info(
         "Brief retrieved successfully",

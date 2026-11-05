@@ -17,8 +17,8 @@
 //
 // Reconnect uses exponential backoff with jitter; on each (re)subscribe the
 // caller reconciles missed state via GET /alerts so no update is lost during a
-// gap. When realtime config is missing the client stays disconnected and the UI
-// falls back to manual refresh (design Component 6 graceful fallback).
+// gap. The hook also reconciles periodically to recover an event that never
+// reached AppSync while the socket stayed connected.
 
 import { authFetch } from './api';
 import { getIdToken } from './auth';
@@ -150,6 +150,7 @@ export class RealtimeClient {
     this.stopped = true;
     this.clearTimers();
     this.subscriptions.clear();
+    this.handlers.onConnectionChange?.(false);
     if (this.socket) {
       try {
         this.socket.close();
@@ -161,6 +162,9 @@ export class RealtimeClient {
   }
 
   private connect(): void {
+    if (this.socket && (
+      this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING
+    )) return;
     const auth = this.authObject();
     if (!auth) {
       // No credential: cannot open an authorized socket. The UI keeps its manual
@@ -175,15 +179,22 @@ export class RealtimeClient {
       return;
     }
 
-    this.socket.onopen = () => {
+    const socket = this.socket;
+    socket.onopen = () => {
+      if (this.socket !== socket) return;
       // Initiate the session; the server replies with connection_ack.
       this.send({ type: 'connection_init' });
     };
-    this.socket.onmessage = (event) => this.handleMessage(event);
-    this.socket.onerror = () => {
+    socket.onmessage = (event) => {
+      if (this.socket === socket) this.handleMessage(event);
+    };
+    socket.onerror = () => {
       // onclose follows; reconnect is scheduled there.
     };
-    this.socket.onclose = () => {
+    socket.onclose = () => {
+      if (this.socket !== socket) return;
+      this.socket = null;
+      this.subscriptions.clear();
       this.handlers.onConnectionChange?.(false);
       this.clearKaTimer();
       if (!this.stopped) this.scheduleReconnect();
@@ -202,8 +213,6 @@ export class RealtimeClient {
     if (type === 'connection_ack') {
       const timeout = Number(message.connectionTimeoutMs);
       this.connectionTimeoutMs = Number.isFinite(timeout) && timeout > 0 ? timeout : DEFAULT_CONNECTION_TIMEOUT_MS;
-      this.backoffAttempt = 0;
-      this.handlers.onConnectionChange?.(true);
       this.resetKaTimer();
       this.subscribeAll();
       return;
@@ -214,17 +223,25 @@ export class RealtimeClient {
       return;
     }
     if (type === 'subscribe_success') {
-      // A subscription is active; reconcile any state missed during the gap.
-      this.handlers.onResubscribe();
+      // A handshake alone does not mean the feed is subscribed. Reconcile
+      // once for the broadcast subscription, rather than once per channel.
+      if (this.subscriptions.get(String(message.id)) === 'broadcast') {
+        this.backoffAttempt = 0;
+        this.handlers.onConnectionChange?.(true);
+        this.handlers.onResubscribe();
+      }
       return;
     }
     if (type === 'data') {
       this.handleData(message);
       return;
     }
-    // subscribe_error / broadcast_error: log and let backoff/reconnect handle it.
+    // Operation errors do not automatically close the socket. Explicitly
+    // reconnect so a rejected subscription cannot stay falsely "live".
     if (type === 'subscribe_error' || type === 'broadcast_error') {
-      console.warn('[realtime] operation error', message);
+      console.warn('[realtime] operation error', type);
+      this.handlers.onConnectionChange?.(false);
+      this.socket?.close();
     }
   }
 
@@ -258,7 +275,10 @@ export class RealtimeClient {
     }
     if (!obj || typeof obj !== 'object') return null;
     const candidate = obj as Partial<RealtimeAlertEvent>;
-    if (!candidate.eventType || !candidate.alertId || !candidate.propertyId) return null;
+    if (
+      !['ALERT_CREATED', 'ALERT_UPDATED', 'ALERT_RESOLVED'].includes(candidate.eventType ?? '') ||
+      !candidate.alertId || candidate.propertyId !== this.propertyId
+    ) return null;
     return candidate as RealtimeAlertEvent;
   }
 

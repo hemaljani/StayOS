@@ -18,6 +18,7 @@ backend/
 │   ├── delivery/             # AppSync Events realtime + Web Push + INFO batcher
 │   ├── action_executor/      # GM-approved write-backs (closed loop)
 │   ├── demo_simulator/       # deterministic operational-data mutations (demo)
+│   ├── forecast_invoker.py   # Scheduler -> validated AgentCore forecast result
 │   └── api/                  # REST API business logic
 └── tests/                    # pytest + Hypothesis, mirrors src/pulse/
 ```
@@ -43,6 +44,38 @@ pytest                      # run the test suite
 The `src` layout plus `pythonpath = ["src"]` in `pyproject.toml` means `pytest`
 resolves `import pulse` without a build step; an editable install (`pip install
 -e .`) additionally makes `python -c "import pulse"` work anywhere.
+
+### Forecast invocation validation
+
+The shared Lambda archive includes `pulse.forecast_invoker.lambda_handler`.
+CodeBuild imports this handler from the final ZIP before uploading it, so an
+omitted module fails the build. The handler initializes its AWS client on first
+invocation, then reuses it across warm invocations.
+
+`FORECAST_AGENT_RUNTIME_ARN` selects the runtime; an empty value explicitly skips
+forecasting during initial deployment. The invocation role grants access to
+that exact runtime and its `DEFAULT` endpoint once configured. The handler
+consumes the JSON response and raises on runtime failures, rejected requests,
+invalid summaries, or incomplete streams. A completed result includes the
+property, unique session ID, UTC completion timestamp, and forecast counts.
+`completedAt` records invocation completion; it does not define the forecast's
+business date.
+
+Run the forecast and infrastructure checks from this directory:
+
+```sh
+pytest tests/forecast tests/smoke -q
+```
+
+The invoker emits `Forecast invocation completed` or `Forecast run failure`
+into the pipeline log group. The forecast dashboard displays completion and
+failure counts. A completed no-alert run verifies the invocation path; forecast
+data quality still depends on the runtime's data contract.
+
+Use the repository's documented deployment entry point to apply the package,
+handler configuration, IAM permissions, timeout, and observability template
+together. These local checks do not invoke the deployed runtime or prove that
+the deployed configuration has changed.
 
 ## Conventions
 

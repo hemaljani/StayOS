@@ -2,10 +2,10 @@
 // LUMI is served under /lumi on the shared StayOS origin, so all app paths are
 // prefixed with /lumi. This worker is registered with scope /lumi/.
 
-const STATIC_CACHE = 'stayos-static-v2';
-const API_CACHE = 'stayos-api-v1';
-const AUDIO_CACHE = 'stayos-audio-v2';
-const ALL_CACHES = [STATIC_CACHE, API_CACHE, AUDIO_CACHE];
+const STATIC_CACHE = 'stayos-static-v3';
+// Authenticated responses and audio capabilities must reach their authorizers,
+// including while offline; Cache API storage ignores HTTP no-store directives.
+const LEGACY_PRIVATE_CACHES = ['stayos-api-v1', 'stayos-audio-v1', 'stayos-audio-v2'];
 
 // Static assets to precache on install (under the /lumi base path). NOTE: we do
 // NOT precache the HTML document ('/lumi/') - HTML is always fetched network-first
@@ -34,7 +34,9 @@ self.addEventListener('activate', (event) => {
     caches.keys().then((cacheNames) => {
       return Promise.all(
         cacheNames
-          .filter((name) => !ALL_CACHES.includes(name))
+          .filter((name) =>
+            LEGACY_PRIVATE_CACHES.includes(name) ||
+            ['stayos-static-v1', 'stayos-static-v2'].includes(name))
           .map((name) => caches.delete(name))
       );
     })
@@ -62,15 +64,15 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // API responses: network-first with cache fallback
+  // Never serve another user's brief or an expired capability from local cache.
   if (url.pathname.includes('/v1/briefs/')) {
-    event.respondWith(networkFirstWithCache(request, API_CACHE));
+    event.respondWith(fetch(request, { cache: 'no-store' }));
     return;
   }
 
-  // Audio files: network-first (briefs update daily, must serve latest)
+  // CloudFront must authorize every new audio request, even after cache hits.
   if (url.pathname.endsWith('.mp3')) {
-    event.respondWith(networkFirstWithCache(request, AUDIO_CACHE));
+    event.respondWith(fetch(request, { cache: 'no-store' }));
     return;
   }
 
@@ -134,27 +136,6 @@ async function cacheFirst(request, cacheName) {
   } catch {
     // Return a basic offline response for non-critical assets
     return new Response('', { status: 503, statusText: 'Offline' });
-  }
-}
-
-// Network-first strategy: try network, fall back to cache
-async function networkFirstWithCache(request, cacheName) {
-  try {
-    const response = await fetch(request);
-    if (response.ok) {
-      const cache = await caches.open(cacheName);
-      cache.put(request, response.clone());
-    }
-    return response;
-  } catch {
-    const cached = await caches.match(request);
-    if (cached) {
-      return cached;
-    }
-    return new Response(
-      JSON.stringify({ error: { code: 'OFFLINE', message: 'No cached data available' } }),
-      { status: 503, headers: { 'Content-Type': 'application/json' } }
-    );
   }
 }
 

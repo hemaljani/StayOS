@@ -320,6 +320,11 @@ def test_appsync_events_api_cognito_auth_and_logging(
         provider["AuthType"] for provider in event_config["AuthProviders"]
     }
     assert "AMAZON_COGNITO_USER_POOLS" in auth_types
+    assert "AWS_IAM" in auth_types
+    assert event_config["DefaultPublishAuthModes"] == [{"AuthType": "AWS_IAM"}]
+    assert event_config["DefaultSubscribeAuthModes"] == [
+        {"AuthType": "AMAZON_COGNITO_USER_POOLS"}
+    ]
 
     cognito_config = event_config["AuthProviders"][0]["CognitoConfig"]
     assert cognito_config["UserPoolId"] == {"Ref": "UserPoolId"}
@@ -349,7 +354,7 @@ def test_appsync_pulse_namespace_has_subscribe_publish_handlers(
     }
     publish_modes = {mode["AuthType"] for mode in namespace["PublishAuthModes"]}
     assert "AMAZON_COGNITO_USER_POOLS" in subscribe_modes
-    assert "AMAZON_COGNITO_USER_POOLS" in publish_modes
+    assert publish_modes == {"AWS_IAM"}
 
     handlers = namespace["CodeHandlers"]
     assert "onSubscribe" in handlers

@@ -5,6 +5,14 @@ import sys
 from unittest.mock import Mock
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+
+@pytest.fixture(scope="session")
+def audio_test_private_key():
+    """Ephemeral test-only signing material; never written to disk or logged."""
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
 # The dataset_generator submodules that must resolve to their REAL
 # implementations for every test. Older test modules stubbed these with
@@ -53,7 +61,7 @@ def real_dataset_generator_modules() -> None:
 
 
 @pytest.fixture(autouse=True)
-def aws_environment_variables(monkeypatch: pytest.MonkeyPatch) -> None:
+def aws_environment_variables(monkeypatch: pytest.MonkeyPatch, audio_test_private_key) -> None:
     """Set mock AWS environment variables for all tests.
 
     This fixture ensures Lambda function code that reads environment
@@ -63,6 +71,15 @@ def aws_environment_variables(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SETTINGS_TABLE_NAME", "stayos-settings-test")
     monkeypatch.setenv("AUDIO_BUCKET_NAME", "stayos-audio-test-000000000000")
     monkeypatch.setenv("AUDIO_CLOUDFRONT_DOMAIN", "d1234567890.cloudfront.net")
+    monkeypatch.setenv("AUDIO_SIGNING_KEY_ID", "TESTKEY")
+    monkeypatch.setenv(
+        "AUDIO_SIGNING_PRIVATE_KEY",
+        audio_test_private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode(),
+    )
     monkeypatch.setenv("COGNITO_USER_POOL_ID", "us-east-1_TestPool")
     monkeypatch.setenv("BEDROCK_MODEL_ID", "amazon.claude-3-5-sonnet-20241022-v2:0")
     monkeypatch.setenv("SPOG_API_ENDPOINT", "https://spog-api.test.example.com")

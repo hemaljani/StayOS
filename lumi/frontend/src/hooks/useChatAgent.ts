@@ -2,8 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getIdToken, getAccessToken } from '@/lib/auth';
-import { getIdentityPoolCredentials } from '@/lib/identityPool';
-import { generatePresignedWsUrl } from '@/lib/sigv4WebSocket';
+import { openAgentWebSocket } from '@/lib/agentWebSocket';
 import { CHAT_RUNTIME_ARN, AWS_REGION } from '@/lib/constants';
 
 /**
@@ -96,8 +95,8 @@ function generateMessageId(): string {
  * Custom React hook managing a text chat session with the StayOS chat
  * agent via WebSocket.
  *
- * Handles the full lifecycle: WebSocket connection (SigV4-signed via
- * Cognito Identity Pool credentials), sending user messages, streaming
+ * Handles the full lifecycle: WebSocket connection authenticated with Cognito
+ * OAuth, sending user messages, streaming
  * assistant response chunks into accumulated messages, and tracking
  * typing/connection state.
  *
@@ -234,16 +233,12 @@ export function useChatAgent(): UseChatAgentReturn {
     // Transition to connecting state
     setState((s) => ({ ...s, status: 'connecting', error: null }));
 
-    // Exchange the ID token for temporary AWS credentials via Cognito Identity Pool
-    let wsUrl: string;
+    // Bind transport and first-message identity to the same signed-in user.
+    let ws: WebSocket;
     try {
-      const credentials = await getIdentityPoolCredentials(idToken);
-
-      // Generate a SigV4 presigned WebSocket URL for the chat agent endpoint
-      // (URL expires in 300s but connection persists once established)
-      wsUrl = await generatePresignedWsUrl(CHAT_RUNTIME_ARN, credentials, AWS_REGION);
+      ws = openAgentWebSocket(CHAT_RUNTIME_ARN, accessToken, AWS_REGION);
     } catch (err: unknown) {
-      // Credential exchange or SigV4 signing failed — show error
+      // Surface connection setup failure without logging token material.
       const message =
         err instanceof Error
           ? err.message
@@ -253,14 +248,12 @@ export function useChatAgent(): UseChatAgentReturn {
       return;
     }
 
-    // Open the WebSocket connection to the chat agent (SigV4 auth is in the URL query params)
-    const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
     ws.onopen = () => {
       isConnectedRef.current = true;
       // Send Access Token as first message for identity verification by the agent container
-      // (the chat agent uses SigV4 for transport auth; this identifies which GM is chatting)
+      // The agent binds this message to the OAuth handshake principal.
       ws.send(JSON.stringify({ type: 'identity', accessToken }));
     };
 

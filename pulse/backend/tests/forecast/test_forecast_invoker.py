@@ -1,59 +1,28 @@
-"""Example tests for the PULSE Forecaster invoker Lambda (``pulse-forecaster-invoker``).
-
-These integration-style example tests exercise the scheduling -> invocation hop
-at ``functions/forecast-invoker/lambda_function.py`` (design Testing Strategy ->
-Integration tests). They assert Requirement 1.4: a single ``{propertyId}``
-Scheduler event triggers exactly one ``bedrock-agentcore:InvokeAgentRuntime``
-start-session call carrying that ``propertyId`` as the session payload.
-
-The invoker lives under ``functions/forecast-invoker`` (a hyphenated directory,
-so not an importable package on the pytest path). It is therefore loaded by file
-path via ``importlib.util.spec_from_file_location``. The module builds its
-``bedrock-agentcore`` client at import time as a module-level attribute
-(``_agentcore_client``); the tests replace that attribute with a recording fake
-after import so no network connection is ever opened and no real boto3 client is
-constructed. ``FORECAST_AGENT_RUNTIME_ARN`` is set before each handler call since
-the handler reads it from the environment.
-"""
+"""Forecast invocation tests with real SDK response streams and no AWS calls."""
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
+import io
 import json
-from pathlib import Path
+from datetime import datetime
 from types import ModuleType
 from typing import Any, Optional
 
+import boto3
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, IncompleteReadError
+from botocore.response import StreamingBody
+from botocore.stub import ANY, Stubber
 
-# Path to the invoker module, resolved relative to this test file:
-# tests/forecast/ -> backend/ -> functions/forecast-invoker/lambda_function.py.
-_INVOKER_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "functions"
-    / "forecast-invoker"
-    / "lambda_function.py"
-)
-
-# A representative AgentCore Runtime ARN used as the FORECAST_AGENT_RUNTIME_ARN
-# test value (never a real deployed ARN).
 _RUNTIME_ARN = (
-    "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/pulse-forecaster-abc"
+    "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+    "runtime/pulse_forecaster-Abc1234567"
 )
-
-# A valid Scheduler target input: a single property identifier.
 _PROPERTY_ID = "ALOHA-CHI-001"
 
 
 class _FakeLambdaContext:
-    """A minimal Lambda context for the Powertools inject_lambda_context decorator.
-
-    The handler is wrapped with ``@logger.inject_lambda_context``, which reads
-    these attributes off the context to enrich log records. A real Scheduler
-    invocation supplies them; the tests supply this stand-in instead of ``None``.
-    """
-
     function_name = "pulse-forecaster-invoker"
     memory_limit_in_mb = 128
     invoked_function_arn = (
@@ -62,130 +31,319 @@ class _FakeLambdaContext:
     aws_request_id = "test-request-id-0001"
 
 
+def _summary(**overrides: Any) -> dict[str, Any]:
+    return {
+        "propertyId": _PROPERTY_ID,
+        "predictionsWritten": 2,
+        "resolved": 1,
+        "noAlert": False,
+        **overrides,
+    }
+
+
+def _response(
+    summary: Any, *, status: int = 200, content_type: str = "application/json"
+) -> dict[str, Any]:
+    raw = summary if isinstance(summary, bytes) else json.dumps(summary).encode()
+    return {
+        "statusCode": status,
+        "contentType": content_type,
+        "response": StreamingBody(io.BytesIO(raw), len(raw)),
+    }
+
+
 class _FakeAgentCoreClient:
-    """A fake ``bedrock-agentcore`` client recording invoke_agent_runtime calls.
-
-    Attributes:
-        calls: The recorded InvokeAgentRuntime keyword-argument dicts, in order.
-    """
-
-    def __init__(self, error: Optional[Exception] = None) -> None:
-        """Initialize the fake.
-
-        Args:
-            error: Optional exception to raise on invocation, to simulate an
-                InvokeAgentRuntime/API failure.
-        """
+    def __init__(
+        self,
+        error: Optional[Exception] = None,
+        response: Optional[dict[str, Any]] = None,
+    ) -> None:
         self.calls: list[dict[str, Any]] = []
         self._error = error
+        self.response = response if response is not None else _response(_summary())
 
     def invoke_agent_runtime(self, **kwargs: Any) -> dict[str, Any]:
-        """Record the call and optionally raise the configured error.
-
-        Args:
-            **kwargs: The InvokeAgentRuntime keyword arguments the handler sends.
-
-        Returns:
-            A minimal stand-in response (the handler does not read it).
-
-        Raises:
-            Exception: The configured error, if any.
-        """
         self.calls.append(kwargs)
         if self._error is not None:
             raise self._error
-        # Minimal response mirroring the real dict-with-streaming-body shape; the
-        # handler never reads it, so an object placeholder is sufficient.
-        return {"statusCode": 200, "response": object()}
-
-
-def _load_invoker_module() -> ModuleType:
-    """Load the forecast-invoker ``lambda_function`` module by file path.
-
-    The invoker directory is hyphenated and thus not importable as a package, so
-    the module is loaded directly from its source file.
-
-    Returns:
-        The loaded ``lambda_function`` module object.
-    """
-    spec = importlib.util.spec_from_file_location(
-        "forecast_invoker_lambda_function", _INVOKER_PATH
-    )
-    if spec is None or spec.loader is None:
-        raise AssertionError(f"could not load invoker module at {_INVOKER_PATH}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+        return self.response
 
 
 @pytest.fixture()
-def invoker_module() -> ModuleType:
-    """Provide the freshly loaded invoker module for each test."""
-    return _load_invoker_module()
+def invoker_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    monkeypatch.setenv("FORECAST_AGENT_RUNTIME_ARN", _RUNTIME_ARN)
+    return importlib.reload(importlib.import_module("pulse.forecast_invoker"))
 
 
-def test_event_triggers_exactly_one_start_session(
+def test_event_invokes_once_and_returns_completed_forecast(
     invoker_module: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A {propertyId} event triggers exactly one start-session call (Req 1.4).
-
-    Also verifies the call carries the FORECAST_AGENT_RUNTIME_ARN runtime ARN,
-    the DEFAULT qualifier, a >= 33-character session id, and a JSON payload whose
-    propertyId matches the event, and that the handler returns a summary dict.
-    """
-    # Runtime ARN comes from the environment (PYQUALITY-06 / NAMING-03).
-    monkeypatch.setenv(
-        invoker_module.ENV_FORECAST_AGENT_RUNTIME_ARN, _RUNTIME_ARN
-    )
-    fake_client = _FakeAgentCoreClient()
-    # Replace the module-level client so no real boto3 client / network is used.
-    monkeypatch.setattr(invoker_module, "_agentcore_client", fake_client)
-
+    client = _FakeAgentCoreClient()
+    monkeypatch.setattr(invoker_module, "_agentcore_client", client)
     result = invoker_module.lambda_handler(
         {"propertyId": _PROPERTY_ID}, _FakeLambdaContext()
     )
 
-    # Requirement 1.4: exactly one start-session call for the event.
-    assert len(fake_client.calls) == 1
-    call = fake_client.calls[0]
-
-    # The call targets the configured runtime ARN at the DEFAULT endpoint.
+    assert len(client.calls) == 1
+    call = client.calls[0]
     assert call["agentRuntimeArn"] == _RUNTIME_ARN
     assert call["qualifier"] == "DEFAULT"
-    # InvokeAgentRuntime requires a session id of at least 33 characters.
+    assert call["contentType"] == call["accept"] == "application/json"
     assert len(call["runtimeSessionId"]) >= 33
-
-    # The payload is JSON bytes carrying the event's propertyId.
-    payload = json.loads(call["payload"].decode("utf-8"))
-    assert payload["propertyId"] == _PROPERTY_ID
-
-    # The handler returns a summary dict without raising.
+    assert json.loads(call["payload"]) == {"propertyId": _PROPERTY_ID}
     assert result["invoked"] is True
-    assert result["propertyId"] == _PROPERTY_ID
+    assert result["completed"] is True
     assert result["runtimeSessionId"] == call["runtimeSessionId"]
+    assert datetime.fromisoformat(result["completedAt"]).utcoffset() is not None
+    for key, value in _summary().items():
+        assert result[key] == value
+    assert client.response["response"]._raw_stream.closed
 
 
-def test_client_error_is_reraised_for_scheduler_retry(
+def test_sdk_call_matches_agentcore_api_model(
     invoker_module: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A ClientError from InvokeAgentRuntime propagates so the Scheduler retries (Req 1.6)."""
-    monkeypatch.setenv(
-        invoker_module.ENV_FORECAST_AGENT_RUNTIME_ARN, _RUNTIME_ARN
+    client = boto3.client(
+        "bedrock-agentcore",
+        region_name="us-east-1",
+        aws_access_key_id="testing",
+        aws_secret_access_key="testing",
     )
+    monkeypatch.setattr(invoker_module, "_agentcore_client", client)
+    with Stubber(client) as stubber:
+        stubber.add_response(
+            "invoke_agent_runtime",
+            _response(_summary()),
+            {
+                "agentRuntimeArn": _RUNTIME_ARN,
+                "runtimeSessionId": ANY,
+                "qualifier": "DEFAULT",
+                "contentType": "application/json",
+                "accept": "application/json",
+                "payload": json.dumps({"propertyId": _PROPERTY_ID}).encode(),
+            },
+        )
+        result = invoker_module.lambda_handler(
+            {"propertyId": _PROPERTY_ID}, _FakeLambdaContext()
+        )
+        assert result["completed"] is True
+        stubber.assert_no_pending_responses()
+
+
+def test_successful_no_alert_outcome_is_completed(
+    invoker_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeAgentCoreClient(
+        response=_response(_summary(predictionsWritten=0, noAlert=True))
+    )
+    monkeypatch.setattr(invoker_module, "_agentcore_client", client)
+    result = invoker_module.lambda_handler(
+        {"propertyId": _PROPERTY_ID}, _FakeLambdaContext()
+    )
+    assert result["completed"] is True
+    assert result["noAlert"] is True
+
+
+def test_client_error_is_reraised(
+    invoker_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     error = ClientError(
         {"Error": {"Code": "ThrottlingException", "Message": "slow down"}},
         "InvokeAgentRuntime",
     )
-    fake_client = _FakeAgentCoreClient(error=error)
-    monkeypatch.setattr(invoker_module, "_agentcore_client", fake_client)
-
-    # The handler logs and re-raises rather than swallowing the failure.
+    client = _FakeAgentCoreClient(error=error)
+    monkeypatch.setattr(invoker_module, "_agentcore_client", client)
     with pytest.raises(ClientError):
         invoker_module.lambda_handler(
             {"propertyId": _PROPERTY_ID}, _FakeLambdaContext()
         )
+    assert len(client.calls) == 1
 
-    # It still attempted exactly one start-session before failing.
-    assert len(fake_client.calls) == 1
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        {"propertyId": _PROPERTY_ID, "failed": True, "reason": "RuntimeError"},
+        {"propertyId": None, "rejected": True, "reason": "property_disabled"},
+        _summary(propertyId="ALOHA-MIA-001"),
+        _summary(predictionsWritten=-1),
+        _summary(predictionsWritten=True),
+        _summary(resolved="1"),
+        _summary(noAlert=True),
+        _summary(noAlert="false"),
+        {"propertyId": _PROPERTY_ID},
+        [],
+        b"invalid JSON",
+        b"\xff",
+        b" " * (64 * 1024 + 1),
+    ],
+)
+def test_failed_or_invalid_results_raise_and_close_body(
+    invoker_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    summary: Any,
+) -> None:
+    client = _FakeAgentCoreClient(response=_response(summary))
+    monkeypatch.setattr(invoker_module, "_agentcore_client", client)
+    with pytest.raises(RuntimeError):
+        invoker_module.lambda_handler(
+            {"propertyId": _PROPERTY_ID}, _FakeLambdaContext()
+        )
+    assert client.response["response"]._raw_stream.closed
+
+
+@pytest.mark.parametrize(
+    "status,content_type", [(500, "application/json"), (200, "text/event-stream")]
+)
+def test_unsuccessful_transport_or_wrong_content_type_raises(
+    invoker_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    content_type: str,
+) -> None:
+    client = _FakeAgentCoreClient(
+        response=_response(_summary(), status=status, content_type=content_type)
+    )
+    monkeypatch.setattr(invoker_module, "_agentcore_client", client)
+    with pytest.raises(RuntimeError):
+        invoker_module.lambda_handler(
+            {"propertyId": _PROPERTY_ID}, _FakeLambdaContext()
+        )
+    assert client.response["response"]._raw_stream.closed
+
+
+def test_missing_body_raises(
+    invoker_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeAgentCoreClient(
+        response={"statusCode": 200, "contentType": "application/json"}
+    )
+    monkeypatch.setattr(invoker_module, "_agentcore_client", client)
+    with pytest.raises(RuntimeError, match="no response body"):
+        invoker_module.lambda_handler(
+            {"propertyId": _PROPERTY_ID}, _FakeLambdaContext()
+        )
+
+
+def test_stream_read_error_raises_and_closes_body(
+    invoker_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenBody(io.BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            raise TimeoutError("stream stalled")
+
+    body = BrokenBody()
+    client = _FakeAgentCoreClient(
+        response={
+            "statusCode": 200,
+            "contentType": "application/json",
+            "response": body,
+        }
+    )
+    monkeypatch.setattr(invoker_module, "_agentcore_client", client)
+    with pytest.raises(TimeoutError):
+        invoker_module.lambda_handler(
+            {"propertyId": _PROPERTY_ID}, _FakeLambdaContext()
+        )
+    assert body.closed
+
+
+def test_truncated_stream_cannot_report_completion(
+    invoker_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = json.dumps(_summary()).encode()
+    body = StreamingBody(io.BytesIO(raw), len(raw) + 5)
+    client = _FakeAgentCoreClient(
+        response={
+            "statusCode": 200,
+            "contentType": "application/json",
+            "response": body,
+        }
+    )
+    monkeypatch.setattr(invoker_module, "_agentcore_client", client)
+    with pytest.raises(IncompleteReadError):
+        invoker_module.lambda_handler(
+            {"propertyId": _PROPERTY_ID}, _FakeLambdaContext()
+        )
+    assert body._raw_stream.closed
+
+
+def test_json_with_charset_is_accepted(
+    invoker_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeAgentCoreClient(
+        response=_response(_summary(), content_type="application/json; charset=utf-8")
+    )
+    monkeypatch.setattr(invoker_module, "_agentcore_client", client)
+    result = invoker_module.lambda_handler(
+        {"propertyId": _PROPERTY_ID}, _FakeLambdaContext()
+    )
+    assert result["completed"] is True
+
+
+def test_client_is_created_lazily_and_reused(
+    invoker_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import Mock
+
+    client = _FakeAgentCoreClient()
+    factory = Mock(return_value=client)
+    monkeypatch.setattr(invoker_module.boto3, "client", factory)
+    assert invoker_module._agentcore_client is None
+    invoker_module.lambda_handler({"propertyId": _PROPERTY_ID}, _FakeLambdaContext())
+    client.response = _response(_summary())
+    invoker_module.lambda_handler({"propertyId": _PROPERTY_ID}, _FakeLambdaContext())
+    factory.assert_called_once_with(
+        "bedrock-agentcore", config=invoker_module.BOTO_CONFIG
+    )
+    assert len(client.calls) == 2
+    assert client.calls[0]["runtimeSessionId"] != client.calls[1]["runtimeSessionId"]
+
+
+@pytest.mark.parametrize(
+    "event",
+    [{}, {"propertyId": ""}, {"propertyId": " "}, {"propertyId": 12}, None],
+)
+def test_invalid_property_does_not_invoke(
+    invoker_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    event: Any,
+) -> None:
+    client = _FakeAgentCoreClient()
+    monkeypatch.setattr(invoker_module, "_agentcore_client", client)
+    with pytest.raises(ValueError):
+        invoker_module.lambda_handler(event, _FakeLambdaContext())
+    assert not client.calls
+
+
+@pytest.mark.parametrize("runtime_arn", ["", "   ", None])
+def test_unconfigured_runtime_is_an_explicit_skip(
+    invoker_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_arn: Optional[str],
+) -> None:
+    if runtime_arn is None:
+        monkeypatch.delenv("FORECAST_AGENT_RUNTIME_ARN")
+    else:
+        monkeypatch.setenv("FORECAST_AGENT_RUNTIME_ARN", runtime_arn)
+    client = _FakeAgentCoreClient()
+    monkeypatch.setattr(invoker_module, "_agentcore_client", client)
+    result = invoker_module.lambda_handler(
+        {"propertyId": _PROPERTY_ID}, _FakeLambdaContext()
+    )
+    assert result == {
+        "invoked": False,
+        "completed": False,
+        "propertyId": _PROPERTY_ID,
+        "reason": "runtime_not_configured",
+    }
+    assert not client.calls

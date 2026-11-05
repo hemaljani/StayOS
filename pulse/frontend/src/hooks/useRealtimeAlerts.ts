@@ -3,7 +3,7 @@
 // Layers realtime on top of the REST baseline (useAlerts): it seeds from
 // GET /alerts, then applies ALERT_CREATED / ALERT_UPDATED / ALERT_RESOLVED events
 // pushed over the AppSync Events WebSocket so the live feed and KPI grid update
-// without polling (Requirement 15.4, design Component 6). ALERT_CREATED prepends
+// immediately (Requirement 15.4, design Component 6). ALERT_CREATED prepends
 // (or updates) a card; ALERT_UPDATED updates escalation/brief/status in place and
 // flips the agent-ready badge when hasTriageBrief becomes true; ALERT_RESOLVED
 // moves the card to resolved history. KPI counts are derived from the alert list
@@ -12,9 +12,8 @@
 // Escalation events arriving on the caller's per-user channel are recorded in
 // assignedIds so the feed can give them a distinct "assigned to you" treatment,
 // separate from ambient feed updates. On each (re)subscribe the hook reconciles
-// via GET /alerts so no state is missed during a connection gap. When realtime
-// config is missing the hook silently falls back to the REST baseline + manual
-// refresh.
+// via GET /alerts. A quiet reconciliation every minute and on tab/network
+// return also recovers a failed publish while the socket remains connected.
 
 'use client';
 
@@ -23,6 +22,33 @@ import { useAlerts } from './useAlerts';
 import { getCurrentUser } from '@/lib/auth';
 import { RealtimeClient, fetchRealtimeConfig } from '@/lib/realtime';
 import type { Alert, RealtimeAlertEvent } from '@/lib/types';
+
+export const RECONCILE_INTERVAL_MS = 60_000;
+
+interface ReceivedEvent {
+  receivedAt: number;
+  event: RealtimeAlertEvent;
+}
+
+// Preserve events received during a REST read, then apply them over its snapshot.
+// This prevents reconciliation itself from hiding a newly delivered alert.
+export function reconcileSnapshot(
+  snapshot: Alert[],
+  previous: Alert[],
+  events: ReceivedEvent[],
+  snapshotStartedAt: number
+): Alert[] {
+  const previousById = new Map(previous.map((alert) => [alert.alertId, alert]));
+  const seeded = snapshot.map((alert) => {
+    const prior = previousById.get(alert.alertId);
+    return !alert.triageBrief && prior?.triageBrief
+      ? { ...alert, triageBrief: prior.triageBrief }
+      : alert;
+  });
+  return events
+    .filter(({ receivedAt }) => receivedAt >= snapshotStartedAt)
+    .reduce((alerts, { event }) => mergeEvent(alerts, event), seeded);
+}
 
 // A minimal placeholder brief so the agent-ready badge can appear when a realtime
 // event reports hasTriageBrief=true before the full brief is fetched on open.
@@ -63,6 +89,12 @@ function alertFromEvent(event: RealtimeAlertEvent, existing?: Alert): Alert {
 // ALERT_RESOLVED) can be unit/property tested directly without a live socket.
 export function mergeEvent(prev: Alert[], event: RealtimeAlertEvent): Alert[] {
   const index = prev.findIndex((alert) => alert.alertId === event.alertId);
+  if (
+    index >= 0 && event.lastStatusChangeAt && prev[index].lastStatusChangeAt &&
+    Date.parse(event.lastStatusChangeAt) < Date.parse(prev[index].lastStatusChangeAt!)
+  ) {
+    return prev;
+  }
 
   if (event.eventType === 'ALERT_CREATED' && index === -1) {
     // New alert: prepend so it sorts to the top of the live feed.
@@ -72,7 +104,12 @@ export function mergeEvent(prev: Alert[], event: RealtimeAlertEvent): Alert[] {
   if (index === -1) {
     // UPDATED/RESOLVED for an alert not in the current window: fold it in so the
     // event is not lost (it reconciles fully on the next GET /alerts).
-    return [alertFromEvent(event), ...prev];
+    const alert = alertFromEvent(event);
+    if (event.eventType === 'ALERT_RESOLVED') {
+      alert.status = 'RESOLVED';
+      alert.resolvedAt = event.lastStatusChangeAt ?? new Date().toISOString();
+    }
+    return [alert, ...prev];
   }
 
   // Update the existing card in place.
@@ -105,6 +142,7 @@ export function useRealtimeAlerts() {
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [assignedIds, setAssignedIds] = useState<Set<string>>(new Set());
   const [connected, setConnected] = useState(false);
+  const eventsRef = useRef<ReceivedEvent[]>([]);
 
   // Keep the latest refetch in a ref so the realtime effect can call it without
   // re-subscribing when the callback identity changes.
@@ -118,18 +156,16 @@ export function useRealtimeAlerts() {
   // (possibly earlier) REST fetch returned it without a brief, we keep that
   // brief so the badge never regresses across a reseed.
   useEffect(() => {
-    setAlerts((prev) => {
-      if (prev.length === 0) return base.alerts;
-      const priorById = new Map(prev.map((alert) => [alert.alertId, alert]));
-      return base.alerts.map((alert) => {
-        if (alert.triageBrief) return alert;
-        const prior = priorById.get(alert.alertId);
-        return prior?.triageBrief ? { ...alert, triageBrief: prior.triageBrief } : alert;
-      });
-    });
-  }, [base.alerts]);
+    const events = eventsRef.current;
+    setAlerts((prev) => reconcileSnapshot(base.alerts, prev, events, base.snapshotStartedAt));
+    eventsRef.current = events.filter(({ receivedAt }) => receivedAt >= base.snapshotStartedAt);
+  }, [base.alerts, base.snapshotStartedAt]);
 
   const applyEvent = useCallback((event: RealtimeAlertEvent, assigned: boolean) => {
+    eventsRef.current.push({ event, receivedAt: Date.now() });
+    // Bound memory during a prolonged REST outage; later snapshots restore the
+    // authoritative feed even if an unusually busy connection fills this buffer.
+    if (eventsRef.current.length > 1000) eventsRef.current.shift();
     setAlerts((prev) => mergeEvent(prev, event));
     if (assigned) {
       setAssignedIds((prev) => {
@@ -140,6 +176,24 @@ export function useRealtimeAlerts() {
     }
   }, []);
 
+  useEffect(() => {
+    const reconcile = () => {
+      if (document.visibilityState === 'visible') {
+        void refetchRef.current({ background: true });
+      }
+    };
+    const timer = window.setInterval(reconcile, RECONCILE_INTERVAL_MS);
+    document.addEventListener('visibilitychange', reconcile);
+    window.addEventListener('online', reconcile);
+    window.addEventListener('focus', reconcile);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', reconcile);
+      window.removeEventListener('online', reconcile);
+      window.removeEventListener('focus', reconcile);
+    };
+  }, []);
+
   // Open the realtime subscription once on mount.
   useEffect(() => {
     let client: RealtimeClient | null = null;
@@ -147,14 +201,14 @@ export function useRealtimeAlerts() {
 
     (async () => {
       const config = await fetchRealtimeConfig();
-      if (cancelled || !config) return; // Graceful fallback: manual refresh only.
+      if (cancelled || !config) return; // Periodic REST recovery remains available.
       const user = getCurrentUser();
       if (!user?.propertyId) return;
 
       client = new RealtimeClient(config, user.propertyId, user.gmAlias, {
         onBroadcastEvent: (event) => applyEvent(event, false),
         onUnicastEvent: (event) => applyEvent(event, true),
-        onResubscribe: () => refetchRef.current(),
+        onResubscribe: () => refetchRef.current({ background: true }),
         onConnectionChange: setConnected,
       });
       client.start();

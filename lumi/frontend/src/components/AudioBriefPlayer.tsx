@@ -1,14 +1,36 @@
 'use client';
 
 import { useAudio } from '@/hooks/useAudio';
+import { useCallback } from 'react';
+import { authFetch } from '@/lib/api';
+import type { BriefResponse } from '@/lib/types';
 
 interface AudioBriefPlayerProps {
   audioUrl?: string;
   durationSeconds?: number;
+  audioUrlExpiresAt?: string;
+  propertyId?: string;
+  briefDate?: string;
 }
 
-export default function AudioBriefPlayer({ audioUrl, durationSeconds }: AudioBriefPlayerProps) {
-  const { isPlaying, progress, duration, currentTime, error, toggle } = useAudio(audioUrl);
+export default function AudioBriefPlayer({
+  audioUrl, durationSeconds, audioUrlExpiresAt, propertyId, briefDate,
+}: AudioBriefPlayerProps) {
+  const renew = useCallback(async () => {
+    if (!propertyId || !briefDate) throw new Error('Brief identity unavailable');
+    const brief = await authFetch<BriefResponse>(
+      `/briefs/${encodeURIComponent(propertyId)}/${encodeURIComponent(briefDate)}`,
+      { cache: 'no-store' },
+    );
+    if (!brief.audioBrief?.audioUrl) throw new Error('Audio unavailable');
+    return {
+      audioUrl: brief.audioBrief.audioUrl,
+      audioUrlExpiresAt: brief.audioBrief.audioUrlExpiresAt,
+    };
+  }, [propertyId, briefDate]);
+  const { isPlaying, progress, duration, currentTime, error, toggle } = useAudio(
+    audioUrl, audioUrlExpiresAt, renew,
+  );
 
   const displayDuration = duration || durationSeconds || 0;
   const formatTime = (seconds: number) => {

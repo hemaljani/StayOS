@@ -177,6 +177,38 @@ deployment-preflight:
 	echo "  Profile:     $${AWS_PROFILE:-<default credential chain>}"; \
 	echo "  CFN profile: $(if $(CLOUDFORMATION_PROFILE),$(CLOUDFORMATION_PROFILE),<default credential chain>)"
 
+# Focused release for an already deployed PULSE stack. Capture/build, preview,
+# execution and verification are separate phases; all preserve deployed inputs.
+FORECAST_RELEASE_PHASE ?= prepare
+FORECAST_RELEASE_DIR ?= build/forecast-release
+REALTIME_RELEASE_PHASE ?= prepare
+SECURITY_RELEASE_PHASE ?= prepare
+SECURITY_TEMPLATE_PHASE ?= bootstrap
+SECURITY_FRONTEND_DOMAIN ?=
+.PHONY: deploy-security
+deploy-security:
+	@PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools python3 -m stayos_deploy.security_release \
+		'$(SECURITY_RELEASE_PHASE)' --template-phase '$(SECURITY_TEMPLATE_PHASE)' \
+		--profile '$(PROFILE)' --cloudformation-profile '$(CLOUDFORMATION_PROFILE)' \
+		--region '$(REGION)' --expected-account-id '$(EXPECTED_ACCOUNT_ID)' \
+		--stack-prefix '$(LUMI_STACK_PREFIX)' --frontend-domain '$(SECURITY_FRONTEND_DOMAIN)'
+
+.PHONY: deploy-realtime
+deploy-realtime:
+	@PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools python3 -m stayos_deploy.realtime_release \
+		'$(REALTIME_RELEASE_PHASE)' --profile '$(PROFILE)' \
+		--cloudformation-profile '$(CLOUDFORMATION_PROFILE)' \
+		--region '$(REGION)' --expected-account-id '$(EXPECTED_ACCOUNT_ID)' \
+		--stack-prefix '$(PULSE_STACK_PREFIX)'
+
+.PHONY: deploy-forecast-invoker
+deploy-forecast-invoker:
+	@PYTHONPATH=tools python3 -m stayos_deploy.forecast_release \
+		'$(FORECAST_RELEASE_PHASE)' --directory '$(FORECAST_RELEASE_DIR)' \
+		--profile '$(PROFILE)' --cloudformation-profile '$(CLOUDFORMATION_PROFILE)' \
+		--region '$(REGION)' --expected-account-id '$(EXPECTED_ACCOUNT_ID)' \
+		--stack-prefix '$(PULSE_STACK_PREFIX)'
+
 # ─── deploy-all: deploy the whole platform, end to end ───────────────────────
 # Deploys LUMI, then threads its outputs (Cognito pool, 5 DynamoDB stream ARNs,
 # Gateway endpoint, Tool Lambda ARN) into PULSE, builds the Triage + Forecasting

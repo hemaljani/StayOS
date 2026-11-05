@@ -5,6 +5,44 @@ All notable changes to **StayOS** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2026-11-05
+
+### Fixed
+- Package the PULSE forecast invoker from the backend source tree and validate
+  AgentCore responses so failed forecasts are reported instead of silently
+  succeeding.
+- Authorize PULSE backend realtime publication with IAM and reconcile alerts
+  after reconnecting, preserving filters and preventing duplicate cards.
+- Bind LUMI chat and voice sessions to verified Cognito identities and the
+  user's current property attributes.
+
+### Security
+- Serve private brief audio through short-lived CloudFront signed URLs,
+  renew playback URLs when needed, and prevent private content from remaining
+  in the service worker cache.
+- Tighten API identity checks, property authorization, IAM permissions, TLS,
+  CORS, and PULSE API throttling and access logging.
+- Keep the account-specific review journal out of Git and exclude local
+  credential configuration and symbolic links from focused release archives.
+- Known dependency advisories remain in MCP, Next.js/sharp, and frontend
+  development/build tooling. Remediation is deferred; this prototype release
+  does not resolve those advisories. Static frontend exports disable the
+  affected Next.js server endpoints.
+
+### Added
+- Focused CloudFormation release automation and regression tests for forecast,
+  realtime, and authorization changes.
+- A reproducible authorization architecture diagram using AWS service icons.
+
+### Validation
+- Automated backend, agent, frontend, and deployment checks passed during
+  integration testing. The authorization release passed 300 regression tests,
+  TypeScript checks, and the LUMI production build.
+- Manual acceptance passed for LUMI latest and past audio, chat, voice, and
+  PULSE alerts, filters, refresh, details, and realtime recovery.
+- Signed audio access and expiry checks passed; unsigned, tampered,
+  cross-property, and direct S3 requests were denied.
+
 ## [1.2.1] - 2026-10-08
 
 ### Changed

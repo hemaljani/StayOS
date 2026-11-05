@@ -2,8 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getIdToken, getAccessToken } from '@/lib/auth';
-import { getIdentityPoolCredentials } from '@/lib/identityPool';
-import { generatePresignedWsUrl } from '@/lib/sigv4WebSocket';
+import { openAgentWebSocket } from '@/lib/agentWebSocket';
 import { AGENTCORE_RUNTIME_ARN, AWS_REGION, withBase } from '@/lib/constants';
 
 // Playback sample rate for Nova Sonic output (24kHz/16-bit/mono PCM)
@@ -476,20 +475,12 @@ export function useVoiceAgent(): UseVoiceAgentReturn {
       return;
     }
 
-    // Exchange the ID token for temporary AWS credentials via Cognito Identity Pool
-    let wsUrl: string;
+    // Bind transport and first-message identity to the same signed-in user.
+    let ws: WebSocket;
     try {
-      const credentials = await getIdentityPoolCredentials(idToken);
-
-      // Generate a SigV4 presigned WebSocket URL for the AgentCore endpoint
-      // (URL expires in 300s but connection persists once established)
-      wsUrl = await generatePresignedWsUrl(
-        AGENTCORE_RUNTIME_ARN,
-        credentials,
-        AWS_REGION
-      );
+      ws = openAgentWebSocket(AGENTCORE_RUNTIME_ARN, accessToken, AWS_REGION);
     } catch (err: unknown) {
-      // Credential exchange or SigV4 signing failed — clean up and show error
+      // Surface connection setup failure without logging token material.
       const message =
         err instanceof Error
           ? err.message
@@ -505,14 +496,12 @@ export function useVoiceAgent(): UseVoiceAgentReturn {
     playbackContextRef.current = playbackContext;
     nextPlaybackTimeRef.current = 0;
 
-    // Open the WebSocket connection to AgentCore (SigV4 auth is in the URL query params)
-    const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
     ws.onopen = () => {
       isConnectedRef.current = true;
       // Send Access Token as first message for identity verification by the agent container
-      // (AgentCore uses SigV4 for transport auth; this identifies which GM is speaking)
+      // The agent binds this message to the OAuth handshake principal.
       ws.send(JSON.stringify({ type: 'identity', accessToken }));
       // Send sessionStart event to initiate the Nova Sonic stream on the server
       ws.send(JSON.stringify({ type: 'sessionStart' }));
