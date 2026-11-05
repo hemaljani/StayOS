@@ -109,15 +109,18 @@ CloudFormation outputs and runtime IDs stored in SSM.
 | Variable | Description | Source |
 |----------|-------------|--------|
 | `NEXT_PUBLIC_AGENTCORE_RUNTIME_ARN` | AgentCore Runtime ARN for WebSocket endpoint | Constructed from the runtime ID in SSM `/${STACK_PREFIX}/voice/runtime-id`, plus the deployment account and region |
-| `NEXT_PUBLIC_COGNITO_IDENTITY_POOL_ID` | Identity Pool ID for credential exchange | CloudFormation output: `VoiceIdentityPoolId` |
 | `NEXT_PUBLIC_AWS_REGION` | AWS region | Deployment `REGION` (defaults to `us-east-1`) |
+
+Voice and chat reuse the signed-in Cognito session from the shared `@stayos/auth`
+module. Agent connections do not require an Identity Pool credential exchange.
 
 ### Authentication Flow
 
-The voice agent uses SigV4 authentication via Cognito Identity Pool (replacing the previous JWT-in-URL pattern):
+The voice agent uses OAuth authentication with the signed-in user's Cognito
+access token:
 
-1. **Credential exchange** - The browser exchanges the Cognito ID Token for temporary AWS credentials via the Identity Pool
-2. **SigV4 WebSocket** - Temporary credentials sign a presigned WebSocket URL for the AgentCore endpoint
+1. **Shared session** - The browser reads the Cognito access token from the shared `@stayos/auth` module.
+2. **OAuth WebSocket** - The shared `openAgentWebSocket` helper sends the access token through the AgentCore WebSocket subprotocol rather than URL query parameters.
 3. **Identity verification** - The Access Token is sent as the first message; the container calls `cognito-idp:GetUser` to extract the GM's `propertyId` and `gmAlias`
 4. **Voice session** - A GA Strands `BidiAgent` with `BedrockNovaSonicModel`
    explicitly selects `amazon.nova-2-5-sonic`. The backend adapter retains
@@ -140,8 +143,9 @@ See [`docs/voice-agent-architecture.png`](docs/voice-agent-architecture.png) for
 ## Chat Agent (AgentCore + Gateway)
 
 The LUMI chat agent runs on the same [Amazon Bedrock AgentCore Runtime](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/) as the voice agent, but answers General Manager questions as text instead of speech — useful when voice isn't practical (a noisy lobby, a meeting, or simply a preference for typing). It uses [Strands Agents](https://strandsagents.com/) with Claude Sonnet for reasoning, and discovers/calls tools through the **AgentCore Gateway** rather than in-process.
-The browser opens a SigV4-authenticated WebSocket to the chat agent in
-AgentCore Runtime. The agent discovers and calls tools through the Gateway
+The browser opens an OAuth-authenticated WebSocket to the chat agent in
+AgentCore Runtime, using the same Cognito access token and `openAgentWebSocket`
+helper as voice. The agent discovers and calls tools through the Gateway
 over MCP. The Gateway invokes the Tool Lambda, which reads DynamoDB; the
 chat agent streams its response back to the browser.
 
@@ -161,14 +165,13 @@ chat agent streams its response back to the browser.
 |-----------|------|
 | `AskLumiModal.tsx` | Replaces the direct mic-tap flow — presents a Voice / Chat choice from the bottom nav |
 | `ChatPanel.tsx` | Full-screen chat UI: message thread rendered as Markdown (tables, bold, lists via `react-markdown` + `remark-gfm`), always-visible tappable example-question chips, typing indicator |
-| `useChatAgent.ts` | WebSocket session management, SigV4 auth (same Identity Pool as voice), message streaming/accumulation |
+| `useChatAgent.ts` | WebSocket session management, Cognito OAuth authentication through the shared `openAgentWebSocket` helper, message streaming/accumulation |
 
 Frontend env additions: `NEXT_PUBLIC_CHAT_RUNTIME_ARN` (written to
 `frontend/.env.production` using the runtime ID
 in SSM `/${STACK_PREFIX}/chat/runtime-id`, plus the deployment account and
-region), reusing the existing
-`NEXT_PUBLIC_COGNITO_IDENTITY_POOL_ID`/`NEXT_PUBLIC_AWS_REGION` from the voice
-agent setup.
+region), reusing `NEXT_PUBLIC_AWS_REGION` and the shared signed-in Cognito
+session from the voice agent setup.
 
 ## Data Sources
 
