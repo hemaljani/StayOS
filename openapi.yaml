@@ -1,7 +1,7 @@
 openapi: "3.0.3"
 info:
   title: StayOS API
-  version: "1.2.0"
+  version: "1.2.2"
   description: |
     StayOS is the shared intelligence platform for hotel General Managers and
     associates. This authoritative REST contract documents its two separately

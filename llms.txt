@@ -6,8 +6,8 @@
 
 - Prototype/demo monorepo (not production).
 - Each feature is a self-contained top-level directory with its own backend,
-  frontend, infrastructure, docs, and `README.md`. Follow the root
-  [AGENTS.md](AGENTS.md) for repository guidance. This single repo-root
+  frontend, infrastructure, docs, and `README.md`. Start with the root
+  [README.md](README.md) for platform guidance. This single repo-root
   `llms.txt` is the one index for the whole repo — features do not carry their own.
 - Features share one PWA origin, one Cognito user pool, one AWS WAF web ACL, and
   one DynamoDB operational data layer. Three static-export Next.js apps are
@@ -43,9 +43,10 @@
   transcript assembly, and conversation history across connection renewals.
   Preserves `tiffany`, 16 kHz input PCM, and 24 kHz output PCM.
 - [server.py](lumi/backend/services/voice-agent/server.py):
-  AgentCore WebSocket entrypoint. The browser connects with SigV4 credentials
-  from a Cognito Identity Pool; the backend verifies the access token with
-  Cognito and binds tools to the authenticated GM's property.
+  AgentCore WebSocket entrypoint. The browser connects using its Cognito OAuth
+  access token. The backend verifies the token's signature, issuer, client,
+  expiry, and subject binding; Cognito GetUser checks revocation and supplies
+  the GM's current property attributes.
 - [useVoiceAgent.ts](lumi/frontend/src/hooks/useVoiceAgent.ts):
   browser capture and playback. Waits for `sessionStarted` before sending
   microphone audio and clears queued playback on interruption.
@@ -60,6 +61,27 @@
   `EXPECTED_ACCOUNT_ID`. Frontend publication is separate: regenerate live
   configuration before building and publishing. Runtime readiness alone does
   not prove voice recognition, conversation context, or interruption works.
+
+## LUMI authorization and audio
+
+- [agentWebSocket.ts](lumi/frontend/src/lib/agentWebSocket.ts):
+  shared chat/voice WebSocket connection helper. Sends the OAuth access token
+  through the AgentCore WebSocket subprotocol rather than URL query parameters.
+- [Chat identity resolver](lumi/backend/services/chat-agent/identity_resolver.py)
+  and [Voice identity resolver](lumi/backend/services/voice-agent/identity_resolver.py):
+  bind the first-message identity to the authenticated transport principal and
+  scope tools to the user's current property.
+- [audio_signing.py](lumi/backend/functions/api/audio_signing.py):
+  issues property-authorized CloudFront signed audio URLs valid for 900 seconds.
+  The private signing key is resolved by CloudFormation; this module does not
+  retrieve Secrets Manager values.
+- [briefs_handler.py](lumi/backend/functions/api/handlers/briefs_handler.py):
+  returns signed `audioUrl` and `audioUrlExpiresAt` fields. Retrieve the dated
+  brief again to renew an expired playback URL. LUMI REST requires the configured
+  app client's ID token and returns `Cache-Control: private, no-store`.
+- [sw.js](lumi/frontend/public/sw.js):
+  removes legacy private caches and excludes authenticated APIs and audio from
+  service worker caching.
 
 ## Operational data semantics
 
@@ -137,9 +159,39 @@
   the Alert Writer — `dedupeKey` (`forecast#{propertyId}#OVERSELL#{day}`),
   threshold gate, severity mapping, create-vs-update-in-place, resolve-when-no-
   longer-forecast, and best-effort realtime/Web Push delivery.
-- [pulse/backend/functions/forecast-invoker/lambda_function.py](pulse/backend/functions/forecast-invoker/lambda_function.py):
-  the thin EventBridge Scheduler target that starts a `pulse-forecaster`
-  AgentCore Runtime session for a given `propertyId`.
+- [pulse/backend/src/pulse/forecast_invoker.py](pulse/backend/src/pulse/forecast_invoker.py):
+  the packaged EventBridge Scheduler target
+  (`pulse.forecast_invoker.lambda_handler`). Invokes the `pulse-forecaster`
+  AgentCore Runtime for one property, consumes and validates its completed
+  JSON summary, and logs and raises failures for Lambda error handling.
+
+## PULSE realtime
+
+- [realtime.ts](pulse/frontend/src/lib/realtime.ts):
+  AppSync Events client connection and subscription handling.
+- [useRealtimeAlerts.ts](pulse/frontend/src/hooks/useRealtimeAlerts.ts):
+  reconnects and reconciles the alert feed while preserving active filters
+  and avoiding duplicate cards.
+- [pulse-api.yaml](pulse/infrastructure/nested-stacks/pulse-api.yaml):
+  configures IAM-authenticated backend event publication and Cognito-authenticated
+  browser subscriptions, API throttling, and access logging.
+
+## Focused release automation
+
+- [forecast_release.py](tools/stayos_deploy/forecast_release.py):
+  `make deploy-forecast-invoker` packages and deploys the forecast invoker through
+  its existing nested CloudFormation stack while preserving unrelated resources.
+  See the [forecast release procedure](docs/deployment-pipeline.md#focused-forecast-invoker-release).
+- [realtime_release.py](tools/stayos_deploy/realtime_release.py):
+  `make deploy-realtime` applies scoped realtime authorization and recovery
+  changes, with resumable release phases and validation.
+- [security_release.py](tools/stayos_deploy/security_release.py):
+  `make deploy-security` applies scoped audio and identity authorization changes,
+  with change-set guards, artifact checks, and access-boundary validation.
+- These commands require explicit `PROFILE`, `CLOUDFORMATION_PROFILE`,
+  `REGION`, and `EXPECTED_ACCOUNT_ID`. Review the selected phase before running;
+  deployment phases write to AWS. Account-specific release state stays in an
+  ignored local journal.
 
 ## Docs
 
@@ -149,8 +201,6 @@
   quiesced, baselined, and fired live on stage.
 - [openapi.yaml](openapi.yaml): Unified StayOS REST API specification and
   authoritative contract for both LUMI and PULSE.
-- [AGENTS.md](AGENTS.md): root contributor/agent guide — repo-wide safety,
-  conventions, and per-feature workflow.
 - [docs/deployment-pipeline.md](docs/deployment-pipeline.md): account-aware
   deployment, frontend configuration, focused voice upgrades, and recovery.
 
@@ -161,5 +211,6 @@
   deferred.
 - [CONTRIBUTING.md](CONTRIBUTING.md): how to scope a PR to one feature.
 - [CHANGELOG.md](CHANGELOG.md): notable changes per release. The latest
-  documented version is `1.2.1`, covering the GA Strands/Nova Sonic 2.5 upgrade
-  and focused deployment automation.
+  documented version is `1.2.2`, covering forecast invocation, realtime recovery,
+  audio and identity authorization, and focused release automation. Known
+  dependency advisories remain deferred; this release is not vulnerability-free.
