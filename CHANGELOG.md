@@ -32,7 +32,6 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 ### Added
 - Focused CloudFormation release automation and regression tests for forecast,
   realtime, and authorization changes.
-- A reproducible authorization architecture diagram using AWS service icons.
 
 ### Validation
 - Automated backend, agent, frontend, and deployment checks passed during
